@@ -152,6 +152,33 @@ namespace DarlingServer {
 		LatencyHistogram checkinLatency;   // service time of checkin RPCs
 		LatencyHistogram forkLatency;      // service time of fork-checkin RPCs (incl. parent coordination)
 
+		// ---- per-call-number breakdown (perf #9 / dar-dar6x4-perf-5dq.16) ----
+		// The real-build profile (perf #6) put ~57% of guest wall-clock in recvmsg
+		// waiting for an RPC reply. To aim the recv-spin tuning (perf #7) at the calls
+		// that actually dominate, we record, per call number, how many times it was
+		// serviced and the distribution of its server-side service time. Frequency is
+		// the key lever: every call pays one full round-trip wakeup that the spin can
+		// elide, so the most NUMEROUS calls are the ones worth spinning for.
+		//
+		// Call numbers are sequential 1..~80 (the high UNMANAGED bit is masked off when
+		// indexing), so a fixed lock-free array indexed by the low bits is both cheap
+		// and allocation-free on the hot path. 256 covers the whole range with margin.
+		static constexpr size_t kMaxCallNumbers = 256;
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallCount {};
+		std::array<LatencyHistogram, kMaxCallNumbers> perCallLatency {};
+
+		// Record one serviced RPC of the given call number with the given service time.
+		// callNumber is the raw dserver_callnum value (the UNMANAGED flag, if set, is
+		// masked off for indexing). Safe to call from any worker; lock-free.
+		void recordCall(uint32_t callNumber, uint64_t microseconds) {
+			size_t idx = callNumber & 0xffu; // low byte: call numbers are < 256
+			if (idx >= kMaxCallNumbers) {
+				return;
+			}
+			perCallCount[idx].fetch_add(1, std::memory_order_relaxed);
+			perCallLatency[idx].record(microseconds);
+		}
+
 		// last reply timestamp (CLOCK_MONOTONIC microseconds), for last_reply_age_ms
 		std::atomic<uint64_t> lastReplyMonoUs {0};
 

@@ -386,6 +386,9 @@ void DarlingServer::Thread::microthreadWorker() {
 		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
 		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
 		_metrics.rpcLatency.record(serviceUs);
+		// perf #9 (dar-dar6x4-perf-5dq.16): per-call-number breakdown so perf #7 can
+		// see which RPC numbers dominate the guest's recvmsg-wait.
+		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
 		if (_callNumber == DarlingServer::Call::Number::Checkin) {
 			_metrics.checkinLatency.record(serviceUs);
 		}
