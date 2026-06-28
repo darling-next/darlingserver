@@ -58,6 +58,8 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"messages_received\": " << messagesReceived.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"checkins\": " << checkins.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"forks\": " << forks.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"inline_handled\": " << inlineHandled.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"queued_to_pool\": " << queuedToPool.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"last_reply_age_ms\": " << lastReplyAgeMs << ",\n";
 	if (!extraGauges.empty()) {
 		out << "  " << extraGauges << ",\n";

@@ -668,7 +668,29 @@ void DarlingServer::Server::start() {
 				try {
 					auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
 					if (call) {
-						_workQueue.push(call->thread());
+						// perf #2b (dar-dar6x4-perf-5dq.8): run the call INLINE on the main
+						// event loop instead of always handing it to the worker pool. The
+						// profile (perf #2a) showed ~70% of server CPU was the main-loop ->
+						// worker condvar handoff (pthread_cond_signal -> futex_wake) for work
+						// that is itself <1% of CPU -- so for the common case of a cheap,
+						// non-blocking RPC (checkin etc.) the wakeup tax dwarfs the work.
+						//
+						// doWork() never blocks its caller: a non-blocking call runs to
+						// completion here; a call that blocks suspends its microthread (via
+						// setcontext) and returns control to us, having already arranged its
+						// own resume onto the work queue (Thread::doWork doneWorking ->
+						// scheduleThread). So running inline is safe in BOTH cases and only
+						// the genuinely-blocking minority ever pays for the worker pool.
+						auto thread = call->thread();
+						if (thread) {
+							thread->doWork();
+							auto& m = Metrics::shared();
+							if (thread->isCurrentlySuspended()) {
+								m.queuedToPool.fetch_add(1, std::memory_order_relaxed);
+							} else {
+								m.inlineHandled.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
 					}
 				} catch (const std::exception& ex) {
 					static DarlingServer::Log serverLog("server");

@@ -1455,6 +1455,14 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 	}
 };
 
+bool DarlingServer::Thread::isCurrentlySuspended() const {
+	// perf #2b: read the same _suspended flag doWork()/suspend() maintain. A microthread
+	// that ran to completion inline never set _suspended; one that blocked has it set
+	// (until a resume clears it). Shared-lock is enough -- this is a single-bool read.
+	std::shared_lock lock(_rwlock);
+	return _suspended;
+};
+
 DarlingServer::Thread::RunState DarlingServer::Thread::getRunState() const {
 	auto process = this->process();
 	if (!process || isDead()) {

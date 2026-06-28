@@ -197,6 +197,13 @@ namespace DarlingServer {
 
 		void doWork();
 
+		// perf #2b (dar-dar6x4-perf-5dq.8): the main event loop runs cheap, non-blocking
+		// RPCs inline via doWork() instead of paying a worker-thread wakeup. After an inline
+		// doWork() returns, this reports whether the microthread is still suspended (i.e. the
+		// call blocked and will be resumed on the worker pool) vs ran to completion.
+		// Cheap, lock-protected read of the same _suspended flag doWork() itself consults.
+		bool isCurrentlySuspended() const;
+
 		/**
 		 * NOTE: This currently only works if this thread is the current thread.
 		 *       It will throw an error in all other cases.

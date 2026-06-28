@@ -136,6 +136,13 @@ namespace DarlingServer {
 		std::atomic<uint64_t> checkins {0};       // checkin RPCs (process/thread registration)
 		std::atomic<uint64_t> forks {0};          // fork-checkins specifically
 		std::atomic<uint64_t> messagesReceived {0};
+		// perf #2b (dar-dar6x4-perf-5dq.8): inline fast-path accounting. A call run to
+		// completion directly on the main event loop (no worker wakeup) increments
+		// inlineHandled; a call that suspended its microthread (so it must finish on the
+		// worker pool when resumed) increments queuedToPool. Under a healthy fast-path the
+		// vast majority of cheap RPCs (checkin etc.) should be inlineHandled.
+		std::atomic<uint64_t> inlineHandled {0};
+		std::atomic<uint64_t> queuedToPool {0};
 
 		// ---- gauges sampled at snapshot time (set by the owner) ----
 		// These are filled in by Server when producing a snapshot, not on the hot path.
