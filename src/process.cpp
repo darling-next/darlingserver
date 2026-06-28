@@ -318,45 +318,63 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// update the process architecture
 		_architecture = architecture;
 
+		// dar-6x4: the dtape_task_create / dtape_thread_create / dtape_semaphore_*
+		// calls below can SUSPEND the microthread (they enter duct-taped XNU code that
+		// may block on a waitq/lock). We MUST NOT hold _rwlock across a suspension:
+		// _rwlock is a std::shared_mutex (a real per-OS-thread rwlock), but a suspended
+		// microthread resumes on a DIFFERENT OS thread (perf #2b runs cheap RPCs inline
+		// on the MAIN thread, while resumes happen on the WORKER). Holding the write
+		// lock across the suspend strands it owned by the suspending OS thread; a
+		// sibling's fork-checkin then blocks forever in _notifyListeningKqchannels()
+		// taking this same lock for read on the worker, wedging the whole server
+		// (confirmed live: gdb __cur_writer == main tid, worker stuck in rdlock). The
+		// thread-clear loop above already drops the lock around the blocking
+		// notifyDead() for exactly this reason; do the same for the dtape work here.
+		//
+		// It is safe to drop the lock for this block: all other threads have been
+		// cleared (only mainThread remains in _threads), _pendingReplacement is still
+		// true, and the dtape handles being swapped (_dtapeTask, mainThread->_dtapeThread,
+		// the semaphores) are not traversed by _rwlock readers -- readers consult
+		// _threads / _listeningKqchannels / _kqchannels / scalar fields, none of which
+		// we mutate while unlocked.
+		lock.unlock();
+
 		// replace the old task with a new task that inherits from it
 		auto oldTask = _dtapeTask;
 		auto newTask = dtape_task_create(oldTask, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
-		_dtapeTask = newTask;
 
 		// now replace the main thread's duct-taped thread with a new one
 		auto oldThread = mainThread->_dtapeThread;
-		auto newThread = dtape_thread_create(_dtapeTask, mainThread->_nstid, mainThread.get());
-		mainThread->_dtapeThread = newThread;
+		auto newThread = dtape_thread_create(newTask, mainThread->_nstid, mainThread.get());
 
-		// destroy the main thread's old S2C semaphores
+		// create a new fork-wait semaphore and new S2C semaphores for the new task
+		auto newForkWaitSemaphore = dtape_semaphore_create(newTask, 0);
+		auto newPerform = dtape_semaphore_create(newTask, 1);
+		auto newReply = dtape_semaphore_create(newTask, 0);
+		auto newInterruptEnter = dtape_semaphore_create(newTask, 0);
+		auto newInterruptExit = dtape_semaphore_create(newTask, 0);
+
+		// destroy the old semaphores (created against the old task)
 		dtape_semaphore_destroy(mainThread->_s2cPerformSempahore);
-		mainThread->_s2cPerformSempahore = nullptr;
 		dtape_semaphore_destroy(mainThread->_s2cReplySempahore);
-		mainThread->_s2cReplySempahore = nullptr;
 		dtape_semaphore_destroy(mainThread->_s2cInterruptEnterSemaphore);
-		mainThread->_s2cInterruptEnterSemaphore = nullptr;
 		dtape_semaphore_destroy(mainThread->_s2cInterruptExitSemaphore);
-		mainThread->_s2cInterruptExitSemaphore = nullptr;
-
-		// destroy the fork-wait semaphore
 		dtape_semaphore_destroy(_dtapeForkWaitSemaphore);
-		_dtapeForkWaitSemaphore = nullptr;
 
-		// release the main thread's old duct-taped thread
+		// release the main thread's old duct-taped thread and the old task
 		dtape_thread_release(oldThread);
-
-		// release the old task
 		dtape_task_release(oldTask);
 
-		// create a new fork-wait semaphore for the new task
-		_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
+		// publish the new state under the lock again
+		lock.lock();
+		_dtapeTask = newTask;
+		mainThread->_dtapeThread = newThread;
+		_dtapeForkWaitSemaphore = newForkWaitSemaphore;
 		_forkChildCheckin.reset();
-
-		// create new S2C semaphores for the main thread
-		mainThread->_s2cPerformSempahore = dtape_semaphore_create(_dtapeTask, 1);
-		mainThread->_s2cReplySempahore = dtape_semaphore_create(_dtapeTask, 0);
-		mainThread->_s2cInterruptEnterSemaphore = dtape_semaphore_create(_dtapeTask, 0);
-		mainThread->_s2cInterruptExitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
+		mainThread->_s2cPerformSempahore = newPerform;
+		mainThread->_s2cReplySempahore = newReply;
+		mainThread->_s2cInterruptEnterSemaphore = newInterruptEnter;
+		mainThread->_s2cInterruptExitSemaphore = newInterruptExit;
 	} else {
 		// fork case
 
