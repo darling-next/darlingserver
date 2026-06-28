@@ -361,11 +361,23 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		dtape_semaphore_destroy(mainThread->_s2cInterruptExitSemaphore);
 		dtape_semaphore_destroy(_dtapeForkWaitSemaphore);
 
-		// release the main thread's old duct-taped thread and the old task
-		dtape_thread_release(oldThread);
-		dtape_task_release(oldTask);
-
-		// publish the new state under the lock again
+		// publish the new state FIRST, then release the old task/thread.
+		//
+		// dar-l8k: the order matters. dtape_task_release(oldTask) tears down the old task's
+		// IPC space -> ipc_space_terminate -> ipc_right_terminate -> ipc_port_destroy, which
+		// (with IMPORTANCE_INHERITANCE) reads `current_thread()->ith_assertions`.
+		// `current_thread()` resolves through dtape_hook_current_thread to
+		// `Thread::currentThread()->_dtapeThread` -- i.e. mainThread->_dtapeThread. If we
+		// release+free oldThread and run the task teardown while mainThread->_dtapeThread is
+		// STILL oldThread, the teardown dereferences the freed dtape_thread (heap UAF, pinned
+		// by ASan: free at dtape_thread_release here, use at ipc_port_destroy:936). So we must
+		// repoint mainThread->_dtapeThread at the live newThread BEFORE the releases.
+		//
+		// The publish needs _rwlock; the releases must NOT hold it (dtape_task_release can
+		// suspend the microthread, and a suspended microthread resumes on a different OS
+		// thread -- holding the std::shared_mutex write lock across a suspend strands it, the
+		// exact wedge documented above for the dtape_*_create calls). So: publish under the
+		// lock, drop the lock, then release the old handles.
 		lock.lock();
 		_dtapeTask = newTask;
 		mainThread->_dtapeThread = newThread;
@@ -375,6 +387,15 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		mainThread->_s2cReplySempahore = newReply;
 		mainThread->_s2cInterruptEnterSemaphore = newInterruptEnter;
 		mainThread->_s2cInterruptExitSemaphore = newInterruptExit;
+		lock.unlock();
+
+		// release the main thread's old duct-taped thread and the old task now that
+		// current_thread() resolves to the live newThread (see dar-l8k note above).
+		dtape_thread_release(oldThread);
+		dtape_task_release(oldTask);
+
+		// re-acquire so the rest of the function runs under the lock as before.
+		lock.lock();
 	} else {
 		// fork case
 
