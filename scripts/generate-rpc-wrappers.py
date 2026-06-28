@@ -1494,13 +1494,34 @@ for call in calls:
 		library_source.write("};\n\n")
 
 	if not no_reply:
+		# perf #9-decompose (dar-dar6x4-perf-5dq): GUEST-SIDE per-callnum recvmsg-sleep
+		# accounting. perf #6 showed ~57% of build wall-clock is the guest asleep in
+		# recvmsg waiting for the reply; perf #9 measured only the (tiny) SERVER service
+		# time, so we still don't know WHICH calls the guest sleeps on longest. The call
+		# number is a compile-time constant ONLY here at the wrapper's receive site
+		# (dserver_callnum_<name>) -- NOT inside the shared receive_message hook -- so the
+		# timing must be emitted by the generator around the receive. It is wrapped in
+		# #ifdef DARLING_RPC_SLEEP_ACCOUNT so a normal build emits byte-identical wrappers
+		# (zero cost); only an instrumented diagnostic build defines the macro. begin/end
+		# bracket the ENTIRE receive (including the retry_receive loop on EINTR / unknown
+		# replies), so the attributed time is the full reply-wait this call paid.
+		library_source.write("#ifdef DARLING_RPC_SLEEP_ACCOUNT\n")
+		library_source.write("\tunsigned long __sleep_acct_start = __darling_rpc_sleep_account_begin();\n")
+		library_source.write("#endif\n")
 		library_source.write("retry_receive:\n")
 		library_source.write("\tlong_status = dserver_rpc_hooks_receive_message(server_socket, &replymsg);\n\n")
 
 		library_source.write("\tif (long_status == dserver_rpc_hooks_get_interrupt_status()) {\n")
 		library_source.write("\t\tgoto retry_receive;\n")
 		library_source.write("\t}\n\n")
-		
+
+		# perf #9-decompose: the reply-wait is over (terminal status, not an EINTR retry).
+		# Attribute the elapsed wait to THIS call number. End is reached for every terminal
+		# outcome (success or error), so the accounting is complete regardless of result.
+		library_source.write("#ifdef DARLING_RPC_SLEEP_ACCOUNT\n")
+		library_source.write("\t__darling_rpc_sleep_account_end(__sleep_acct_start, dserver_callnum_" + call_name + ");\n")
+		library_source.write("#endif\n")
+
 		library_source.write("\tif (long_status < 0) {\n")
 		if (flags & ALLOW_INTERRUPTIONS) == 0:
 			library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
