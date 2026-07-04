@@ -714,6 +714,24 @@ int main(int argc, char** argv) {
 		perma_drop_privileges(originalUID, originalGID);
 		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
 
+		// dar-pot: bind this launchd's lifetime to darlingserver's. We are PID 1
+		// of the guest PID namespace; if darlingserver (our parent) ever dies --
+		// crash, SIGKILL, or the launcher exiting -- the kernel would otherwise
+		// leave us (and thus every guest/mldr in this namespace) running,
+		// orphaned, until they accumulate and wedge the next fresh boot. Asking
+		// for SIGKILL on parent death makes ns-PID-1 die with the server; the
+		// kernel then cascade-kills the whole guest namespace. No orphaned guests
+		// can outlive their server. This MUST come AFTER perma_drop_privileges (a
+		// credential change clears the pdeathsig) and BEFORE spawnLaunchd (so no
+		// guest can exist before the binding is in place). The pdeathsig also
+		// survives the exec into mldr/launchd (mldr is not set-uid, so exec keeps
+		// it). The classic "parent died in the clone->here window" race is already
+		// covered by the childWaitFDs handshake below: we arm pdeathsig before
+		// that read(), so a parent that already died triggers our SIGKILL rather
+		// than us proceeding to boot an orphaned launchd. (Note: getppid() cannot
+		// detect it here -- across the PID-ns boundary it always reports 0.)
+		prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+
 		// decrease the FD limit back to the default
 		if (setrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
 			fprintf(stderr, "Warning: failed to decrease FD limit back down for launchd: %s\n", strerror(errno));
