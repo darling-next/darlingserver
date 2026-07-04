@@ -335,6 +335,44 @@ if [ -f "$MLSRC" ]; then
 	echo
 fi
 
+# --- D16 follow-up (dar-j7e7): postfork_reset RESOURCE-OWNERSHIP gate. The D16 gate pins the active-bit/
+#     generation bookkeeping but NOT what __dserver_ring_postfork_reset() frees per lane. The shipped impl
+#     gated teardown on `wake_fd >= 0`; because the lane table is `static` (zero-init, wake_fd==0), the fork
+#     child ran close(0) once per untouched lane -> stdin destroyed -> "cannot duplicate fd 0". This gate
+#     models the teardown decision and asserts it frees resources for EXACTLY the owning (active==1) lanes,
+#     never a stdio fd, and restores the -1 sentinel. Hermetic, pure model (no rpc.h). ---
+PFSRC="$HERE/ring_postfork_reset_gate_test.c"
+if [ -f "$PFSRC" ]; then
+	echo "== postfork-reset GREEN arm (ownership-gated teardown; no stdio fd closed; -1 sentinel) =="
+	if ! "$CC" -std=c11 -o "$TMP/pf_green" "$PFSRC" 2>/dev/null; then
+		echo "postfork-reset GREEN arm failed to COMPILE"; exit 2
+	fi
+	if ! "$TMP/pf_green"; then
+		echo "postfork-reset GREEN arm FAILED -- teardown frees a non-owning lane or drops the sentinel"; exit 1
+	fi
+	echo
+	echo "== postfork-reset RED arm A (-DRESET_GATE_ON_WAKEFD_GE0: the shipped close(0) bug, MUST fail) =="
+	if ! "$CC" -std=c11 -DRESET_GATE_ON_WAKEFD_GE0 -o "$TMP/pf_redA" "$PFSRC" 2>/dev/null; then
+		echo "postfork-reset RED arm A failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/pf_redA" >/dev/null 2>&1; then
+		echo "postfork-reset RED arm A PASSED but must FAIL -- gate not catching close(0) on zero-init lanes"; exit 1
+	fi
+	echo "  postfork-reset RED arm A correctly failed."
+	echo
+	echo "== postfork-reset RED arm B (-DRESET_LEAVES_WAKEFD_ZERO: sentinel not restored, MUST fail) =="
+	if ! "$CC" -std=c11 -DRESET_LEAVES_WAKEFD_ZERO -o "$TMP/pf_redB" "$PFSRC" 2>/dev/null; then
+		echo "postfork-reset RED arm B failed to COMPILE -- gate broken"; exit 2
+	fi
+	if "$TMP/pf_redB" >/dev/null 2>&1; then
+		echo "postfork-reset RED arm B PASSED but must FAIL -- gate not checking the -1 sentinel post-condition"; exit 1
+	fi
+	echo "  postfork-reset RED arm B correctly failed."
+	echo
+	echo "ring_postfork_reset gate: RED->GREEN OK"
+	echo
+fi
+
 # --- Phase C/D (P8, dar-1il.3 / .3.1): DUPLEX-lane wake-model gate. The hard gate the duplex lane
 #     is built on -- pure logic, hermetic. GREEN: the duplex wake model is lost-wake-free (guest park
 #     watches the S2C-upcall stream; server park watches the upcall-reply stream) + correlation-safe.
