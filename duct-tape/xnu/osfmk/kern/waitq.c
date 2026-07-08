@@ -76,6 +76,7 @@
 #include <kern/policy_internal.h>
 #include <kern/turnstile.h>
 #include <darlingserver/duct-tape/wait-timer.h>
+#include <darlingserver/duct-tape/test-diagnostics.h>
 
 #include <os/hash.h>
 #include <libkern/OSAtomic.h>
@@ -2929,6 +2930,12 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		// abort). Cancel any such leftover before (re)arming for this wait so
 		// the wait_timer state starts clean. Matches XNU's invariant that a
 		// thread entering assert_wait has no live wait_timer.
+		dtape_test_trace_wait_timer(
+		    "wait_prepare",
+		    (unsigned long long)thread,
+		    thread->wait_result,
+		    thread->wait_timer_is_set,
+		    thread->wait_timer_active);
 		dtape_thread_prepare_for_wait(thread);
 
 		if (deadline != 0) {

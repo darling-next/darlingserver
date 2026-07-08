@@ -119,6 +119,7 @@ add_executable(darlingserver
 	src/async-writer.cpp
 	src/stack-pool.cpp
 	src/metrics.cpp
+	src/test-diagnostics.cpp
 )
 
 add_dependencies(darlingserver

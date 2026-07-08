@@ -29,6 +29,7 @@
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/config.hpp>
 #include <darlingserver/metrics.hpp>
+#include <darlingserver/test-diagnostics.hpp>
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
@@ -65,6 +66,10 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		process = processRegistry().registerIfAbsent(header->pid, [&]() {
 			std::shared_ptr<Process> tmp = nullptr;
 
+			if (TestDiagnostics::consumeFault("ingest.process_register_fail")) {
+				return tmp;
+			}
+
 			int lifetimePipe = -1;
 
 			if (header->number == dserver_callnum_checkin) {
@@ -85,6 +90,16 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			return tmp;
 		});
 
+		if (TestDiagnostics::consumeFault("ingest.force_missing_process")) {
+			TestDiagnostics::traceLine(
+				"call.ingest_missing_process number=" + std::to_string(header->number) +
+				" pid=" + std::to_string(header->pid) +
+				" tid=" + std::to_string(header->tid) +
+				" forced=1 code=" + std::to_string(-ESRCH)
+			);
+			process = nullptr;
+		}
+
 		if (!process) {
 			callLog.error() << "Received call from non-existent process (number "
 				<< header->number << "); replying -ESRCH instead of dropping" << callLog.endLog;
@@ -98,6 +113,10 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 		thread = threadRegistry().registerIfAbsent(header->tid, [&]() {
 			std::shared_ptr<Thread> tmp = nullptr;
+
+			if (TestDiagnostics::consumeFault("ingest.thread_register_fail")) {
+				return tmp;
+			}
 
 			void* stackHint = nullptr;
 
@@ -140,7 +159,6 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 	if (header->number == dserver_callnum_s2c) {
 		// this is an S2C reply
-
 		{
 			std::unique_lock lock(thread->_rwlock);
 
@@ -280,12 +298,25 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 				callLog.error() << "Uncaught std::system_error from kernel-async processCall (call "
 					<< DarlingServer::Call::callNumberToString(result->number()) << "): " << err.what()
 					<< " (code " << err.code().value() << ")" << callLog.endLog;
+				TestDiagnostics::traceLine(
+					"call.kernel_async_exception kind=system number=" +
+					std::to_string(static_cast<int>(result->number())) +
+					" code=" + std::to_string(err.code().value())
+				);
 			} catch (const std::exception& ex) {
 				callLog.error() << "Uncaught exception from kernel-async processCall (call "
 					<< DarlingServer::Call::callNumberToString(result->number()) << "): " << ex.what() << callLog.endLog;
+				TestDiagnostics::traceLine(
+					"call.kernel_async_exception kind=std number=" +
+					std::to_string(static_cast<int>(result->number()))
+				);
 			} catch (...) {
 				callLog.error() << "Uncaught non-std exception from kernel-async processCall (call "
 					<< DarlingServer::Call::callNumberToString(result->number()) << ")" << callLog.endLog;
+				TestDiagnostics::traceLine(
+					"call.kernel_async_exception kind=unknown number=" +
+					std::to_string(static_cast<int>(result->number()))
+				);
 			}
 		});
 		return nullptr;
@@ -618,6 +649,11 @@ void DarlingServer::Call::Uidgid::processCall() {
 	int code = 0;
 	int uid = -1;
 	int gid = -1;
+
+	if (TestDiagnostics::consumeFault("processcall.uidgid_throw")) {
+		TestDiagnostics::traceLine("call.processcall_throw name=uidgid");
+		throw std::runtime_error("injected uidgid processCall failure");
+	}
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {

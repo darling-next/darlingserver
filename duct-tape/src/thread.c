@@ -3,6 +3,7 @@
 #include <darlingserver/duct-tape/task.h>
 #include <darlingserver/duct-tape/thread.h>
 #include <darlingserver/duct-tape/wait-timer.h>
+#include <darlingserver/duct-tape/test-diagnostics.h>
 #include <darlingserver/duct-tape/hooks.internal.h>
 #include <darlingserver/duct-tape/log.h>
 #include <darlingserver/duct-tape/psynch.h>
@@ -593,6 +594,8 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	int had_timer = xthread->wait_timer_is_set;
+	int active = xthread->wait_timer_active;
 	thread->xnu_thread.wait_result = wresult;
 
 	// Cancel the wait timer if one was armed for a timed wait. XNU's
@@ -605,6 +608,7 @@ boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	// typically a subsequent deadline-less psynch wait -- aborting it with
 	// ETIMEDOUT and stranding a condvar/mutex handoff (intermittent hang).
 	dtape_thread_cancel_wait_timer(&thread->xnu_thread);
+	dtape_test_trace_wait_timer("thread_unblock", (unsigned long long)xthread, wresult, had_timer, active);
 
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;

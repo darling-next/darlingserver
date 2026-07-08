@@ -86,6 +86,7 @@
 
 #include <darlingserver/duct-tape/fatal-exception-reply.h>
 #include <darlingserver/duct-tape/thread.h>
+#include <darlingserver/duct-tape/test-diagnostics.h>
 
 void
 mach_msg_receive_results_complete(ipc_object_t object);
@@ -455,6 +456,7 @@ kernel_mach_msg_rpc(
 	    dthread->fatal_exception_delivery));
 	mach_msg_option_t rcv_option = dtape_exception_reply_wait_option(bounded);
 	mach_msg_timeout_t rcv_timeout = dtape_exception_reply_wait_timeout(bounded);
+	dtape_test_trace_exception_reply_wait((unsigned long long)self, bounded, rcv_timeout);
 
 	for (;;) {
 		ipc_mqueue_t mqueue;

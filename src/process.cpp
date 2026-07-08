@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <darlingserver/logging.hpp>
+#include <darlingserver/test-diagnostics.hpp>
 
 #include <fstream>
 #include <regex>
@@ -292,6 +293,11 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// exec case
 
 		processLog.info() << *this << ": replacing process with a new task (with architecture \"" << architectureToString(architecture) << "\")" << processLog.endLog;
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_begin pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid()) +
+			" arch=" + std::to_string(static_cast<int>(architecture))
+		);
 
 		// clear all threads except the main thread
 		std::shared_ptr<Thread> mainThread = nullptr;
@@ -387,12 +393,20 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		mainThread->_s2cReplySempahore = newReply;
 		mainThread->_s2cInterruptEnterSemaphore = newInterruptEnter;
 		mainThread->_s2cInterruptExitSemaphore = newInterruptExit;
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_publish pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
 		lock.unlock();
 
 		// release the main thread's old duct-taped thread and the old task now that
 		// current_thread() resolves to the live newThread (see dar-l8k note above).
 		dtape_thread_release(oldThread);
 		dtape_task_release(oldTask);
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_release_old pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
 
 		// re-acquire so the rest of the function runs under the lock as before.
 		lock.lock();
@@ -415,11 +429,18 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
 			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.checkin.fork_notify_parent child=" + std::to_string(nsid()) +
+				" parent=" + std::to_string(parent->nsid())
+			);
 			parent->_forkChildCheckin.markChildCheckedIn();
 			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		} else {
 			processLog.info() << *this << ": checkin without registered fork parent" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.checkin.fork_no_parent child=" + std::to_string(nsid())
+			);
 		}
 	}
 };
@@ -428,6 +449,10 @@ void DarlingServer::Process::setPendingReplacement() {
 	std::unique_lock lock(_rwlock);
 
 	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
+	TestDiagnostics::traceLine(
+		"process.pending_replacement pid=" + std::to_string(id()) +
+		" nsid=" + std::to_string(nsid())
+	);
 
 	_pendingReplacement = true;
 };
