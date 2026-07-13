@@ -1,6 +1,10 @@
 #include <darlingserver/duct-tape/stubs.h>
 #include <darlingserver/duct-tape/log.h>
 
+// declared by hand: <execinfo.h>'s __nonnull annotation collides with XNU's macros in this TU
+extern int backtrace(void** array, int size);
+extern void backtrace_symbols_fd(void* const* array, int size, int fd);
+
 #include <kern/thread.h>
 #include <kern/policy_internal.h>
 
@@ -84,6 +88,16 @@ void panic(const char* message, ...) {
 	va_end(args);
 	printf("\n");
 	fflush(stdout);
+	{
+		// A0 diagnosis: name the panicking microthread + host backtrace so a fiber-context
+		// panic (e.g. semaphore_convert_wait_result) is attributable without a debugger.
+		void* frames[32];
+		int n = backtrace(frames, 32);
+		printf("panic backtrace (%d frames):\n", n);
+		fflush(stdout);
+		backtrace_symbols_fd(frames, n, 1);
+		fflush(stdout);
+	}
 	abort();
 };
 

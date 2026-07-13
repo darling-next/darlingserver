@@ -96,6 +96,11 @@ namespace DarlingServer {
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
 		bool _pendingReplacement = false;
+	// perf#25a A0 (Part 4): whether this process's MAIN thread has completed a checkin.
+	// A main-thread re-checkin (that is not a fork checkin) is definitionally an exec
+	// replacement; keying didExec off this makes the decision independent of the
+	// exec-listener-pipe event's arrival timing (see notifyCheckin).
+	bool _mainThreadCheckedIn = false;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -182,7 +187,7 @@ namespace DarlingServer {
 		bool readMemory(uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode = nullptr) const;
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;
 
-		void notifyCheckin(Architecture architecture);
+		void notifyCheckin(Architecture architecture, bool isMainThread, bool isFork);
 		void setPendingReplacement();
 
 		void registerKqchan(std::shared_ptr<Kqchan> kqchan);

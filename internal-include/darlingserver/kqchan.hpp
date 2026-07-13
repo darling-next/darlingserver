@@ -42,6 +42,14 @@ namespace DarlingServer {
 		bool _canSendNotification = true;
 		bool _deferNotification = false;
 		std::optional<Message> _deferredNotification = std::nullopt;
+		// perf#25a-hang (A0): sticky "a notification was requested while deferred" flag. Replaces the
+		// orphan-prone _deferredNotification stash as the deferral carrier: a stashed Message could be
+		// left un-flushed if the _notify that stashed it raced past the _read that would flush it, and
+		// since _sendNotification also consumed _canSendNotification on the stash path, the channel then
+		// GATED every future notification forever (guest never re-notified -> never acks -> deadlock,
+		// exactly the brew fork-storm hang). A boolean is idempotent and self-healing: it is resolved
+		// every time deferral clears, and notifications are contentless + duplicate-safe by design.
+		bool _notificationRequestedWhileDeferred = false;
 		std::mutex _sendingMutex;
 		uint64_t _notificationCount = 0;
 
@@ -52,6 +60,12 @@ namespace DarlingServer {
 		virtual void _processMessages();
 
 		virtual std::shared_ptr<Kqchan> sharedFromRoot();
+
+		// Whether the channel currently has pending work the peer should be notified about. Used by
+		// _sendDeferredNotification to re-arm a notification when deferral clears (level-triggered, so a
+		// notification lost to a defer/gate race is always recovered). Base returns false; the proc
+		// channel overrides it to report a non-empty event queue.
+		virtual bool _hasPendingEvents();
 
 		void _sendNotification();
 		void _sendDeferredNotification();
@@ -134,6 +148,10 @@ namespace DarlingServer {
 		void _notify(uint32_t event, int64_t data);
 
 		virtual void _processMessages();
+
+		// perf#25a-hang (A0): report whether events remain to be read, so a notification lost to a
+		// defer/gate race is re-armed when deferral clears. Takes _mutex (the event-queue lock).
+		virtual bool _hasPendingEvents();
 
 		/**
 		 * See Kqchan::MachPort::_checkForEventsAsync(); this does the same thing for process kqchannels.

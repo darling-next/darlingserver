@@ -36,6 +36,13 @@
 #include <darlingserver/kqchan.hpp>
 #include <system_error>
 #include <cerrno>
+#include <atomic>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <cstdarg>
+#include <sys/stat.h>
 #ifdef DSERVER_RING_TRANSPORT
 	#include <darlingserver/ring.hpp>
 	#include <darlingserver/monitor.hpp>
@@ -46,6 +53,70 @@
 static DarlingServer::Log callLog("calls");
 
 DarlingServer::Log DarlingServer::Call::rpcReplyLog("replies");
+
+// A0 (perf#25a-hang) PER-TID RPC TRACE -- env-gated (DARLING_SERVER_AUXLOG=1, same gate + same log file
+// as the kqchan AUXLOG so both traces interleave chronologically). The guest-side capture proved the
+// stall is a lost/never-sent DGRAM RPC reply (server idle, every parked guest thread in recvmsg with
+// Recv-Q=0). This trace names, per guest tid, EVERY call the server receives (RECV) and the DISPOSITION
+// of its reply -- the four pushCallReply outcomes (SENT-UDS / SENT-RING / STASH-SAVED[interrupt] /
+// STASH-DEFERRED[s2c]), each stash's matching FLUSH, the Call::sendReply fallback/error/direct paths.
+// A stall then reads directly off the tape: a RECV whose reply STASHes and never FLUSHes, or that never
+// produces any reply line at all, names the exact stuck call + drop site. Zero cost when unset (one
+// relaxed-load bool). Writes to the prefix log file via O_APPEND (atomic per-line). NOT default-on;
+// reverted before any non-instrumented build.
+//
+// Exposed with external linkage (not static) so thread.cpp's pushCallReply/flush sites -- the actual
+// reply dispositions -- share one file-open and one timestamp base with the call.cpp RECV site.
+static bool __rpctrace_enabled() {
+	static std::atomic<int> cached{-1};
+	int v = cached.load(std::memory_order_relaxed);
+	if (v < 0) {
+		const char* e = getenv("DARLING_SERVER_AUXLOG");
+		v = (e && e[0] == '1') ? 1 : 0;
+		cached.store(v, std::memory_order_relaxed);
+	}
+	return v != 0;
+}
+
+static int __rpctrace_fd() {
+	static int fd = []() -> int {
+		if (!__rpctrace_enabled()) {
+			return -1;
+		}
+		std::string path = DarlingServer::Server::sharedInstance().prefix() + "/private/var/log/dserver-auxlog.txt";
+		return open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	}();
+	return fd;
+}
+
+__attribute__((format(printf, 1, 2)))
+void DarlingServer::__rpctrace(const char* fmt, ...) {
+	if (!__rpctrace_enabled()) {
+		return;
+	}
+	int fd = __rpctrace_fd();
+	if (fd < 0) {
+		return;
+	}
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	char line[512];
+	int n = snprintf(line, sizeof(line), "[RPCTRACE %ld.%06ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000);
+	va_list ap;
+	va_start(ap, fmt);
+	if (n >= 0 && (size_t)n < sizeof(line)) {
+		int m = vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+		if (m >= 0) {
+			n += m;
+		}
+	}
+	va_end(ap);
+	if (n < 0 || (size_t)n >= (int)sizeof(line)) {
+		n = sizeof(line) - 1;
+	}
+	line[n++] = '\n';
+	(void)!write(fd, line, n);
+}
 
 // perf #18 D15a (dar-1il.10): static ring-eligibility classifier for the attach-timeline census.
 // Mirrors the dispatch allowlist (DSERVER_RING_C2S_OPCODES, rpc-supplement.h) -- the SAME macro the
@@ -181,6 +252,16 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	auto tidString = (thread) ? (std::to_string(thread->id()) + " (" + std::to_string(thread->nsid()) + ")") : (std::to_string(header->tid) + " (-1)");
 	callLog.debug() << "Received call #" << header->number << " (" << dserver_callnum_to_string(header->number) << ") from PID " << pidString << ", TID " << tidString << callLog.endLog;
 
+	// A0 RPC TRACE: every call the server accepts, keyed by host tid (matches /proc/<tid> in the guest
+	// capture) + guest nsid. The nsid pins WHICH guest thread; the host tid ties it to the recvmsg the
+	// stall capture saw parked. s2c/push_reply are logged here too (they return early below) so the tape
+	// shows the interrupt/S2C protocol traffic interleaved with the call it belongs to.
+	DarlingServer::__rpctrace("RECV call=%u(%s) hpid=%d htid=%d nspid=%lld nstid=%lld",
+		(unsigned)header->number, dserver_callnum_to_string(header->number),
+		header->pid, header->tid,
+		(long long)(process ? process->nsid() : -1),
+		(long long)(thread ? thread->nsid() : -1));
+
 	if (header->number == dserver_callnum_s2c) {
 		// this is an S2C reply
 		{
@@ -241,6 +322,8 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 				// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
 				// and we received both calls (interrupt_enter and push_reply) at the same time
 				thread->_pendingSavedReply = std::move(replyToSave);
+				// A0 RPC TRACE: pushed-back reply parked in _pendingSavedReply (flushed at InterruptEnter).
+				DarlingServer::__rpctrace("PUSHREPLY-STASH htid=%d nstid=%lld slot=pendingSaved", thread->id(), (long long)thread->nsid());
 			} else if (thread->_interrupts.empty()) {
 				// The push_reply races the interrupt's lifetime: the interrupt was
 				// already torn down (interrupt_exit popped it) by the time this
@@ -251,6 +334,8 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 				// client now. (dar-gwn.1.7)
 				lock.unlock();
 				callLog.debug() << *thread << ": push_reply arrived with no live interrupt; re-sending pushed reply directly" << callLog.endLog;
+				// A0 RPC TRACE: pushed-back reply re-sent directly (no live interrupt to stash it in).
+				DarlingServer::__rpctrace("PUSHREPLY-DIRECT htid=%d nstid=%lld dead=%d", thread->id(), (long long)thread->nsid(), (int)thread->isDead());
 				if (!thread->isDead()) {
 					Server::sharedInstance().sendMessage(std::move(replyToSave));
 				}
@@ -262,6 +347,8 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 					throw std::runtime_error("Client-pushed reply overwriting existing saved reply");
 				}
 				thread->_interrupts.top().savedReply = std::move(replyToSave);
+				// A0 RPC TRACE: pushed-back reply parked in _interrupts.top().savedReply (flushed at InterruptExit).
+				DarlingServer::__rpctrace("PUSHREPLY-STASH htid=%d nstid=%lld slot=interruptTop", thread->id(), (long long)thread->nsid());
 			}
 		}
 
@@ -439,6 +526,16 @@ bool DarlingServer::Call::isBSDTrap() const {
 };
 
 void DarlingServer::Call::sendReply(Message&& reply) {
+	// A0 RPC TRACE: the non-pushCallReply reply funnel -- thread-expired fallback (generated _sendReply
+	// when _thread.lock() fails), error replies (sendErrorReplyFromHeader), and the push_reply
+	// no-live-interrupt direct re-send. No thread handle here; key by the reply's own header number so
+	// the tape still names which call this reply belongs to.
+	if (reply.data().size() >= sizeof(dserver_rpc_replyhdr_t)) {
+		auto* rh = reinterpret_cast<const dserver_rpc_replyhdr_t*>(reply.data().data());
+		DarlingServer::__rpctrace("SENT-FALLBACK call=%u code=%d", (unsigned)rh->number, (int)rh->code);
+	} else {
+		DarlingServer::__rpctrace("SENT-FALLBACK (undersized reply)");
+	}
 	Server::sharedInstance().sendMessage(std::move(reply));
 };
 
@@ -507,7 +604,10 @@ void DarlingServer::Call::Checkin::processCall() {
 		if (auto process = thread->process()) {
 			// the process needs to know when the checkin occurs, in case it has a pending replacement
 			// and also to notify its parent about when the fork is complete
-			process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture));
+			// perf#25a A0 (Part 4): tell the process WHO is checking in -- only a main-thread
+			// non-fork re-checkin may be treated as an exec replacement (see notifyCheckin).
+			process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture),
+				thread->nsid() == process->nsid(), _body.is_fork);
 		} else {
 			code = -ESRCH;
 		}
@@ -1071,6 +1171,9 @@ void DarlingServer::Call::InterruptExit::processCall() {
 			callLog.debug() << *thread << ": Going to send saved reply" << callLog.endLog;
 			Server::sharedInstance().sendMessage(std::move(*tmp.savedReply));
 			tmp.savedReply = std::nullopt;
+			// A0 RPC TRACE: the STASH-SAVED[interrupt] reply is now flushed at interrupt_exit. Its absence
+			// for a tid that logged STASH-SAVED is the stall signature (interrupted reply never re-sent).
+			DarlingServer::__rpctrace("FLUSH-SAVED htid=%d nstid=%lld", thread->id(), (long long)thread->nsid());
 		}
 	}
 };

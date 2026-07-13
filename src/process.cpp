@@ -271,10 +271,33 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMainThread, bool isFork) {
 	std::unique_lock lock(_rwlock);
 
-	bool didExec = _pendingReplacement;
+	// perf#25a A0 (Part 4): decide exec-vs-fork from WHO is checking in, not from the racy
+	// _pendingReplacement flag alone. The flag is armed by the exec-listener pipe's EOF, an
+	// epoll event whose delivery order against the post-exec checkin RPC is not guaranteed:
+	// under brew's exec churn the pipe event can land AFTER the new image's main checkin was
+	// already processed, leaving the flag armed with no exec in flight. The NEXT checkin from
+	// that process is then a pthread_create THREAD checkin, and treating it as a replacement
+	// runs the thread sweep below -- which kills the very thread that is checking in, so its
+	// checkin reply is dropped (REPLY-DISP disp=DROP-DEAD on the RPC tape) and the guest thread
+	// waits forever in recvmsg: the captured `brew reinstall wget` freeze at the openssl@3
+	// build (ruby cc-shim leaf, no zombies). The timing-independent rule: an exec replacement
+	// is exactly a MAIN-thread re-checkin that is not a fork checkin -- after execve the kernel
+	// killed every other thread and the main thread checks in again from the new image; no
+	// other event has that shape. Thread checkins can never sweep.
+	bool didExec = isMainThread && !isFork && _mainThreadCheckedIn;
+
+	if (isMainThread) {
+		_mainThreadCheckedIn = true;
+	}
+
+	if (_pendingReplacement && !didExec && !isMainThread) {
+		// stale arm from a late pipe event (the matching exec checkin already ran); clear it
+		// below like every checkin does, and note it for the log.
+		processLog.info() << *this << ": clearing stale pending-replacement on a non-main checkin" << processLog.endLog;
+	}
 
 	if (didExec) {
 		// exec case
@@ -420,7 +443,12 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	if (didExec) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
-	} else {
+	} else if (isFork) {
+		// perf#25a A0 (Part 4): only a FORK checkin announces a child's arrival. Previously
+		// every checkin from the process (including pthread_create THREAD checkins) took this
+		// branch and raised the parent's fork-wait semaphore -- each spurious up is a stored
+		// wakeup that satisfies the parent's NEXT fork_wait_for_child immediately, detaching
+		// the semaphore count from real child arrivals under churn.
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
 			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;

@@ -87,6 +87,14 @@ namespace DarlingServer {
 		// coalesced wake request that bridges the transition between the two.
 		bool _suspended = false;
 		bool _resumePermit = false;
+		// perf#25a A0: a dispatch (scheduleThread) can be popped by a worker and
+		// enter doWork() while this microthread is still _running on another worker
+		// (mid suspend()/doneWorking transition; _running clears only at the
+		// doneWorking tail). doWork() cannot run it now, but must NOT silently drop
+		// it: it records the owed re-run here, and the doneWorking tail (once
+		// _running is cleared) reschedules exactly once. This complements
+		// _resumePermit, which only bridges the wake-before-suspend direction.
+		bool _rerunPending = false;
 		ucontext_t _resumeContext;
 		dtape_thread_t* _dtapeThread;
 		std::function<void()> _continuationCallback = nullptr;
@@ -344,6 +352,7 @@ namespace DarlingServer {
 		 */
 		void suspend(std::function<void()> continuationCallback = nullptr, libsimple_lock_t* unlockMe = nullptr);
 		void resume();
+		void clearResumePermit();
 		void terminate();
 
 		void setThreadHandles(uintptr_t pthreadHandle, uintptr_t dispatchQueueAddress);
