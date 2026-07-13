@@ -153,8 +153,8 @@ typedef struct dserver_kqchan_reply_proc_read {
 // dserver_ring_shm_validate() at the bottom is the trust-boundary gate; it is compiled
 // identically into the server and into the adversarial unit test.
 //
-// This whole block is gated behind DSERVER_RING_TRANSPORT so a default build is
-// byte-identical (the structs/inline fn are only referenced when the feature is enabled).
+// Live transport structures and operations are feature-gated. The static opcode
+// taxonomy below remains available to heatmap consumers in transport-OFF builds.
 //
 
 #ifdef DSERVER_RING_TRANSPORT
@@ -367,6 +367,10 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // are P4; P3 only migrates small inline-only ops.
 #define DSERVER_RING_FLAG_REPLY_ERROR 0x1u
 
+#endif // DSERVER_RING_TRANSPORT
+
+// Static classification describes the common source contract even when transport
+// is compiled out; it does not create a ring, attach a lane, or dispatch any RPC.
 // --- C2S ring opcode allowlist: the SINGLE source of truth (perf #18 P5-bulk, dar-1il.1) ------
 //
 // The set of dserver_callnum_* values a guest may publish onto the c2s ring (and that the server
@@ -610,6 +614,8 @@ static_assert(dserver_ring_c2s_set_is_canon_safe(),
 	"above; such ops belong on the future duplex lane (dar-1il.3), not Lane 1.");
 #endif
 #endif // _DARLINGSERVER_API_H_
+
+#ifdef DSERVER_RING_TRANSPORT
 
 // --- C2S opcode-set ABI tie (perf #18 dar-1il.2 item 2) ---------------------------------------
 //

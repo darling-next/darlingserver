@@ -40,29 +40,12 @@ static void checkinBeforeMonitor()
 	completion.begin(pipe.listener, true);
 	pipe.writer.reset();
 
-	// Model only the caller's pending replacement and the thread consuming it.
-	// Calls are serialized, as they are under Process::_rwlock.
-	bool replacementPending = false;
-	int retaskedThread = 0;
-	auto publishCompletion = [&](Result result) {
-		if (result == Result::Darling) {
-			replacementPending = true;
-		}
-	};
-	auto checkin = [&](int threadID) {
-		publishCompletion(completion.poll());
-		if (std::exchange(replacementPending, false)) {
-			retaskedThread = threadID;
-		}
-	};
-
-	checkin(101);
-	require(retaskedThread == 101,
-		"exec thread Checkin must consume completion before the monitor runs");
-	publishCompletion(completion.poll(pipe.listener));
-	checkin(202);
-	require(retaskedThread == 101,
-		"delayed monitor must not publish another replacement for a later thread");
+	require(completion.poll() == Result::Darling,
+		"Checkin must observe successful exec before the monitor runs");
+	require(completion.poll(pipe.listener) == Result::None,
+		"delayed monitor must not publish a duplicate exec completion");
+	require(completion.poll() == Result::None,
+		"later Checkin must not rediscover the previous image's completion");
 }
 
 static void monitorBeforeCheckin()

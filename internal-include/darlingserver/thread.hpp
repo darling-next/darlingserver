@@ -343,6 +343,7 @@ namespace DarlingServer {
 		 */
 		void suspend(std::function<void()> continuationCallback = nullptr, libsimple_lock_t* unlockMe = nullptr);
 		void resume();
+		void clearResumePermit();
 		void terminate();
 
 		void setThreadHandles(uintptr_t pthreadHandle, uintptr_t dispatchQueueAddress);

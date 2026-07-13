@@ -33,6 +33,11 @@
 #include <darlingserver/monitor.hpp>
 
 namespace DarlingServer {
+	// A0 (perf#25a-hang) per-tid RPC trace sink. Env-gated (DARLING_SERVER_AUXLOG=1), defined in call.cpp,
+	// shared with thread.cpp's reply-disposition sites. No-op when the env is unset. NOT default-on.
+	__attribute__((format(printf, 1, 2)))
+	void __rpctrace(const char* fmt, ...);
+
 	// NOTE: server instances MUST be created with `new` rather than as a normal local/stack variable
 	class Server {
 		friend class Monitor;

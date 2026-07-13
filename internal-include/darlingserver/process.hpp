@@ -96,8 +96,9 @@ namespace DarlingServer {
 		dtape_task_t* _dtapeTask;
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
-		bool _pendingReplacement = false;
 		ExecCompletion _execCompletion;
+		// Only a non-fork main-thread re-checkin replaces the task.
+		bool _mainThreadCheckedIn = false;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -145,7 +146,7 @@ namespace DarlingServer {
 		void _dispose();
 
 		void _setEternalID(EternalID eid);
-		void _setPendingReplacement(); // requires _rwlock
+		void _traceExecCompletion(); // requires _rwlock
 
 	public:
 		using ID = pid_t;
@@ -185,7 +186,7 @@ namespace DarlingServer {
 		bool readMemory(uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode = nullptr) const;
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;
 
-		void notifyCheckin(Architecture architecture);
+		void notifyCheckin(Architecture architecture, bool isMainThread, bool isFork);
 		void beginExec(std::shared_ptr<FD> listener, bool executingMachO);
 		void notifyExecCompletion(const std::shared_ptr<FD>& listener);
 

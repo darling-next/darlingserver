@@ -73,6 +73,10 @@ struct DTapeHooks {
 		static_cast<DarlingServer::Thread*>(thread_context)->resume();
 	};
 
+	static void dtape_hook_thread_clear_resume_permit(void* thread_context) {
+		static_cast<DarlingServer::Thread*>(thread_context)->clearResumePermit();
+	};
+
 	static dtape_task_t* dtape_hook_current_task(void) {
 		auto thread = DarlingServer::Thread::currentThread();
 		if (!thread) {
@@ -405,6 +409,7 @@ struct DTapeHooks {
 
 		.thread_suspend = dtape_hook_thread_suspend,
 		.thread_resume = dtape_hook_thread_resume,
+		.thread_clear_resume_permit = dtape_hook_thread_clear_resume_permit,
 		.thread_terminate = dtape_hook_thread_terminate,
 		.thread_create_kernel = dtape_hook_thread_create_kernel,
 		.thread_setup = dtape_hook_thread_setup,
