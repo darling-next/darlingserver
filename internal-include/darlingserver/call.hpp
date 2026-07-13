@@ -71,6 +71,13 @@ namespace DarlingServer {
 
 		static std::shared_ptr<Call> callFromMessage(Message&& requestMessage);
 
+		// perf #18 D15a (dar-1il.10): is this raw call number a member of the simple-ring C2S
+		// allowlist (DSERVER_RING_C2S_OPCODES)? Used ONLY by the attach-timeline census to classify a
+		// pre-attach UDS call as "would have ridden the ring had it been attached". Defined in call.cpp
+		// where the shared macro is already in scope; returns false when the ring transport is compiled
+		// out. NOT a dispatch predicate -- the real eligibility gate is in ringServiceThread.
+		static bool ringEligibleCallnum(uint32_t callNumber);
+
 		virtual Number number() const = 0;
 		std::shared_ptr<Thread> thread() const;
 

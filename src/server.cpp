@@ -32,6 +32,7 @@
 #include <array>
 #include <sstream>
 #include <cstddef>
+#include <unordered_map>
 #include <darlingserver/registry.hpp>
 #include <sys/eventfd.h>
 #include <darlingserver/duct-tape.h>
@@ -42,6 +43,11 @@
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
+#ifdef DSERVER_RING_TRANSPORT
+	#include <darlingserver/ring.hpp>
+	#include <cstdlib>
+	#include <time.h>
+#endif
 
 static DarlingServer::Server* sharedInstancePointer = nullptr;
 
@@ -460,6 +466,70 @@ DarlingServer::Server::Server(
 	// perf #0 (dar-dar6x4-perf-5dq.6): record the server start time for uptime.
 	Metrics::shared().startMonoUs = Metrics::nowMonoUs();
 
+	// perf #18 P8 D8 (dar-1il.3.2.x): arm the mach_msg_overwrite SHAPE CENSUS if requested. OFF by
+	// default; a pure measurement (no behavior change) that classifies each msg_overwrite by
+	// send/receive + body descriptor shape so we can size the reclaimable fraction of its ~19%
+	// hotness before designing any ring migration. Set DARLING_SERVER_MSG_CENSUS=1 at server start.
+	if (const char* env = getenv("DARLING_SERVER_MSG_CENSUS")) {
+		if (env[0] == '1') {
+			Metrics::shared().msgCensusOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log censusLog("census");
+			censusLog.error() << "[NOTICE] perf#18 D8 mach_msg_overwrite shape census ARMED"
+				<< " (DARLING_SERVER_MSG_CENSUS=1). Pure measurement, no behavior change."
+				<< " Read msg_* counters via the stat socket; msg_send_only_simple / msg_total"
+				<< " sizes the reclaimable share." << censusLog.endLog;
+		}
+	}
+
+	// perf #18 D9 (dar-1il.4): arm the global RPC HEATMAP + lane-eligibility census if requested. OFF by
+	// default; a pure measurement (no behavior change) that records, per call number, the transport split
+	// (uds vs ring), per-transport latency, and the runtime facts that decide lane eligibility
+	// (used_fiber, caller_s2c). The point: stop GUESSING the next op to ring-migrate (the D8 lesson --
+	// the hottest op was barely reclaimable) and find it by DATA. Read rpc_heatmap via the stat socket;
+	// rank by count x (uds_p50 - ring_p50) x eligibility. Set DARLING_SERVER_RPC_HEATMAP=1 at server start.
+	if (const char* env = getenv("DARLING_SERVER_RPC_HEATMAP")) {
+		if (env[0] == '1') {
+			Metrics::shared().heatmapOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log heatmapLog("heatmap");
+			heatmapLog.error() << "[NOTICE] perf#18 D9 global RPC heatmap + lane-eligibility census ARMED"
+				<< " (DARLING_SERVER_RPC_HEATMAP=1). Pure measurement, no behavior change."
+				<< " Read rpc_heatmap via the stat socket; per-callnum transport split + lane verdict."
+				<< heatmapLog.endLog;
+		}
+	}
+
+	// perf #18 D15a (dar-1il.10): arm the ring-ATTACH TIMELINE / reclaimability census if requested.
+	// OFF by default; a pure measurement (no behavior change) that records the per-process pre-attach
+	// UDS window -- which eligible ops run over UDS before the guest lazily attaches its ring, the
+	// ordinal at which attach happens, and attach attempt/reject tallies. D14 found the reclaimable UDS
+	// tail is pre-attach-dominated; this sizes it and informs whether to move attach earlier (and how).
+	// Set DARLING_SERVER_ATTACH_CENSUS=1 at server start. Read attach_census_* via the stat socket.
+	if (const char* env = getenv("DARLING_SERVER_ATTACH_CENSUS")) {
+		if (env[0] == '1') {
+			Metrics::shared().attachCensusOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log attachLog("attachcensus");
+			attachLog.error() << "[NOTICE] perf#18 D15a ring-attach timeline census ARMED"
+				<< " (DARLING_SERVER_ATTACH_CENSUS=1). Pure measurement, no behavior change."
+				<< " Read attach_census_* via the stat socket; pre-attach eligible-UDS by callnum."
+				<< attachLog.endLog;
+		}
+	}
+
+	// perf #18 D17 (dar-1il.12): POST-D16 residual-UDS classifier arming. RECON-ONLY, default-OFF;
+	// classifies each residual UDS call by WHY it is on UDS (first-before-this-thread's-lane vs
+	// despite-a-live-lane) so we can decide if the post-D16 231-call residual is unavoidable (A) or a
+	// wrapper/coverage gap (B/D). Read residual_* via the stat socket. Pure measurement, no behavior change.
+	if (const char* env = getenv("DARLING_SERVER_RESIDUAL_CENSUS")) {
+		if (env[0] == '1') {
+			Metrics::shared().residualCensusOn.store(true, std::memory_order_relaxed);
+			static DarlingServer::Log residualLog("residualcensus");
+			residualLog.error() << "[NOTICE] perf#18 D17 post-D16 residual-UDS classifier ARMED"
+				<< " (DARLING_SERVER_RESIDUAL_CENSUS=1). Pure measurement, no behavior change."
+				<< " Read residual_* via the stat socket; reason buckets + uds-despite-lane by callnum."
+				<< residualLog.endLog;
+		}
+	}
+
 	// Remove the old socket relative to the already-retained prefix. The path
 	// spelling is used only by bind(2), which has no *at variant.
 	if (unlinkat(prefixFD, ".darlingserver.sock", 0) == -1 &&
@@ -624,6 +694,29 @@ void DarlingServer::Server::_handleStatConnection() {
 		       << ", \"workers_available\": " << wq.threadsAvailable
 		       << ", \"clients_blocked_in_rpc\": " << (wq.depth + wq.threadsBusy);
 
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 D17 (dar-1il.12): set the max-ring-threads-per-process gauge at snapshot time (only
+		// when the residual census is armed). The server registers one ring thread per attached guest
+		// thread, so the peak count of ring threads sharing a process IS the server-side proxy for the
+		// guest's "max lanes/process". Computed off the hot path, under the ring-threads lock.
+		if (Metrics::shared().residualCensusOn.load(std::memory_order_relaxed)) {
+			std::unordered_map<Process*, uint64_t> perProc;
+			{
+				std::unique_lock lock(_ringThreadsLock);
+				for (auto& weak : _ringThreads) {
+					if (auto t = weak.lock()) {
+						if (auto p = t->process()) {
+							perProc[p.get()] += 1;
+						}
+					}
+				}
+			}
+			uint64_t mx = 0;
+			for (auto& kv : perProc) mx = std::max(mx, kv.second);
+			Metrics::shared().maxRingThreadsPerProcess.store(mx, std::memory_order_relaxed);
+		}
+#endif
+
 		std::string json = Metrics::shared().snapshotJSON(gauges.str());
 
 		// best-effort blocking-ish write; the payload is tiny (<1KB) so a single write
@@ -684,6 +777,48 @@ void DarlingServer::Server::start() {
 				try {
 					auto call = DarlingServer::Call::callFromMessage(std::move(*msg));
 					if (call) {
+						// perf #18 D15a (dar-1il.10): attach-timeline census. This is the GENUINE UDS
+						// receive site (the main event loop reading the listener socket) -- ring calls
+						// are dispatched in ringServiceThread and never pass through here, so a call
+						// recorded here is unambiguously UDS-transported. Record the per-process UDS
+						// ordinal + whether the ring had attached yet + static ring-eligibility, so we
+						// can size the pre-attach eligible-UDS window. No-op unless the census is armed.
+						if (Metrics::shared().attachCensusOn.load(std::memory_order_relaxed)) {
+							if (auto t = call->thread()) {
+								if (auto p = t->process()) {
+									uint64_t ord = p->nextUdsCallOrdinal();
+									bool attachedYet = p->ringAttachedYet();
+									bool eligible = DarlingServer::Call::ringEligibleCallnum(
+										static_cast<uint32_t>(call->number()));
+									Metrics::shared().recordAttachCensusUdsCall(
+										static_cast<uint32_t>(call->number()), ord, attachedYet, eligible);
+								}
+							}
+						}
+						// perf #18 D17 (dar-1il.12): POST-D16 residual UDS classifier. Same UDS choke point;
+						// classifies each UDS call by WHY it is on UDS using server-observable per-(thread,
+						// process) state -- whether THIS thread has a live ring now (#ifdef'd: ring() exists
+						// only with the ring transport) and whether the process ever attached one. This is
+						// what separates reason A (first-eligible-before-this-thread's-lane) from B/D (an
+						// eligible op on UDS despite a live lane = wrapper gap / forced fallback). No-op
+						// unless DARLING_SERVER_RESIDUAL_CENSUS=1. No lane-ownership change (D17 constraint).
+						if (Metrics::shared().residualCensusOn.load(std::memory_order_relaxed)) {
+							uint32_t cn = static_cast<uint32_t>(call->number());
+							bool eligible = DarlingServer::Call::ringEligibleCallnum(cn);
+							bool controlPlane = (cn == static_cast<uint32_t>(dserver_callnum_checkin))
+							                 || (cn == static_cast<uint32_t>(dserver_callnum_ring_attach));
+							bool threadHasRing = false;
+							bool procEverAttached = false;
+							if (auto t = call->thread()) {
+#ifdef DSERVER_RING_TRANSPORT
+								threadHasRing = (t->ring() != nullptr);
+#endif
+								if (auto p = t->process()) {
+									procEverAttached = p->ringAttachedYet();
+								}
+							}
+							Metrics::shared().recordResidualReason(cn, threadHasRing, procEverAttached, eligible, controlPlane);
+						}
 						// perf #2b (dar-dar6x4-perf-5dq.8): run the call INLINE on the main
 						// event loop instead of always handing it to the worker pool. The
 						// profile (perf #2a) showed ~70% of server CPU was the main-loop ->
@@ -735,7 +870,70 @@ void DarlingServer::Server::start() {
 		}
 
 		struct epoll_event events[16];
-		int ret = epoll_wait(_epollFD, events, 16, -1);
+		int ret;
+
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 P4 (dar-dar6x4-perf-5dq.33): adaptive pre-epoll spin (the gist's wake model).
+		// Before committing to a blocking epoll_wait we busy-poll the attached rings for a bounded
+		// budget so a hot RPC stream is serviced with zero doorbell syscalls and zero scheduler
+		// handoffs. The budget is small (balanced default 20us) and we ALSO poll epoll with a 0
+		// timeout each iteration so UDS + other Monitors are never starved -- if anything else is
+		// ready we break straight out and handle it. Only when the budget elapses with no ring or
+		// epoll activity do we arm + block, exactly as a server with no rings always has.
+		_resolveRingSpinBudget();
+		bool haveRings;
+		{
+			std::unique_lock lock(_ringThreadsLock);
+			haveRings = !_ringThreads.empty();
+		}
+		ret = -2; // sentinel: "not yet blocked"
+		if (haveRings && _ringSpinNs > 0) {
+			struct timespec ts0;
+			clock_gettime(CLOCK_MONOTONIC, &ts0);
+			uint64_t startNs = (uint64_t)ts0.tv_sec * 1000000000ull + ts0.tv_nsec;
+			_setAllRingStates(DSERVER_RING_SRV_ACTIVE_POLLING);
+			for (;;) {
+				uint32_t serviced = _drainRings();
+
+				// Harvest any UDS / Monitor / wakeup readiness without blocking, so the ring spin
+				// never delays them. If something is ready, take it now (ret > 0 -> dispatch loop).
+				ret = epoll_wait(_epollFD, events, 16, 0);
+				if (ret != 0) {
+					break; // ready fds (ret>0) or error (ret<0, handled below)
+				}
+				if (serviced > 0) {
+					continue; // did real work -> keep the budget alive (reset by staying hot)
+				}
+
+				struct timespec ts1;
+				clock_gettime(CLOCK_MONOTONIC, &ts1);
+				uint64_t nowNs = (uint64_t)ts1.tv_sec * 1000000000ull + ts1.tv_nsec;
+				if (nowNs - startNs >= _ringSpinNs) {
+					break; // budget exhausted with nothing to do -> fall through to arm + block
+				}
+				__builtin_ia32_pause();
+			}
+		}
+
+		if (ret == -2 || ret == 0) {
+			// Either we never spun (no rings / low-power) or the spin budget elapsed idle. Arm the
+			// sleep state with the gist's critical recheck: publish SLEEP_ARMED, drain ONCE more
+			// (closing the publish/sleep race -- a guest that produced after our last drain but
+			// before reading SLEEP_ARMED will have doorbelled, but a guest that read ACTIVE_POLLING
+			// and skipped the doorbell is caught here), and only if still idle commit to epoll.
+			_setAllRingStates(DSERVER_RING_SRV_SLEEP_ARMED);
+			if (haveRings && _drainRings() > 0) {
+				// raced in a request -> go service its reply path; don't sleep.
+				_setAllRingStates(DSERVER_RING_SRV_ACTIVE_POLLING);
+				continue;
+			}
+			_setAllRingStates(DSERVER_RING_SRV_SLEEPING_EPOLL);
+			ret = epoll_wait(_epollFD, events, 16, -1);
+			_setAllRingStates(DSERVER_RING_SRV_ACTIVE_POLLING);
+		}
+#else
+		ret = epoll_wait(_epollFD, events, 16, -1);
+#endif
 
 		if (ret < 0) {
 			if (errno == EINTR) {
@@ -939,6 +1137,138 @@ void DarlingServer::Server::removeMonitor(std::shared_ptr<Monitor> monitor) {
 	// force an event loop wakeup (so the removal can be finalized as soon as possible)
 	eventfd_write(_wakeupFD, 1);
 };
+
+#ifdef DSERVER_RING_TRANSPORT
+void DarlingServer::Server::registerRingThread(std::shared_ptr<Thread> thread) {
+	std::unique_lock lock(_ringThreadsLock);
+	// prune dead entries while we're here, and avoid duplicates
+	for (size_t i = 0; i < _ringThreads.size();) {
+		auto t = _ringThreads[i].lock();
+		if (!t) {
+			_ringThreads.erase(_ringThreads.begin() + i);
+		} else if (t.get() == thread.get()) {
+			return; // already registered
+		} else {
+			++i;
+		}
+	}
+	_ringThreads.push_back(thread);
+	// perf #18 D17 (dar-1il.12): cumulative ring-thread registrations = a server-side "lanes acquired"
+	// proxy (each successful per-thread ring_attach lands here exactly once). A plain stat counter.
+	Metrics::shared().totalRingThreadsRegistered.fetch_add(1, std::memory_order_relaxed);
+};
+
+void DarlingServer::Server::unregisterRingThread(std::shared_ptr<Thread> thread) {
+	std::unique_lock lock(_ringThreadsLock);
+	for (size_t i = 0; i < _ringThreads.size();) {
+		auto t = _ringThreads[i].lock();
+		if (!t || t.get() == thread.get()) {
+			_ringThreads.erase(_ringThreads.begin() + i);
+		} else {
+			++i;
+		}
+	}
+};
+
+void DarlingServer::Server::_setAllRingStates(uint32_t state) {
+	std::unique_lock lock(_ringThreadsLock);
+	for (auto& weak : _ringThreads) {
+		if (auto t = weak.lock()) {
+			if (auto r = t->ring()) {
+				r->setServerState(state);
+			}
+		}
+	}
+};
+
+uint32_t DarlingServer::Server::_drainRings() {
+	// Snapshot the live thread set under the lock, then service OUTSIDE the lock: ringServiceThread
+	// runs the full Call path (which can register/unregister rings, take Process/Thread locks, and
+	// suspend microthreads) -- holding _ringThreadsLock across that would invite the dar-6x4
+	// lock-across-suspend hazard class. The snapshot is shared_ptrs so the threads stay alive.
+	std::vector<std::shared_ptr<Thread>> live;
+	{
+		std::unique_lock lock(_ringThreadsLock);
+		live.reserve(_ringThreads.size());
+		for (size_t i = 0; i < _ringThreads.size();) {
+			auto t = _ringThreads[i].lock();
+			if (!t) {
+				_ringThreads.erase(_ringThreads.begin() + i);
+			} else {
+				live.push_back(std::move(t));
+				++i;
+			}
+		}
+	}
+	uint32_t serviced = 0;
+	for (auto& t : live) {
+		// perf #18 P8 D3 (dar-1il.3.1.1): harvest any pending DUPLEX upcall reply for this thread
+		// FIRST. A thread blocked in a duplex S2C upcall has its microthread fiber parked on its reply
+		// semaphore; the guest pump publishes the reply into the ring mailbox. This is the main-loop
+		// resume point: a correlated reply ups the semaphore so the fiber is rescheduled, all without a
+		// dedicated waiter thread (the "scope the server wait to the op, don't block the dserver"
+		// requirement). No-op for threads with nothing in flight. Counts as serviced so the spin budget
+		// stays hot while a duplex roundtrip is mid-flight.
+		if (t->drainDuplexReply()) {
+			++serviced;
+		}
+		serviced += ringServiceThread(t);
+	}
+	if (serviced > 0) {
+		Metrics::shared().ringServicedSpin.fetch_add(serviced, std::memory_order_relaxed);
+	}
+	return serviced;
+};
+
+void DarlingServer::Server::_resolveRingSpinBudget() {
+	if (_ringSpinResolved) {
+		return;
+	}
+	_ringSpinResolved = true;
+
+	// Default budget by mode (the gist's low-power/balanced/latency). balanced is the default:
+	// a short adaptive spin so a back-to-back RPC burst stays hot without burning a core on an
+	// idle desktop. DARLING_SERVER_SPIN_US overrides the microsecond budget directly.
+	uint64_t us = 20; // balanced default
+	if (const char* mode = getenv("DARLING_SERVER_MODE")) {
+		if (strcmp(mode, "low-power") == 0) {
+			us = 0;      // straight to epoll; never poll
+		} else if (strcmp(mode, "latency") == 0) {
+			us = 200;    // aggressive spin (pinning recommended)
+		} else {
+			us = 20;     // balanced / unknown
+		}
+	}
+	if (const char* env = getenv("DARLING_SERVER_SPIN_US")) {
+		char* end = nullptr;
+		unsigned long v = strtoul(env, &end, 10);
+		if (end && *end == '\0') {
+			us = (uint64_t)v;
+		}
+	}
+	_ringSpinNs = us * 1000ull;
+
+	// perf #18 P7 (dar-my8): one-time startup announcement of the ring config. The gist's staged
+	// rollout wants operators to SEE, in the log, that the experimental ring transport is active,
+	// in which mode, and exactly how to turn it (or just the fast ops) off. Resolved once, so this
+	// fires once when the first ring attaches.
+	static DarlingServer::Log ringLog("ring");
+	const char* fastOps = (getenv("DARLING_SERVER_FAST_OPS") && getenv("DARLING_SERVER_FAST_OPS")[0] == '0') ? "OFF" : "on";
+	const char* fastMRP = (getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT") && getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT")[0] == '0') ? "OFF" : "on";
+	// Emitted at error() level deliberately: the default log cutoff is Error, and a staged rollout
+	// REQUIRES this notice be visible without raising the log level. It is a one-time NOTICE, not a
+	// fault. (Worded as [NOTICE] so it doesn't read as a server error.)
+	ringLog.error() << "[NOTICE] perf#18 shared-memory ring transport ACTIVE (experimental). spin_budget="
+		<< (_ringSpinNs / 1000ull) << "us"
+		<< " fast_ops=" << fastOps << " fast_mach_reply_port=" << fastMRP
+		<< ". Disable: rebuild without DSERVER_RING_TRANSPORT (full transport off), or set"
+		<< " DARLING_SERVER_FAST_OPS=0 (all inline fast paths off) /"
+		<< " DARLING_SERVER_FAST_MACH_REPLY_PORT=0 (just mach_reply_port). Mode via DARLING_SERVER_MODE="
+		<< "low-power|balanced|latency or DARLING_SERVER_SPIN_US=<n>."
+		<< " If you hit a hang/crash that may be transport-related, RE-RUN with DARLING_SERVER_FAST_OPS=0"
+		<< " (or a non-ring build) and report whether it reproduces." << ringLog.endLog;
+};
+#endif // DSERVER_RING_TRANSPORT
 
 DarlingServer::Monitor::Monitor(std::shared_ptr<FD> descriptor, Event events, bool edgeTriggered, bool oneshot, std::function<void(std::shared_ptr<Monitor>, Event)> callback):
 	_fd(descriptor),
