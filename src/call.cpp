@@ -36,10 +36,31 @@
 #include <darlingserver/kqchan.hpp>
 #include <system_error>
 #include <cerrno>
+#ifdef DSERVER_RING_TRANSPORT
+	#include <darlingserver/ring.hpp>
+	#include <darlingserver/monitor.hpp>
+	#include <darlingserver/utility.hpp>
+	#include <sys/eventfd.h>
+#endif
 
 static DarlingServer::Log callLog("calls");
 
 DarlingServer::Log DarlingServer::Call::rpcReplyLog("replies");
+
+// perf #18 D15a (dar-1il.10): static ring-eligibility classifier for the attach-timeline census.
+// Mirrors the dispatch allowlist (DSERVER_RING_C2S_OPCODES, rpc-supplement.h) -- the SAME macro the
+// ringServiceThread dispatch keys off -- so "eligible" here means exactly "this op would have ridden
+// the ring had the process attached". Recon only; never gates real dispatch.
+bool DarlingServer::Call::ringEligibleCallnum(uint32_t callNumber) {
+#ifdef DSERVER_RING_TRANSPORT
+#define DSERVER_RING_C2S_ELIGIBLE_CENSUS(op) || (callNumber == (uint32_t)dserver_callnum_##op)
+	return (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE_CENSUS));
+#undef DSERVER_RING_C2S_ELIGIBLE_CENSUS
+#else
+	(void)callNumber;
+	return false;
+#endif
+}
 
 std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Message&& requestMessage) {
 	if (requestMessage.data().size() < sizeof(dserver_rpc_callhdr_t)) {
@@ -251,6 +272,64 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		pipeDesc.acknowledge();
 
 		return nullptr;
+	}
+
+	// perf #18 P8 D8 (dar-1il.3.2.x): mach_msg_overwrite SHAPE CENSUS. Pure measurement, no behavior
+	// change: when armed (DARLING_SERVER_MSG_CENSUS=1, set once on a warm server), classify each
+	// mach_msg_overwrite by send/receive semantics (from the inline RPC args, free) and -- for the
+	// send path -- by the message body's complex/descriptor shape (one cheap readMemory of the header,
+	// skipped entirely when the census is off so the hot path is byte-identical). The goal is to size
+	// the reclaimable fraction of the ~19% msg_overwrite hotness BEFORE designing any ring migration.
+	if (header->number == dserver_callnum_mach_msg_overwrite &&
+	    Metrics::shared().msgCensusOn.load(std::memory_order_relaxed) &&
+	    requestMessage.data().size() >= sizeof(dserver_rpc_call_mach_msg_overwrite_t)) {
+		auto* mc = reinterpret_cast<const dserver_rpc_call_mach_msg_overwrite_t*>(header);
+		const int32_t option = mc->body.option;
+		const bool send = (option & 0x1) != 0; // MACH_SEND_MSG
+		Metrics::MsgComplexClass cclass = Metrics::MsgComplexClass::Unknown;
+		// mach_msg_header_t is 24 bytes in the user ABI (msgh_bits + size + remote/local/voucher port
+		// NAMES [4B each] + id), msgh_bits at offset 0. We use explicit sizes here so this stays free of
+		// the XNU message.h type (not reliably in scope in a darlingserver TU).
+		static const uint32_t kMsgHeaderSize = 24u;
+		static const uint32_t kMachMsghBitsComplex = 0x80000000u;
+		if (send && mc->body.send_size >= kMsgHeaderSize && process) {
+			// Read msgh_bits to tell simple-vs-complex; for a complex message classify by the first
+			// descriptor's type. No mutation, one or two small reads, skipped entirely when census off.
+			uint32_t msghBits = 0;
+			int rc = 0;
+			if (process->readMemory((uintptr_t)mc->body.msg, &msghBits, sizeof(msghBits), &rc)) {
+				if ((msghBits & kMachMsghBitsComplex) == 0) {
+					cclass = Metrics::MsgComplexClass::Simple;
+				} else {
+					// complex: classify by the FIRST descriptor's type (the dominant shape signal).
+					// layout: header(24) | mach_msg_body_t{ uint32 descriptor_count } | desc[0]...
+					// The `type` field is a :8 bitfield that, in every user descriptor variant (port /
+					// ool32 / ool64 / ool_ports / guarded_port), is the HIGH byte of the 4-byte word at
+					// byte offset 8 of the descriptor (after the 4/8-byte address-or-name + a 4-byte
+					// size-or-pad word). Holds for both the 32- and 64-bit user ABIs, so it needs no
+					// architecture branch. We read 12 bytes of desc[0] to reach it.
+					uint8_t dbuf[12];
+					const uintptr_t descStart = (uintptr_t)mc->body.msg + kMsgHeaderSize + sizeof(uint32_t);
+					if (mc->body.send_size >= kMsgHeaderSize + sizeof(uint32_t) + sizeof(dbuf) &&
+					    process->readMemory(descStart, dbuf, sizeof(dbuf), &rc)) {
+						uint32_t typeWord;
+						__builtin_memcpy(&typeWord, dbuf + 8, sizeof(typeWord));
+						uint32_t dtype = (typeWord >> 24) & 0xffu;
+						// MACH_MSG_PORT_DESCRIPTOR=0, OOL=1, OOL_PORTS=2, OOL_VOLATILE=3, GUARDED_PORT=4
+						if (dtype == 1 || dtype == 3) {
+							cclass = Metrics::MsgComplexClass::ComplexOol;       // OOL / OOL_VOLATILE memory
+						} else if (dtype == 0 || dtype == 2 || dtype == 4) {
+							cclass = Metrics::MsgComplexClass::ComplexPort;      // port / ool-ports / guarded-port
+						} else {
+							cclass = Metrics::MsgComplexClass::ComplexOther;
+						}
+					} else {
+						cclass = Metrics::MsgComplexClass::ComplexOther;
+					}
+				}
+			} // else: Unknown (header read failed) -> counted as msg_census_hdr_read_fail
+		}
+		Metrics::shared().recordMsgOverwriteCensus(option, mc->body.send_size, mc->body.rcv_size, mc->body.timeout, cclass);
 	}
 
 	// finally, let's construct the call class
@@ -1418,6 +1497,639 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 	}
 
 	_sendReply(code, portCount, pipes[0]);
+};
+
+// perf #18 (dar-dar6x4-perf-5dq.30): shared-memory ring transport negotiation handler.
+//
+// The guest sends a memfd (via @fd, dup'd into _body.ring_fd) holding a dserver_ring_shm
+// control block + rings + arena, plus the size it claims the mapping is. We treat all of it
+// as untrusted: dserver_ring_attach_check() fstats the fd for its REAL size, maps it
+// read-only, copies the control block out, and runs the pure validator -- dereferencing no
+// guest pointer and trusting no guest-supplied length. reject_reason is 0 (dserver_ring_ok)
+// on accept or a dserver_ring_reject_t code; on any reject (or with the feature compiled
+// off) the guest stays on UDS forever, no error -- the ring is a fast path, never the only
+// path. On accept we build a RingBuffer (maps RW + creates the wake eventfd), register that
+// eventfd as a Readable Monitor on the epoll loop, and hand both to the Thread (it releases
+// them on death). The Monitor callback currently just drains the wake eventfd -- no call is
+// migrated onto the ring yet (that's P3), so there is nothing to dispatch; this proves the
+// attach/teardown lifecycle end-to-end.
+#ifdef DSERVER_RING_TRANSPORT
+// perf #18 P3: service all C2S requests published on a thread's ring. Runs in the ring's
+// Monitor callback on the MAIN event loop (the wake eventfd fired). For each request slot we
+// rebuild the exact UDS-format request bytes the guest would have sent over the socket
+// ({callhdr, body}), construct the SAME Call object via callFromMessage(), arm the thread's
+// one-shot ring-reply sink (beginRingReply), and run it INLINE via doWork() -- identical to
+// the perf#2b main-loop fast path (server.cpp). The reply is redirected onto the s2c ring by
+// Thread::pushCallReply(). Reusing the whole Call path is deliberate: every exec-path fix
+// (dar-l8k UAF, dar-6x4 rwlock-across-suspend, the dar-gwn reply-on-drop guards) applies
+// unchanged -- only the transport in and the reply sink out differ.
+//
+// SECURITY: the slot's callnum/length are attacker-controlled. dserver_ring_consumer_begin()
+// already refuses a corrupt c2s tail; here we additionally (a) bound the inline body to the
+// slot, (b) only accept a small allowlist of ring-eligible call numbers (P3 = task_self_trap),
+// dropping anything else so the guest UDS-falls-back, and (c) never deref a guest pointer.
+// perf #18 P6.1 (dar-ohp): escape hatches. Resolved once from the environment. The fast inline
+// path (doWorkInline, no fiber) is ON by default when the ring is enabled, but either knob set to
+// "0" forces the op back through the generic doWork() fiber path -- so the ring transport can be
+// run WITHOUT specialized inline semantics if a bug surfaces.
+//   DARLING_SERVER_FAST_OPS=0            -> disable ALL inline fast paths
+//   DARLING_SERVER_FAST_MACH_REPLY_PORT=0 -> disable just mach_reply_port's inline path
+static bool ringFastOpsEnabled() {
+	static const bool v = []() {
+		const char* e = getenv("DARLING_SERVER_FAST_OPS");
+		return !(e && e[0] == '0' && e[1] == '\0');
+	}();
+	return v;
+}
+static bool ringFastMachReplyPortEnabled() {
+	static const bool v = []() {
+		const char* e = getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT");
+		return !(e && e[0] == '0' && e[1] == '\0');
+	}();
+	return v;
+}
+// perf #18 P8 D3 (dar-1il.3.1.1): the DUPLEX SELFTEST hatch. Default OFF (must be set to "1"). The
+// sentinel parent op (DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) is recognized in the ring service loop ONLY
+// when this is on, so the duplex lane never activates on any real op or on a normal boot -- it is the
+// outer kill-switch on top of the per-thread conjunction guard. (Membership-wise the sentinel callnum
+// is OUTSIDE the RPC range + not in DSERVER_RING_C2S_OPCODES, so with the hatch off it falls through to
+// the eligible check, is not allowlisted, and is dropped exactly like any unknown callnum.)
+static bool ringDuplexSelftestEnabled() {
+	static const bool v = []() {
+		const char* e = getenv("DARLING_SERVER_DUPLEX_SELFTEST");
+		return e && e[0] == '1' && e[1] == '\0';
+	}();
+	return v;
+}
+
+// perf #18 P8 D5 (dar-1il.3.2.2): the BOOT-SCOPED launchd vm_deallocate-via-duplex proof harness (option 1,
+// gist 3e928115). The caller-S2C munmap deadlock the duplex lane exists to cure is reachable in practice
+// ONLY in launchd/early-init (guest pid 1) on a normal boot; a warm leaf command never drives it. So the
+// ONLY way to get a LIVE caller-S2C cure proof is to let launchd route a vm_deallocate over the duplex lane
+// AT BOOT -- but globally enabling that (or an inherited env hatch) is the forbidden init-wedge hazard. This
+// harness threads that needle: it is a ONE-SHOT, BUDGET-LIMITED, AUTO-DISARMING proof, armed ONLY by an env
+// var ON THE SERVER PROCESS ITSELF (DARLING_SERVER_D5_VMDEALLOC_PROOF=<budget>, set when LAUNCHING the
+// server -- never a guest daemon's inherited env, so shellspawn/leaf processes are untouched). The routing
+// CONJUNCTION (below, in ringServiceThread) additionally requires guest pid==1 + the vm_deallocate callnum +
+// the duplex caps + a clean mailbox, and AUTO-DISARMS (budget->0) after the first successful caller-S2C, so
+// at most <budget> launchd vm_deallocates ever ride the lane and every park is bounded fail-closed.
+//
+// proofBudget(): the remaining number of launchd vm_deallocates allowed onto the duplex lane. Initialized
+// once from the env (0 = disarmed/off, the default). decremented to 0 on the first proven caller-S2C.
+static std::atomic<int>& d5VmDeallocProofBudget() {
+	static std::atomic<int> budget{[]() {
+		const char* e = getenv("DARLING_SERVER_D5_VMDEALLOC_PROOF");
+		if (!e) return 0;
+		int v = atoi(e);
+		if (v < 0) v = 0;
+		if (v > 3) v = 3; // gist: ideally 1-3 events; hard cap the blast radius.
+		return v;
+	}()};
+	return budget;
+}
+static bool d5VmDeallocProofArmed() {
+	return d5VmDeallocProofBudget().load(std::memory_order_relaxed) > 0;
+}
+// Is this callnum eligible for the no-fiber inline fast path? Must be a PROVEN-non-blocking op.
+// task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
+// never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
+//
+// TAXONOMY (perf #18 Phase A, dar-dar6x4-perf-5dq.30.1): this predicate is the "NoFiberFastEligible"
+// concept (Tier 2) in the three-lane vocabulary defined next to DSERVER_RING_OP_CLASS in
+// rpc-supplement.h -- DISTINCT from, and a strict subset of, "SimpleRingC2SEligible" (Tier 1, the
+// DSERVER_RING_C2S_OPCODES allowlist). NoFiberFastEligible => SimpleRingC2SEligible, never the reverse.
+// The classification table tags exactly these two ops NOFIBER_FAST; keep this function in sync with it
+// (the table is documentation/guardrail, this is the live gate -- they must agree).
+//
+// perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT here. Two reasons, both standing:
+// (1) it is not no-fiber-inline-safe -- running it WITHOUT the microthread fiber (doWorkInline) was
+// MEASURED to corrupt the thread's fiber/stack bookkeeping (a later doWork() frees a garbage _stack:
+// StackPool::free -> munmap EINVAL -> std::terminate). It does a port->task translation + task
+// refcounting that is unsafe off the fiber, unlike the surgical mach_reply_port path (pure mint).
+// (2) perf #18 dar-1il.2: it is no longer in the C2S ring allowlist AT ALL (not even the generic
+// fiber path) -- mach_port_mod_refs(delta<0) dropping the last ref is destroy-capable, and
+// destroying a mapped-region-backed port drives a vm munmap S2C upcall to a caller parked on the
+// ring -> deadlock (the same class that sank mach_port_deallocate). It is UDS-only until a
+// proven-safe subset is gated. The no-fiber inline sub-case is reserved for the trivial pure-mint
+// port traps only; the C2S allowlist (DSERVER_RING_C2S_OPCODES, expanded in ringServiceThread) is
+// the larger Tier-1 set, and mod_refs is in NEITHER.
+static bool ringFastPathEligible(uint32_t callnum) {
+	if (!ringFastOpsEnabled()) {
+		return false;
+	}
+	if (callnum == dserver_callnum_mach_reply_port) {
+		return ringFastMachReplyPortEnabled();
+	}
+	if (callnum == dserver_callnum_task_self_trap) {
+		return true;
+	}
+	// perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap are the remaining members of the
+	// pure-mint self-trap family. Same processCall structure as task_self_trap (dtape_*_self_trap mint
+	// + _sendReply -- no port->task translation, no refcounting, no fiber-sensitive stack state), so
+	// they are no-fiber-inline-safe exactly like it. They ride the global fast-ops hatch only (like
+	// task_self_trap, not the per-op mach_reply_port hatch).
+	if (callnum == dserver_callnum_thread_self_trap || callnum == dserver_callnum_host_self_trap) {
+		return true;
+	}
+	return false;
+}
+
+// perf #18 P6.1 step 2 (dar-ohp): is this slot eligible for the SURGICAL direct dispatch (skip
+// Call/Message entirely, run dtape_mach_reply_port + publish straight onto the ring)? Stricter than
+// ringFastPathEligible: EXACTLY mach_reply_port, the per-op hatch on, and a no-payload/no-arena
+// shape (the trap takes no arguments; any body/descriptors/arena means a malformed or unexpected
+// request -> reject and fall back to the framed path which validates fully). The shape guard is the
+// security boundary for the no-Call path: we never decode an attacker-shaped slot here.
+static bool fastMachReplyPortEligible(uint32_t callnum, uint32_t reqlen, uint32_t arenaLen) {
+#ifndef NO_SHAPE_GUARD
+	if (reqlen != 0 || arenaLen != 0) {
+		return false; // mach_reply_port has an empty request body and no arena
+	}
+#endif
+	if (callnum != dserver_callnum_mach_reply_port) {
+		return false;
+	}
+	return ringFastOpsEnabled() && ringFastMachReplyPortEnabled();
+}
+
+uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::Thread>& thread) {
+	using namespace DarlingServer;
+	uint32_t serviced = 0;
+	auto ring = thread->ring();
+	if (!ring) {
+		return 0;
+	}
+	const auto& cb = ring->controlBlock();
+	dserver_ring_t* c2s = ring->c2sRing();
+	uint32_t slotSize = cb.slot_size;
+	uint32_t slotCount = cb.slot_count;
+	uint32_t inlineCap = slotSize - static_cast<uint32_t>(sizeof(dserver_ring_slot_t));
+
+	auto process = thread->process();
+	if (!process) {
+		return 0;
+	}
+
+	// bounded drain: never loop more than slotCount times even if a buggy/hostile peer keeps
+	// the tail ahead (consumer_advance bounds us anyway, but be explicit).
+	for (uint32_t guard = 0; guard < slotCount; ++guard) {
+		dserver_ring_slot_t* req = dserver_ring_consumer_begin(c2s, slotSize, slotCount);
+		if (!req) {
+			break; // empty or corrupt tail
+		}
+#ifdef DSERVER_RING_PHASE_PROF
+		uint64_t _phaseT0 = Metrics::rdtscCycles(); // perf#18 P6: drain phase start
+#endif
+
+		// Copy the transport header out before trusting it (guest can mutate concurrently).
+		uint32_t callnum = req->callnum;
+		uint32_t reqlen = req->length;
+		uint32_t seq = req->seq;
+		uint32_t arenalen = req->arena_len;
+
+		// perf #18 P8 D3 (dar-1il.3.1.1): the synthetic DUPLEX SELFTEST parent op. Recognized ONLY
+		// behind the env hatch + ONLY for the out-of-RPC-range sentinel callnum, so no real op and no
+		// normal boot ever reaches it. Shape: an empty-or-one-uint32 body carrying the echo arg. We free
+		// the slot, then kick off ONE guarded duplex S2C upcall (publish + return -- it does NOT park;
+		// the main-loop drain completes the parent by publishing its final reply when the correlated
+		// reply arrives). If the conjunction guard declines (no v4 ring / no cap / busy / stale mailbox),
+		// publish the parent's FAILURE reply immediately so the guest selftest never wedges.
+		if (ringDuplexSelftestEnabled() && callnum == DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) {
+			uint32_t arg = 0;
+			if (reqlen >= sizeof(uint32_t) && reqlen <= inlineCap) {
+				memcpy(&arg, reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t), sizeof(arg));
+			}
+			dserver_ring_consumer_advance(c2s); // free the slot before kicking off the upcall
+			if (!thread->duplexSelftestUpcall(arg, seq)) {
+				// guard declined -> the duplex path was NOT taken; fail the parent reply now (code != 0,
+				// no fabricated success). The guest selftest sees the error code + UDS-equivalent miss.
+				thread->ring()->publishReply(seq, DSERVER_RING_DUPLEX_SELFTEST_CALLNUM, -1, nullptr, 0);
+				thread->ring()->wakeGuest();
+			}
+			++serviced;
+			continue;
+		}
+
+		// perf #18 P8 D4 (dar-1il.3.2.1): mach_port_deallocate as a DUPLEX PARENT. deallocate is NOT on
+		// the simple ring (it is destroy-capable / caller-S2C); a duplex-deallocate-capable guest routes
+		// it here. We run it on the GENERIC fiber path (exactly like a simple-ring body op) but with
+		// _ringDuplexParentActive set, so its munmap S2C (if any) rides the duplex mailbox instead of the
+		// UDS S2C that a ring-parked caller can't service. The ROUTING decline (the pre-mutation safety
+		// boundary) is HERE: if the caller did not advertise DUPLEX_CAP_DEALLOCATE we must NOT dispatch
+		// the op (we can't safely service its possible S2C) -- publish a DECLINE reply so the guest
+		// UDS-falls-back, BEFORE any mutation (no double-effect). The decline is decidable purely from the
+		// negotiated cap, before the op runs.
+		if (callnum == (uint32_t)dserver_callnum_mach_port_deallocate) {
+			if (!thread->duplexDeallocateCapable()) {
+				// caller is not duplex-deallocate-capable: decline pre-dispatch -> guest UDS-falls-back.
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringDuplexDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			if (reqlen != sizeof(dserver_call_mach_port_deallocate_t)) {
+				// unexpected shape -> decline pre-dispatch (no mutation), guest UDS-falls-back.
+				// (dserver_call_mach_port_deallocate_t is the BODY only: {uint32 target; uint32 name} = 8B.)
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringDuplexDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			// the op is being dispatched onto the duplex lane (proof it RODE the lane, S2C or not).
+			Metrics::shared().ringDuplexParent.fetch_add(1, std::memory_order_relaxed);
+			// rebuild {callhdr, body} exactly as the simple-ring generic path, then dispatch on the fiber
+			// with the duplex-parent flag set so _s2cPerform routes the munmap S2C through the mailbox.
+			size_t totalSize = sizeof(dserver_rpc_callhdr_t) + reqlen;
+			Message reqMsg(totalSize, 0);
+			reqMsg.data().resize(totalSize);
+			auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
+			hdr->number = static_cast<dserver_callnum_t>(callnum);
+			hdr->pid = process->nsid();
+			hdr->tid = thread->nsid();
+			hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
+			       reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t), reqlen);
+			reqMsg.setAddress(thread->address());
+			reqMsg.setPID(process->id());
+			dserver_ring_consumer_advance(c2s); // free the slot before running the op
+			thread->beginRingReply(seq);
+			thread->setRingDuplexParentActive(true);
+			try {
+				auto call = Call::callFromMessage(std::move(reqMsg));
+				if (call) {
+					call->thread()->doWork();
+					++serviced;
+				}
+			} catch (const std::exception& ex) {
+				callLog.error() << "ring duplex deallocate dispatch threw: " << ex.what() << callLog.endLog;
+			}
+			thread->setRingDuplexParentActive(false);
+			continue;
+		}
+
+		// perf #18 P8 D5 (dar-1il.3.2.2): mach_vm_deallocate as a DUPLEX PARENT. Unlike D4's
+		// mach_port_deallocate (whose munmap S2C is unreachable in Darling because make_memory_entry is a
+		// stub), vm_deallocate DOES drive a real caller munmap S2C (vm_map_remove -> dtape_hook_task_free_
+		// pages -> _munmap -> _s2cPerform) -- it is the op that genuinely exercises (and proves) the duplex
+		// lane's caller-S2C cure. Same machinery as D4: run on the GENERIC fiber path with
+		// _ringDuplexParentActive set so the munmap S2C rides the duplex mailbox instead of the UDS S2C a
+		// ring-parked caller can't service. The PRE-MUTATION routing decline is HERE, keyed on the SPECIFIC
+		// VM_DEALLOCATE cap (a D4-only-capable caller must NOT have a vm_deallocate routed onto the lane).
+		if (callnum == (uint32_t)dserver_callnum_mach_vm_deallocate) {
+			// perf #18 P8 D6 (caller-S2C sideband) PROOF CONJUNCTION (gist 3e928115 answer #2). Route a
+			// vm_deallocate onto the duplex lane ONLY if EVERY condition holds; else DECLINE pre-dispatch (no
+			// mutation -> guest UDS-falls-back, the old behavior). The SYNTHETIC WARM real-munmap proof: a
+			// test guest allocates a real page locally then sends vm_deallocate of it with
+			// target==mach_task_self() OVER the duplex ring (bypassing the trap's local-munmap gate). The
+			// server _kernelrpc_mach_vm_deallocate_trap resolves target to the CURRENT task and frees the
+			// caller's REAL pages -> vm_map_remove -> task_free_pages -> a REAL caller-S2C munmap which, since
+			// the caller is a ring-parked duplex parent, rides the duplex mailbox = ring_duplex_s2c>0 LIVE on
+			// the real transport (real _s2cPerform munmap, real guest munmap pump, real fiber resume, real
+			// final reply -- NOT a fake echo, NOT fabricated success). PARENT-CENTRIC guard: armed proof +
+			// duplex-vm cap + shape (NOT pid -- the active pump-capable ring parent IS the carrier, set by
+			// dispatching here with _ringDuplexParentActive). Budget-bounded + auto-disarm caps blast radius.
+			// A decline here is ALWAYS pre-mutation (no double-effect).
+			bool armed = d5VmDeallocProofArmed();
+			bool capable = thread->duplexVmDeallocateCapable();
+			bool goodShape = (reqlen == sizeof(dserver_call_mach_vm_deallocate_t));
+			if (!armed || !capable || !goodShape) {
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringDuplexDecline.fetch_add(1, std::memory_order_relaxed);
+				Metrics::shared().ringDuplexVmdeallocDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			// ARMED + pid-1 + capable + good shape: dispatch onto the duplex lane. Its munmap S2C (if the
+			// freed range is server-managed -- which launchd's early-init vm_deallocates are) rides the
+			// duplex mailbox and increments ring_duplex_vmdealloc_s2c -- the LIVE caller-S2C cure proof.
+			Metrics::shared().ringDuplexParent.fetch_add(1, std::memory_order_relaxed);
+			Metrics::shared().ringDuplexVmdeallocParent.fetch_add(1, std::memory_order_relaxed);
+			size_t totalSize = sizeof(dserver_rpc_callhdr_t) + reqlen;
+			Message reqMsg(totalSize, 0);
+			reqMsg.data().resize(totalSize);
+			auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
+			hdr->number = static_cast<dserver_callnum_t>(callnum);
+			hdr->pid = process->nsid();
+			hdr->tid = thread->nsid();
+			hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
+			       reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t), reqlen);
+			reqMsg.setAddress(thread->address());
+			reqMsg.setPID(process->id());
+			dserver_ring_consumer_advance(c2s); // free the slot before running the op
+			thread->beginRingReply(seq);
+			thread->setRingDuplexParentActive(true);
+			thread->setRingDuplexVmdeallocProof(true); // tag so _drainDuplexReply bumps the vmdealloc counters
+			try {
+				auto call = Call::callFromMessage(std::move(reqMsg));
+				if (call) {
+					call->thread()->doWork();
+					Metrics::shared().ringDuplexVmdeallocFinal.fetch_add(1, std::memory_order_relaxed);
+					++serviced;
+				}
+			} catch (const std::exception& ex) {
+				callLog.error() << "ring duplex vm_deallocate dispatch threw: " << ex.what() << callLog.endLog;
+			}
+			thread->setRingDuplexVmdeallocProof(false);
+			thread->setRingDuplexParentActive(false);
+			// AUTO-DISARM: if this dispatch produced a real caller-S2C (the proof goal), spend one budget
+			// unit; once it hits 0 the proof is disarmed and no further launchd vm_deallocate rides the lane.
+			if (thread->takeRingDuplexVmdeallocS2cFired()) {
+				int prev = d5VmDeallocProofBudget().fetch_sub(1, std::memory_order_relaxed);
+				if (prev <= 1) {
+					Metrics::shared().ringDuplexVmdeallocDisarmed.fetch_add(1, std::memory_order_relaxed);
+					callLog.error() << "[D5PROOF] launchd vm_deallocate caller-S2C cured over duplex lane; "
+					                << "proof auto-disarmed (budget exhausted)" << callLog.endLog;
+				}
+			}
+			continue;
+		}
+
+		// perf #18 P6.1 step 2 (dar-ohp): SURGICAL direct dispatch for mach_reply_port. Skip the
+		// Message rebuild + callFromMessage registry re-lookup + Call heap-alloc that step 1 still
+		// pays. The thread is already held (shared_ptr) for this whole slot iteration, so its
+		// lifetime is guaranteed without the registry lookup; doMachReplyPortInline runs the bare
+		// dtape trap on it and publishes the reply itself. Free the request slot FIRST (same as the
+		// generic path), then dispatch. If it declines (busy/dead/etc.), fall through to the generic
+		// step-1 path below, which re-stages the Message and handles every edge case.
+		if (fastMachReplyPortEligible(callnum, reqlen, arenalen)) {
+			dserver_ring_consumer_advance(c2s); // free the slot before running the op
+#ifdef DSERVER_RING_PHASE_PROF
+			uint64_t _fpT0 = Metrics::rdtscCycles();
+#endif
+			if (thread->doMachReplyPortInline(seq)) {
+				++serviced;
+				Metrics::shared().ringFastHit.fetch_add(1, std::memory_order_relaxed);
+#ifdef DSERVER_RING_PHASE_PROF
+				// The fast path collapses drain+dispatch+body into one window; record the whole
+				// thing as "body" (it IS the op) minus the publish cycles the inline op stashed.
+				uint64_t _fpT1 = Metrics::rdtscCycles();
+				auto& m = Metrics::shared();
+				uint64_t pub = thread->takeRingPublishCycles();
+				uint64_t total = _fpT1 - _fpT0;
+				uint64_t body = (total > pub) ? (total - pub) : 0;
+				m.phaseBodyCycles.fetch_add(body, std::memory_order_relaxed);
+				m.phasePublishCycles.fetch_add(pub, std::memory_order_relaxed);
+				m.phaseSamples.fetch_add(1, std::memory_order_relaxed);
+#endif
+				continue;
+			}
+			// declined inline -> rebuild + run via the generic path (the slot is already consumed,
+			// so re-stage the Message from the copied-out header; reqlen==0 means no body to copy).
+			Metrics::shared().ringFastFallback.fetch_add(1, std::memory_order_relaxed);
+			size_t fbSize = sizeof(dserver_rpc_callhdr_t);
+			Message fbMsg(fbSize, 0);
+			fbMsg.data().resize(fbSize);
+			auto* fbHdr = reinterpret_cast<dserver_rpc_callhdr_t*>(fbMsg.data().data());
+			fbHdr->number = static_cast<dserver_callnum_t>(callnum);
+			fbHdr->pid = process->nsid();
+			fbHdr->tid = thread->nsid();
+			fbHdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+			fbMsg.setAddress(thread->address());
+			fbMsg.setPID(process->id());
+			thread->beginRingReply(seq);
+			try {
+				auto fbCall = Call::callFromMessage(std::move(fbMsg));
+				if (fbCall) {
+					if (!fbCall->thread()->doWorkInline()) {
+						fbCall->thread()->doWork();
+					}
+					++serviced;
+				}
+			} catch (const std::exception& ex) {
+				callLog.error() << "ring fast-path fallback dispatch threw: " << ex.what() << callLog.endLog;
+				Metrics::shared().ringFastFail.fetch_add(1, std::memory_order_relaxed);
+			}
+			continue;
+		}
+
+		// C2S allowlist: which call numbers may ride the ring. task_self_trap was the first
+		// migration (correctness-first; cached per-process so it doesn't move latency);
+		// mach_reply_port is the UNCACHED high-frequency port trap (empty body, {replyhdr.code,
+		// uint32 port} reply). perf #18 P5 (dar-1il): mach_port_mod_refs joins -- it carries a
+		// 4-arg request BODY (target,name,right,delta) and a HEADER-ONLY reply (the result is the
+		// kern_return_t code, no port), so it exercises the generic body-copy datapath below
+		// (NOT the empty-body surgical path). The Message is rebuilt as {callhdr, body} exactly as
+		// over UDS and dispatched via callFromMessage -> the same MachPortModRefs::processCall ->
+		// the same dtape primitive, so behavior is byte-identical to UDS. Anything not allowlisted
+		// -> drop (consume so we don't spin); the guest will UDS-fall-back for it.
+		// NOTE: this allowlist must NOT be gated by a per-op env hatch. A request that the guest
+		// published here is parked waiting for a ring reply; silently dropping it (consume + no
+		// reply) strands the guest on its bounded reply-wait every call (slow UDS re-fall-back per
+		// op = effectively wedged). These ops ride the safe GENERIC fiber path, so they need no
+		// fast-path kill-switch -- the whole-transport switch (DSERVER_RING_TRANSPORT / ABI
+		// auto-fallback) is their safety valve, exactly like task_self_trap.
+		//
+		// perf #18 P5-bulk (dar-1il.1): the allowlist is GENERATED from DSERVER_RING_C2S_OPCODES
+		// (rpc-supplement.h) -- the SAME macro the guest's ring dispatch consumes -- so the guest
+		// "may publish" set and the server "will service" set can never drift (the no-silent-drop
+		// invariant; ring_drift_gate_test.c pins it). To add an op: edit the macro in ONE place.
+		bool eligible = false;
+#define DSERVER_RING_C2S_ELIGIBLE(op) || (callnum == (uint32_t)dserver_callnum_##op)
+		eligible = (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE));
+#undef DSERVER_RING_C2S_ELIGIBLE
+		if (!eligible || reqlen > inlineCap) {
+			dserver_ring_consumer_advance(c2s);
+			continue;
+		}
+
+		// Rebuild the UDS-format request: {callhdr, body}. For task_self_trap there is no body.
+		// Copy the (bounded) inline body out of the slot into a server-owned Message buffer so
+		// the guest can't race-mutate it after we validate.
+		size_t totalSize = sizeof(dserver_rpc_callhdr_t) + reqlen;
+		Message reqMsg(totalSize, 0);
+		reqMsg.data().resize(totalSize);
+		auto* hdr = reinterpret_cast<dserver_rpc_callhdr_t*>(reqMsg.data().data());
+		hdr->number = static_cast<dserver_callnum_t>(callnum);
+		// The call header carries the GUEST-NAMESPACE ids (nsid): callFromMessage() looks the
+		// thread/process up in the registry keyed on nsid. Using the server-internal id() here
+		// makes the lookup miss -> "non-existent thread" -> ESRCH -> the guest FUTEX_WAITs on a
+		// reply that never comes (boot wedge). Mirror the real UDS path: header = nsid, and set
+		// the Message's SCM-pid to the LINUX id() so callFromMessage's pid-consistency check
+		// (process->id() == requestMessage.pid()) holds.
+		hdr->pid = process->nsid();
+		hdr->tid = thread->nsid();
+		hdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
+		if (reqlen > 0) {
+			memcpy(reqMsg.data().data() + sizeof(dserver_rpc_callhdr_t),
+			       reinterpret_cast<const char*>(req) + sizeof(dserver_ring_slot_t),
+			       reqlen);
+		}
+		reqMsg.setAddress(thread->address());
+		reqMsg.setPID(process->id());
+
+		// done reading the request slot; free it before running the call
+		dserver_ring_consumer_advance(c2s);
+
+		// Arm the one-shot ring-reply sink, then dispatch through the normal Call path.
+		thread->beginRingReply(seq);
+#ifdef DSERVER_RING_PHASE_PROF
+		uint64_t _phaseT1 = Metrics::rdtscCycles(); // drain end / dispatch start
+#endif
+		try {
+			auto call = Call::callFromMessage(std::move(reqMsg));
+#ifdef DSERVER_RING_PHASE_PROF
+			uint64_t _phaseT2 = Metrics::rdtscCycles(); // dispatch end / body start
+#endif
+			if (call) {
+				// perf #18 P6.1: for proven-non-blocking allowlisted ops, run WITHOUT the
+				// microthread fiber (doWorkInline) -- the P6 breakdown showed the fiber is ~half
+				// the hot-path cost. doWorkInline returns false if it declined (not the simple
+				// fresh-call case) -> fall back to the generic fiber doWork(). Anything not
+				// fast-eligible (or with the escape hatch off) takes the generic path unchanged
+				// (= perf#2b inline-on-main-loop-via-fiber; self-traps never block).
+				if (ringFastPathEligible(callnum)) {
+					if (!call->thread()->doWorkInline()) {
+						call->thread()->doWork();
+					}
+				} else {
+					call->thread()->doWork();
+				}
+				++serviced;
+#ifdef DSERVER_RING_PHASE_PROF
+				uint64_t _phaseT3 = Metrics::rdtscCycles(); // body end
+				auto& m = Metrics::shared();
+				// body = doWork window MINUS the publish cycles recorded inside publishReply for
+				// this very call (publishReply ran during doWork, via pushCallReply). We read the
+				// just-added publish delta back out of the thread's one-shot scratch.
+				uint64_t pub = thread->takeRingPublishCycles();
+				uint64_t bodyTotal = _phaseT3 - _phaseT2;
+				uint64_t body = (bodyTotal > pub) ? (bodyTotal - pub) : 0;
+				m.phaseDrainCycles.fetch_add(_phaseT1 - _phaseT0, std::memory_order_relaxed);
+				m.phaseDispatchCycles.fetch_add(_phaseT2 - _phaseT1, std::memory_order_relaxed);
+				m.phaseBodyCycles.fetch_add(body, std::memory_order_relaxed);
+				m.phasePublishCycles.fetch_add(pub, std::memory_order_relaxed);
+				m.phaseSamples.fetch_add(1, std::memory_order_relaxed);
+#endif
+			}
+		} catch (const std::exception& ex) {
+			callLog.error() << "ring C2S dispatch threw: " << ex.what() << callLog.endLog;
+			// leave the ring-reply armed flag to be cleared on the next reply; the guest will
+			// time out on this op and UDS-fall-back. Keep serving the rest.
+		}
+	}
+	return serviced;
+}
+#endif
+
+void DarlingServer::Call::RingAttach::processCall() {
+#ifdef DSERVER_RING_TRANSPORT
+	uint32_t rejectReason = dserver_ring_reject_total_size; // default-deny
+	int code = 0;
+	int guestWakeFd = -1; // dup of the wake eventfd handed back to the guest (-1 on reject)
+
+	if (auto thread = _thread.lock()) {
+		if (_body.ring_fd < 0) {
+			// no fd arrived -- can't be a valid attach
+			rejectReason = dserver_ring_reject_total_size;
+		} else {
+			dserver_ring_reject_t reject = dserver_ring_reject_total_size;
+			auto ring = RingBuffer::attach(
+				_body.ring_fd,
+				_body.mapping_size,
+				static_cast<int32_t>(thread->nsid()),
+				&reject
+			);
+			rejectReason = static_cast<uint32_t>(reject);
+
+			if (ring) {
+				const auto& cb = ring->controlBlock();
+				callLog.debug() << "ring_attach accepted for TID " << thread->nsid()
+					<< " (" << cb.slot_count << " slots of " << cb.slot_size << "B)"
+					<< callLog.endLog;
+
+				// Watch the ring's wake eventfd. The guest writes it to signal "I published a
+				// request"; the callback drains it and services the C2S ring. HangUp tears the
+				// ring down. We pass the Monitor a dup of the eventfd (the RingBuffer owns the
+				// original) so the two lifetimes stay independent.
+				int wakeDup = ::dup(ring->eventfd());
+				// And a SECOND dup to hand back to the guest (Variant 2 wake design): the guest
+				// writes this fd to wake the server. The generated reply machinery takes
+				// ownership of guestWakeFd and closes it after the SCM_RIGHTS send.
+				guestWakeFd = ::dup(ring->eventfd());
+				if (wakeDup < 0 || guestWakeFd < 0) {
+					if (wakeDup >= 0) ::close(wakeDup);
+					if (guestWakeFd >= 0) { ::close(guestWakeFd); guestWakeFd = -1; }
+					rejectReason = static_cast<uint32_t>(dserver_ring_reject_total_size);
+				} else {
+					std::weak_ptr<Thread> weakThread = thread;
+					auto monitor = std::make_shared<Monitor>(
+						std::make_shared<FD>(wakeDup),
+						Monitor::Event::Readable | Monitor::Event::HangUp,
+						false, false,
+						[weakThread](std::shared_ptr<Monitor> thisMonitor, Monitor::Event events) {
+							auto t = weakThread.lock();
+							if (auto r = (t ? t->ring() : nullptr)) {
+								r->drainWake();
+							} else {
+								// thread/ring gone -- drain raw so the fd stops firing
+								eventfd_t value;
+								eventfd_read(thisMonitor->fd()->fd(), &value);
+							}
+							if (static_cast<uint64_t>(events & Monitor::Event::HangUp) != 0) {
+								if (t) {
+									Server::sharedInstance().unregisterRingThread(t);
+								}
+								Server::sharedInstance().removeMonitor(thisMonitor);
+								return;
+							}
+							// Service every request the guest published since the last wake. This is
+							// the COLD path: the guest doorbelled because the server was sleeping.
+							if (t) {
+								Metrics::shared().ringDoorbellsReceived.fetch_add(1, std::memory_order_relaxed);
+								uint32_t n = ringServiceThread(t);
+								if (n > 0) {
+									Metrics::shared().ringServicedDoorbell.fetch_add(n, std::memory_order_relaxed);
+								}
+							}
+						}
+					);
+					Server::sharedInstance().addMonitor(monitor);
+					thread->attachRing(ring, monitor);
+					// perf #18 P4: register the ring-owning thread with the server so the main
+					// loop's pre-epoll spin phase can drain it directly (the eventfd Monitor is
+					// only the COLD-path wake; on the hot path the guest skips the doorbell and
+					// the spin phase finds the request by polling the c2s ring).
+					Server::sharedInstance().registerRingThread(thread);
+				}
+			} else {
+				callLog.info() << "ring_attach rejected for TID " << thread->nsid()
+					<< " reason " << rejectReason << " -- thread stays on UDS" << callLog.endLog;
+			}
+
+			// perf #18 D15a (dar-1il.10): attach-timeline census. Record the outcome and, on success,
+			// latch the ordinal at which the ring attached (= how many UDS calls this process ran
+			// before the ring existed -- the size of the pre-attach window). guestWakeFd>=0 means the
+			// ring was mapped + the thread registered (true success). No-op unless the census is armed.
+			if (Metrics::shared().attachCensusOn.load(std::memory_order_relaxed)) {
+				bool success = (guestWakeFd >= 0);
+				uint64_t ordinalAtAttach = 0;
+				if (auto p = thread->process()) {
+					ordinalAtAttach = p->currentUdsCallOrdinal();
+					if (success) {
+						p->markRingAttachedAtOrdinal(ordinalAtAttach == 0 ? 1 : ordinalAtAttach);
+					}
+				}
+				Metrics::shared().recordAttachOutcome(success, rejectReason, ordinalAtAttach);
+			}
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, rejectReason, guestWakeFd);
+#else
+	// feature compiled out: a ring-capable guest gets a clean "unsupported" and falls back
+	// to UDS. reject_reason is non-zero so the guest never believes the ring was accepted;
+	// wake_fd is -1 (no ring).
+	_sendReply(0, static_cast<uint32_t>(1) /* any non-ok */, -1);
+#endif
 };
 
 DSERVER_CLASS_SOURCE_DEFS;

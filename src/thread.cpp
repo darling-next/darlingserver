@@ -27,6 +27,10 @@
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
 #include <darlingserver/test-diagnostics.hpp>
+#ifdef DSERVER_RING_TRANSPORT
+	#include <darlingserver/ring.hpp>
+	#include <darlingserver/monitor.hpp>
+#endif
 #include <filesystem>
 #include <fstream>
 
@@ -37,6 +41,7 @@
 #include <atomic>
 
 #include <sys/syscall.h>
+#include <time.h>
 
 #if DSERVER_ASAN
 	#include <sanitizer/asan_interface.h>
@@ -390,6 +395,18 @@ void DarlingServer::Thread::microthreadWorker() {
 		// perf #9 (dar-dar6x4-perf-5dq.16): per-call-number breakdown so perf #7 can
 		// see which RPC numbers dominate the guest's recvmsg-wait.
 		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
+		// perf #18 D9 (dar-1il.4): heatmap. This is the GENERIC fiber worker, so used_fiber=true (the
+		// call ran on a suspendable microthread -- a blocking/fiber op, NOT Tier-2-no-fiber-eligible).
+		// transport comes from the sticky latch set during dispatch/servicing. perf #18 D14 (dar-1il.9):
+		// caller-S2C is no longer a sticky per-thread bool consumed here -- it is attributed per-call at
+		// _s2cPerform via Metrics::recordCallerS2cFor(activeCall), so there is no cross-op leak.
+		_metrics.recordCallHeatmap(
+			static_cast<uint32_t>(_callNumber), serviceUs,
+			currentThreadVar->_heatmapCallWasRing ? DarlingServer::Metrics::CallTransport::Ring
+			                                      : DarlingServer::Metrics::CallTransport::Uds,
+			/* usedFiber */ true,
+			/* didCallerS2c */ false);
+		currentThreadVar->_heatmapCallWasRing = false;
 		if (_callNumber == DarlingServer::Call::Number::Checkin) {
 			_metrics.checkinLatency.record(serviceUs);
 		}
@@ -647,6 +664,256 @@ doneWorking:
 	}
 	return;
 };
+
+#ifdef DSERVER_RING_TRANSPORT
+bool DarlingServer::Thread::doWorkInline() {
+	// perf #18 P6.1 (dar-ohp): run a proven-non-blocking Call without the microthread fiber.
+	// This is doWork() with the fiber stripped: same guards, same context-enter (so current_task
+	// resolves identically), same processCall + exception containment + metrics as
+	// microthreadWorker(), then the same essential completion cleanup as doneWorking -- but the
+	// call runs on the CURRENT (main-loop) stack instead of a makecontext fiber.
+	//
+	// SAFETY: the caller guarantees the call never suspends. We therefore never touch the fiber
+	// state (backToThreadTopContext / _resumeContext / _stack) and assert it stays non-suspended.
+	std::unique_lock<std::shared_mutex> lock(_rwlock);
+
+	if (_deferralState != DeferralState::NotDeferred) {
+		_deferralState = DeferralState::DeferredPending;
+		return false;
+	}
+	if (_running) {
+		microthreadLog.warning() << _tid << "(" << _nstid << "): doWorkInline on already-running microthread" << microthreadLog.endLog;
+		return false;
+	}
+	if (_terminating || (_dead && !_activeCall) || _suspended || _continuationCallback || !_pendingCall) {
+		// any of these means this is NOT the simple "fresh non-blocking call" case the inline
+		// path is for; let the caller fall back to the full doWork() which handles them.
+		return false;
+	}
+
+	_running = true;
+	currentThreadVar = shared_from_this();
+	dtape_thread_entering(_dtapeThread);
+	_suspended = false;
+	lock.unlock();
+	_runningCondvar.notify_all();
+
+	// --- body: mirror microthreadWorker() without the fiber-return setcontext ---------------
+	makePendingCallActive(); // moves _pendingCall -> _activeCall (same as the fiber path)
+
+	auto& _metrics = DarlingServer::Metrics::shared();
+	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
+	auto _callNumber = _activeCall->number();
+
+	try {
+		_activeCall->processCall();
+	} catch (const std::system_error& err) {
+		microthreadLog.error() << "Uncaught std::system_error from inline processCall ("
+			<< DarlingServer::Call::callNumberToString(_callNumber) << "): " << err.what()
+			<< " (code " << err.code().value() << ")" << microthreadLog.endLog;
+		try { _activeCall->sendBasicReply(-err.code().value()); } catch (...) {}
+	} catch (const std::exception& ex) {
+		microthreadLog.error() << "Uncaught exception from inline processCall ("
+			<< DarlingServer::Call::callNumberToString(_callNumber) << "): " << ex.what() << microthreadLog.endLog;
+		try { _activeCall->sendBasicReply(-EINVAL); } catch (...) {}
+	} catch (...) {
+		microthreadLog.error() << "Uncaught non-std exception from inline processCall ("
+			<< DarlingServer::Call::callNumberToString(_callNumber) << ")" << microthreadLog.endLog;
+		try { _activeCall->sendBasicReply(-EINVAL); } catch (...) {}
+	}
+
+	{
+		uint64_t now = DarlingServer::Metrics::nowMonoUs();
+		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
+		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
+		_metrics.rpcLatency.record(serviceUs);
+		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
+		// perf #18 D9 (dar-1il.4): heatmap. This is doWorkInline -- the Tier-2 NO-FIBER ring path. By
+		// construction it ran a ring-originated allowlisted op without suspending (used_fiber=false); a
+		// real suspend here is a contract violation handled below. transport=ring. perf #18 D14
+		// (dar-1il.9): caller-S2C attributed per-call at _s2cPerform, not via a sticky latch here.
+		_metrics.recordCallHeatmap(
+			static_cast<uint32_t>(_callNumber), serviceUs,
+			DarlingServer::Metrics::CallTransport::Ring,
+			/* usedFiber */ false,
+			/* didCallerS2c */ false);
+		_heatmapCallWasRing = false;
+	}
+
+	// processCall() on a non-blocking op must have run to completion. If somehow it suspended
+	// (a misclassified op), that is a contract violation -> we'd have corrupted the fiber model.
+	// Detect it loudly rather than silently mishandle.
+	bool canRelease = false;
+	{
+		std::unique_lock<std::shared_mutex> relock(_rwlock);
+		if (_suspended) {
+			// Should be impossible for an allowlisted op. The microthread "suspended" without a
+			// fiber to resume onto -> we cannot honor it. Log; leave _running cleared so the
+			// thread isn't wedged. (The guest will time out on this op and UDS-fall-back.)
+			microthreadLog.error() << *this << ": doWorkInline call suspended -- not fast-path eligible!" << microthreadLog.endLog;
+			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
+			_suspended = false;
+		}
+		_activeCall = nullptr;
+		dtape_thread_exiting(_dtapeThread);
+		currentThreadVar = nullptr;
+		_running = false;
+
+		if (_dead && !_activeCall && !_terminating) {
+			_terminating = true;
+			canRelease = true;
+		}
+		if (_terminating && !_dead) {
+			relock.unlock();
+			notifyDead();
+		} else {
+			if (!_terminating && !_dead && !_pendingInterrupts.empty()) {
+				if (!_pendingCall) {
+					_pendingCall = _pendingInterrupts.front();
+					_pendingInterrupts.pop();
+					Server::sharedInstance().scheduleThread(shared_from_this());
+				}
+			}
+			relock.unlock();
+		}
+	}
+	_runningCondvar.notify_all();
+	if (canRelease) {
+		_scheduleRelease();
+	}
+	return true;
+};
+
+bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
+	// perf #18 P6.1 step 2 (dar-ohp): the surgical one-op path. This is doWorkInline() with the
+	// Call/Message framing ALSO removed: no _pendingCall, no processCall(), no callFromMessage --
+	// we run the bare dtape primitive and publish the reply onto the ring ourselves. The duct-tape
+	// context setup/teardown is IDENTICAL to doWorkInline (so current_task() resolves to this
+	// thread's space exactly as MachReplyPort::processCall would see it).
+	auto ring = _ring;
+	if (!ring) {
+		return false; // caller falls back to the generic path
+	}
+
+	std::unique_lock<std::shared_mutex> lock(_rwlock);
+
+	if (_deferralState != DeferralState::NotDeferred) {
+		_deferralState = DeferralState::DeferredPending;
+		return false;
+	}
+	if (_running) {
+		microthreadLog.warning() << _tid << "(" << _nstid << "): doMachReplyPortInline on already-running microthread" << microthreadLog.endLog;
+		return false;
+	}
+	if (_terminating || _dead || _suspended || _continuationCallback || _pendingCall || _activeCall) {
+		// Not the simple "fresh, idle thread servicing a no-arg trap" case. There is no Call to run
+		// here (we bypass callFromMessage), so a _pendingCall/_activeCall would be left dangling --
+		// decline and let the caller take the generic step-1 path which handles all of these.
+		return false;
+	}
+
+	_running = true;
+	currentThreadVar = shared_from_this();
+	dtape_thread_entering(_dtapeThread);
+	_suspended = false;
+	lock.unlock();
+	_runningCondvar.notify_all();
+
+	// --- body: the bare Mach primitive, identical to what MachReplyPort::processCall calls ------
+	auto& _metrics = DarlingServer::Metrics::shared();
+	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
+	uint32_t port = dtape_mach_reply_port();
+
+	// publish {replyhdr.code=0}{uint32 port_name} straight onto the s2c ring + wake the guest.
+	// Byte-identical to the reply the generic path produces via pushCallReply for this op.
+#ifdef DSERVER_RING_PHASE_PROF
+	uint64_t _pubT0 = Metrics::rdtscCycles();
+#endif
+	bool published = ring->publishReply(seq, static_cast<uint32_t>(dserver_callnum_mach_reply_port), 0, &port, sizeof(port));
+#ifdef DSERVER_RING_PHASE_PROF
+	_ringPublishCycles = Metrics::rdtscCycles() - _pubT0;
+#endif
+	if (published) {
+		ring->wakeGuest();
+	} else {
+		// s2c ring full: the reply will be sent via UDS below (no double-mint). Account it so a
+		// nonzero ring_s2c_full under load flags a guest that isn't draining its s2c ring.
+		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	{
+		uint64_t now = DarlingServer::Metrics::nowMonoUs();
+		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
+		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
+		_metrics.rpcLatency.record(serviceUs);
+		_metrics.recordCall(static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs);
+		// perf #18 D9 (dar-1il.4): heatmap. The surgical mach_reply_port path: ring transport, no fiber,
+		// pure mint (never an S2C). It bypasses beginRingReply/processCall, so pass the facts directly.
+		_metrics.recordCallHeatmap(
+			static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs,
+			DarlingServer::Metrics::CallTransport::Ring,
+			/* usedFiber */ false, /* didCallerS2c */ false);
+	}
+
+	// --- completion cleanup: mirror doWorkInline's (no fiber, no _activeCall ever set) ----------
+	bool canRelease = false;
+	{
+		std::unique_lock<std::shared_mutex> relock(_rwlock);
+		if (_suspended) {
+			// Impossible for mach_reply_port (it never blocks). Log loudly; clear so we don't wedge.
+			microthreadLog.error() << *this << ": doMachReplyPortInline suspended -- mach_reply_port must never block!" << microthreadLog.endLog;
+			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
+			_suspended = false;
+		}
+		dtape_thread_exiting(_dtapeThread);
+		currentThreadVar = nullptr;
+		_running = false;
+
+		if (_dead && !_activeCall && !_terminating) {
+			_terminating = true;
+			canRelease = true;
+		}
+		if (_terminating && !_dead) {
+			relock.unlock();
+			notifyDead();
+		} else {
+			if (!_terminating && !_dead && !_pendingInterrupts.empty()) {
+				if (!_pendingCall) {
+					_pendingCall = _pendingInterrupts.front();
+					_pendingInterrupts.pop();
+					Server::sharedInstance().scheduleThread(shared_from_this());
+				}
+			}
+			relock.unlock();
+		}
+	}
+	_runningCondvar.notify_all();
+	if (canRelease) {
+		_scheduleRelease();
+	}
+
+	// If the publish failed (s2c full), tell the caller to fall back so the guest still gets a
+	// reply via the generic path. The dtape trap already ran (it minted a real port); re-running
+	// it via callFromMessage would leak that port. So instead of "return false to re-dispatch",
+	// we treat a publish failure as a HARD inline failure only when nothing was minted. Here the
+	// port WAS minted and the only loss is the wake; publishReply already UDS-falls-back inside
+	// pushCallReply for the generic path, but we don't have that here. Simplest correct choice:
+	// if publish failed, send the reply via UDS directly so we never double-mint.
+	if (!published) {
+		// Build the minimal UDS reply and send it. Reuse the same reply convention.
+		dserver_rpc_reply_mach_reply_port_t reply;
+		reply.header.number = dserver_callnum_mach_reply_port;
+		reply.header.code = 0;
+		reply.body.port_name = port;
+		Message replyMsg(sizeof(reply), 0);
+		replyMsg.data().resize(sizeof(reply));
+		memcpy(replyMsg.data().data(), &reply, sizeof(reply));
+		replyMsg.setAddress(_address);
+		Server::sharedInstance().sendMessage(std::move(replyMsg));
+	}
+	return true;
+};
+#endif
 
 void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, libsimple_lock_t* unlockMe) {
 	if (this != currentThreadVar.get()) {
@@ -1125,6 +1392,44 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 			_deferReplyForS2C = true;
 		}
 
+#ifdef DSERVER_RING_TRANSPORT
+		// perf #18 P8 D6 (caller-S2C sideband) STEP 1 ATTRIBUTION: this S2C is going to THIS thread (a
+		// caller-S2C) iff currentThread()==this. Classify the active parent op's lane so we learn whether
+		// the reachable caller-S2C munmap hazard is carried by a RING parent (curable by the sideband) or a
+		// UDS parent (future hazard) or no managed call (server-internal). Read under the held _rwlock.
+		{
+			auto hdr = reinterpret_cast<const dserver_s2c_callhdr_t*>(call.data().data());
+			bool isMunmap = (hdr->s2c_number == dserver_s2c_msgnum_munmap);
+			bool toCurrentCaller = (currentThread().get() == this);
+			if (isMunmap && toCurrentCaller) {
+				// classify the active parent op's lane (the D6 attribution: which lane carries a caller-S2C
+				// munmap). RING parent => curable by the duplex sideband; UDS parent => today not a ring-
+				// deadlock (caller services via recvmsg) but a FUTURE hazard if that op is ever ring-
+				// migrated; no managed call => pure server-internal.
+				if (_ringReplyPending) {
+					Metrics::shared().s2cMunmapRingParent.fetch_add(1, std::memory_order_relaxed);
+				} else if (_activeCall) {
+					Metrics::shared().s2cMunmapUdsParent.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					Metrics::shared().s2cMunmapNoParent.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		}
+#endif
+
+		// perf #18 D9 (dar-1il.4) + D14 (dar-1il.9): record that the active call drove a CALLER-S2C
+		// upcall (an S2C to THIS thread, i.e. while it is the caller waiting for a reply). Any caller-S2C
+		// means the op is NOT a simple closed req->reply -- it needs the duplex lane (Lane 2), not the
+		// simple ring (Lane 1) -- so the heatmap must flag it regardless of S2C type or ring build. D14
+		// replaces the old sticky per-thread _heatmapCallDidS2c bool (consumed at the NEXT recordCall,
+		// which over-attributed an exec/teardown munmap to the wrong op -- D13's mldr_path false latch)
+		// with PER-CALL-SCOPED attribution: bump the bucket for the op ACTUALLY executing right now
+		// (_activeCall), at the moment the S2C fires. _activeCall is null for a server-internal S2C (no
+		// managed parent) -- already counted by s2cMunmapNoParent, no per-op bucket to charge.
+		if (currentThread().get() == this && _activeCall) {
+			Metrics::shared().recordCallerS2cFor(static_cast<uint32_t>(_activeCall->number()));
+		}
+
 		call.setAddress(_address);
 	}
 
@@ -1137,8 +1442,41 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 
 	s2cLog.debug() << *this << ": Going to send S2C message" << s2cLog.endLog;
 
-	// send the call
-	Server::sharedInstance().sendMessage(std::move(call));
+#ifdef DSERVER_RING_TRANSPORT
+	// perf #18 P8 D4 (dar-1il.3.2.1): if this thread's current call is a DUPLEX PARENT (a ring-originated
+	// mach_port_deallocate from a duplex-deallocate-capable caller) and the S2C is the munmap shape, route
+	// the upcall through the duplex MAILBOX instead of the UDS send. The fiber then parks on
+	// _s2cReplySempahore exactly as the UDS path below; the main-loop _drainDuplexReply harvests the
+	// correlated munmap reply, synthesizes _s2cReply, and ups the semaphore. The op runs entirely on the
+	// ring -- no UDS fallback after this point, so the destroy side effect is applied exactly once.
+	//
+	// The guard can DECLINE (no v5 ring / no DEALLOCATE cap / mailbox busy). That decline happens BEFORE
+	// any mutation only at the ROUTING layer (ringServiceThread), NOT here -- by the time _s2cPerform runs
+	// the dtape op has already begun mutating (we're mid-ipc_right_dealloc). So a decline HERE must NOT
+	// silently fall back to a UDS S2C for a ring-parked caller (it can't service it -> the very deadlock
+	// we're avoiding). Instead, a decline here is a hard error: we leave the in-flight markers clear and
+	// fall through to the UDS send, which is correct ONLY if the caller is NOT ring-parked. Since
+	// _ringDuplexParentActive implies a ring-parked caller, a decline here is a should-not-happen
+	// (the routing layer already verified the cap + clean mailbox); we log + take the UDS path as a
+	// last resort (the bounded guest wait then UDS-falls-back the op). In practice the guard passes.
+	bool duplexUpcallTaken = false;
+	if (_ringDuplexParentActive && expectedReplyNumber == dserver_s2c_msgnum_munmap) {
+		auto* mcall = reinterpret_cast<const dserver_s2c_call_munmap_t*>(call.data().data());
+		uint64_t addr = mcall->address;
+		uint64_t len = mcall->length;
+		std::unique_lock lock(_rwlock);
+		duplexUpcallTaken = _s2cTryDuplexMunmapLocked(dserver_s2c_msgnum_munmap, addr, len, lock);
+		if (!duplexUpcallTaken) {
+			s2cLog.error() << *this << ": duplex munmap guard declined mid-op (mailbox busy?); "
+			               << "falling through to UDS S2C (caller may be ring-parked)" << s2cLog.endLog;
+		}
+	}
+	if (!duplexUpcallTaken)
+#endif
+	{
+		// send the call (UDS S2C -- the unchanged path)
+		Server::sharedInstance().sendMessage(std::move(call));
+	}
 
 	// now let's wait for the reply
 	if (!dtape_semaphore_down_simple(_s2cReplySempahore)) {
@@ -1166,7 +1504,16 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 		if (_deferReplyForS2C) {
 			_deferReplyForS2C = false;
 			if (_deferredReply) {
-				Server::sharedInstance().sendMessage(std::move(*_deferredReply));
+#ifdef DSERVER_RING_TRANSPORT
+				// perf #18 P5-bulk (dar-1il.1): a ring-originated call that triggered this S2C
+				// upcall deferred its reply; it MUST go back onto the s2c ring, not UDS, or the
+				// ring-waiting guest never wakes. _publishReplyToRingLocked consumes _ringReplyPending
+				// and returns false (not a ring call) -> fall through to the UDS send below.
+				if (!_publishReplyToRingLocked(*_deferredReply))
+#endif
+				{
+					Server::sharedInstance().sendMessage(std::move(*_deferredReply));
+				}
 				_deferredReply = std::nullopt;
 			}
 		}
@@ -1197,6 +1544,401 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 
 	return std::move(*reply);
 };
+
+#ifdef DSERVER_RING_TRANSPORT
+// perf #18 P8 D3 (dar-1il.3.1.1): the GUARDED duplex publish for an S2C upcall -- the iron conjunction
+// guard + the mailbox publish. This is the SHARED primitive: in D3 the synthetic sentinel parent op
+// drives it (state-machine completion in the drain); in Phase E the real _s2cPerform of a duplex-
+// eligible op (deallocate) will drive it the same way and complete by upping its parked fiber. Returns
+// true iff the duplex path was taken (the upcall is now in flight); false means the guard declined and
+// the caller MUST take its verbatim fallback (UDS for a real op; failure-reply for the synthetic op --
+// never a fabricated success).
+//
+// MUST be entered with `lock` (a unique_lock on _rwlock) held. On success it leaves the in-flight
+// markers armed and `lock` STILL HELD (the caller drops it); the drain side (_drainDuplexReply) takes
+// _rwlock too, so the markers are published atomically vs. the harvest. The upcall mailbox publish is
+// a release-store linearization point; the guest pump observes it with acquire.
+bool DarlingServer::Thread::_s2cTryDuplexLocked(uint32_t upcallOp, uint32_t arg, std::unique_lock<std::shared_mutex>& lock) {
+	(void)lock; // documents the lock contract; we operate under the held lock
+	// --- the iron conjunction guard: duplex ONLY if ALL hold, else the caller falls back ----------
+	// (2) the caller has a v4+ ring that advertised the SELFTEST duplex capability.
+	auto ring = _ring; // _ring is guarded by _rwlock; we hold it
+	if (!ring || !ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_SELFTEST)) {
+		return false;
+	}
+	dserver_ring_shm_t* cb = ring->liveControlBlock();
+	if (!cb) {
+		return false;
+	}
+	// (4) the upcall shape is one the minimal protocol supports.
+	if (upcallOp != DSERVER_RING_DUPLEX_UPCALL_ECHO) {
+		return false;
+	}
+	// (5) one-outstanding invariant: no upcall already in flight on this thread, and the mailbox slot
+	//     is free (no stale unconsumed upcall/reply). A stale ready bit -> decline (don't clobber).
+	if (_duplexUpcallInFlight) {
+		return false;
+	}
+	if (dserver_ring_duplex_upcall_available(cb)) {
+		return false; // a prior upcall is still unhandled in the mailbox -> not safe to publish
+	}
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) != 0u) {
+		return false; // a stale reply sits unconsumed -> decline rather than risk mis-correlation
+	}
+	// (3)+(6) allocate NONZERO, monotonic correlation ids (ABA-safe: never reused while a stale reply
+	//     could exist, because we just checked the mailbox is clean and we bump per upcall).
+	uint32_t parentId = _duplexNextId++;
+	uint32_t upcallId = _duplexNextId++;
+	if (parentId == 0) { parentId = _duplexNextId++; } // wrap guard: 0 means "none"
+	if (upcallId == 0) { upcallId = _duplexNextId++; }
+
+	// Arm the in-flight markers BEFORE publishing the upcall, so the drain (which takes _rwlock) can
+	// only ever observe a consistent (in-flight + correlation ids) state. (1)+(7) the caller-is-in-
+	// duplex-wait and same-ring-instance conditions are intrinsic here: this IS the caller thread's
+	// own ring, and the upcall targets that same ring's mailbox -- there is no cross-thread or
+	// cross-ring delivery in this path.
+	_duplexParentId = parentId;
+	_duplexUpcallId = upcallId;
+	_duplexReplyReady = false;
+	_duplexUpcallInFlight = true;
+	_duplexInFlightFast.store(true, std::memory_order_release); // lock-free mirror for the hot drain
+
+	// publish the upcall (release-store linearization) while still holding the lock.
+	dserver_ring_duplex_publish_upcall(cb, upcallOp, parentId, upcallId, arg);
+
+	// the guest may be spinning its wait-pump (no syscall) or parked on the s2c futex; bump+conditional
+	// FUTEX_WAKE exactly like a Lane-1 reply so a parked pump is woken without a syscall when it spins.
+	ring->wakeGuest();
+
+	return true;
+};
+
+// perf #18 P8 D3: harvest a correlated duplex reply for this thread, if one is in flight + ready, and
+// COMPLETE the parent op. Called from the main-loop ring drain for every ring thread -- this is the
+// resume point that keeps the server wait SCOPED to the op (no dedicated waiter thread, no blocking of
+// the dserver). For the D3 synthetic sentinel, completion = publish the parent FINAL reply onto the
+// s2c ring (routing #8). Returns true iff it did work (harvest or reject). Takes _rwlock itself.
+bool DarlingServer::Thread::_drainDuplexReply() {
+	// Hot path: the overwhelming common case is no duplex in flight on this thread. Skip the _rwlock
+	// entirely with a single relaxed atomic load so the Lane-1 drain cost is unchanged (one load per
+	// thread per drain, no lock). Only when a duplex upcall is genuinely in flight do we take the lock.
+	if (!_duplexInFlightFast.load(std::memory_order_acquire)) {
+		return false;
+	}
+	std::shared_ptr<RingBuffer> ringForReply;
+	uint32_t finalSeq = 0;
+	uint32_t finalResult = 0;
+	int32_t  finalCode = 0;
+	bool completeSentinel = false;
+	bool resumeRealFiber = false; // perf #18 P8 D4: up _s2cReplySempahore for a real-op duplex parent
+	{
+		std::unique_lock lock(_rwlock);
+		if (!_duplexUpcallInFlight) {
+			return false; // nothing parked on a duplex reply
+		}
+		auto ring = _ring;
+		if (!ring) {
+			return false;
+		}
+		dserver_ring_shm_t* cb = ring->liveControlBlock();
+		if (!cb) {
+			return false;
+		}
+		int mismatch = 0;
+		if (dserver_ring_duplex_reply_ready(cb, _duplexParentId, _duplexUpcallId, &mismatch)) {
+			// correlated reply: harvest it, consume the slot, clear the in-flight state.
+			_duplexReplyStatus = cb->duplex_reply_status;
+			_duplexReplyArg = cb->duplex_reply_arg;
+			int32_t replyErrno = cb->duplex_reply_errno;
+			_duplexReplyReady = true;
+			uint32_t realUpcallNum = _duplexRealUpcallNum;
+			dserver_ring_duplex_consume_reply(cb);
+			_duplexUpcallInFlight = false;
+			_duplexRealUpcallNum = 0;
+			_duplexUpcallDeadlineNs = 0; // perf #18 P8 D6: disarm the fail-closed deadline on success
+			_duplexInFlightFast.store(false, std::memory_order_release);
+			Metrics::shared().ringDuplexS2c.fetch_add(1, std::memory_order_relaxed);
+			if (_duplexSentinelSeq != 0) {
+				// D3 synthetic sentinel completion: stage the parent final reply (published below, lock
+				// dropped). The parent op's result IS the echo result the guest computed for the upcall.
+				completeSentinel = true;
+				ringForReply = ring;
+				finalSeq = _duplexSentinelSeq;
+				finalResult = _duplexReplyArg;
+				finalCode = (_duplexReplyStatus == 0) ? 0 : -1;
+				_duplexSentinelSeq = 0;
+			} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_munmap) {
+				// perf #18 P8 D5 (dar-1il.3.2.2) boot-scoped proof: a REAL caller-S2C munmap just completed
+				// over the duplex mailbox for a vm_deallocate proof parent. Count it + mark the sticky flag
+				// so the dispatcher spends a proof-budget unit (auto-disarm). THIS is the live caller-S2C
+				// cure the duplex lane was built for, finally on the real op.
+				if (_ringDuplexVmdeallocProof) {
+					Metrics::shared().ringDuplexVmdeallocS2c.fetch_add(1, std::memory_order_relaxed);
+					_ringDuplexVmdeallocS2cFired = true;
+				}
+				// perf #18 P8 D4: REAL-op resume. Synthesize the _s2cReply Message exactly as the UDS S2C
+				// reply would arrive (a dserver_s2c_reply_munmap_t carrying the guest's munmap result), so
+				// _s2cPerform's reply-extraction + validation path is byte-identical to UDS. Then up
+				// _s2cReplySempahore to resume the parked fiber, which finishes the deallocate and emits
+				// its final reply via the existing deferred-reply->ring path.
+				Message s2cReply(sizeof(dserver_s2c_reply_munmap_t), 0);
+				auto* r = reinterpret_cast<dserver_s2c_reply_munmap_t*>(s2cReply.data().data());
+				r->header.call_number = 0;
+				r->header.pid = 0;
+				r->header.tid = 0;
+				r->header.architecture = 0;
+				r->header.s2c_number = dserver_s2c_msgnum_munmap;
+				r->return_value = _duplexReplyStatus; // guest's munmap return_value (0 ok / -1 error)
+				r->errno_result = replyErrno;
+				if (_s2cReply) {
+					// should be impossible (one outstanding upcall) -- but never clobber a pending reply.
+					s2cLog.error() << *this << ": duplex munmap reply but an _s2cReply was already pending" << s2cLog.endLog;
+				} else {
+					_s2cReply = std::move(s2cReply);
+					resumeRealFiber = true;
+				}
+			}
+		} else if (mismatch) {
+			// a reply landed that does NOT correlate (wrong parent/upcall id: a buggy/hostile guest or
+			// a stale reply from a torn-down op). Refuse to resume on it: drop the slot, count it, and
+			// FAIL the parent (no wedge, no fabricated success). pitfall #2 (ABA) + #3 (wrong corr).
+			uint32_t realUpcallNum = _duplexRealUpcallNum;
+			dserver_ring_duplex_consume_reply(cb);
+			_duplexUpcallInFlight = false;
+			_duplexRealUpcallNum = 0;
+			_duplexUpcallDeadlineNs = 0; // perf #18 P8 D6: disarm the fail-closed deadline on mis-correlation
+			_duplexInFlightFast.store(false, std::memory_order_release);
+			Metrics::shared().ringDuplexReject.fetch_add(1, std::memory_order_relaxed);
+			if (_duplexSentinelSeq != 0) {
+				completeSentinel = true;
+				ringForReply = ring;
+				finalSeq = _duplexSentinelSeq;
+				finalResult = 0;
+				finalCode = -1; // mis-correlation -> the synthetic parent fails
+				_duplexSentinelSeq = 0;
+			} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_munmap) {
+				// perf #18 P8 D4: a mis-correlated reply for a REAL munmap upcall. We must NOT resume the
+				// fiber on a bogus munmap result (that could tell the kernel the unmap succeeded when it
+				// didn't = corruption). Synthesize a FAILED munmap reply (return_value=-1, EINTR) so the
+				// fiber resumes, the deallocate sees the S2C failed, and the op surfaces an error rather
+				// than fabricating success. Bounded: the fiber resumes immediately (no wedge).
+				Message s2cReply(sizeof(dserver_s2c_reply_munmap_t), 0);
+				auto* r = reinterpret_cast<dserver_s2c_reply_munmap_t*>(s2cReply.data().data());
+				r->header.call_number = 0;
+				r->header.pid = 0;
+				r->header.tid = 0;
+				r->header.architecture = 0;
+				r->header.s2c_number = dserver_s2c_msgnum_munmap;
+				r->return_value = -1;
+				r->errno_result = 4 /*EINTR*/;
+				if (!_s2cReply) {
+					_s2cReply = std::move(s2cReply);
+					resumeRealFiber = true;
+				}
+			}
+		} else {
+			// in flight, no correlated reply yet. perf #18 P8 D6: enforce the SERVER-side fail-closed
+			// deadline (gist failure policy #12). If the guest never pumped this S2C by the deadline,
+			// resume the fiber with a FAILED reply (so the op surfaces an error, never a leaked fiber /
+			// fabricated success), count the timeout, clear the in-flight + mailbox state, and disarm the
+			// vm_deallocate proof so a stuck guest can't keep re-arming. Bounded: the fiber resumes here.
+			if (_duplexUpcallDeadlineNs != 0) {
+				struct timespec ts;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+				if (now >= _duplexUpcallDeadlineNs) {
+					uint32_t realUpcallNum = _duplexRealUpcallNum;
+					// clear the mailbox upcall slot so a late guest pump can't act on a stale upcall, and
+					// reset all in-flight markers.
+					dserver_ring_duplex_consume_reply(cb); // idempotent clear of any partial reply state
+					__atomic_store_n(&cb->duplex_upcall_ready, 0u, __ATOMIC_RELEASE); // retract the unhandled upcall
+					_duplexUpcallInFlight = false;
+					_duplexRealUpcallNum = 0;
+					_duplexUpcallDeadlineNs = 0;
+					_duplexInFlightFast.store(false, std::memory_order_release);
+					Metrics::shared().ringDuplexVmdeallocTimeout.fetch_add(1, std::memory_order_relaxed);
+					if (_ringDuplexVmdeallocProof) {
+						// disarm the boot/synthetic proof so a non-pumping guest can't keep arming it.
+						Metrics::shared().ringDuplexVmdeallocDisarmed.fetch_add(1, std::memory_order_relaxed);
+					}
+					s2cLog.error() << *this << ": [D6] duplex S2C upcall TIMED OUT (no guest pump by deadline); "
+					               << "failing the parent op closed (bounded, no leaked fiber)" << s2cLog.endLog;
+					if (_duplexSentinelSeq != 0) {
+						completeSentinel = true;
+						ringForReply = ring;
+						finalSeq = _duplexSentinelSeq;
+						finalResult = 0;
+						finalCode = -1;
+						_duplexSentinelSeq = 0;
+					} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_munmap) {
+						Message s2cReply(sizeof(dserver_s2c_reply_munmap_t), 0);
+						auto* r = reinterpret_cast<dserver_s2c_reply_munmap_t*>(s2cReply.data().data());
+						r->header.call_number = 0;
+						r->header.pid = 0;
+						r->header.tid = 0;
+						r->header.architecture = 0;
+						r->header.s2c_number = dserver_s2c_msgnum_munmap;
+						r->return_value = -1;
+						r->errno_result = 110 /*ETIMEDOUT*/;
+						if (!_s2cReply) {
+							_s2cReply = std::move(s2cReply);
+							resumeRealFiber = true;
+						}
+					}
+				} else {
+					return false; // in flight, deadline not yet reached
+				}
+			} else {
+				return false; // in flight but no reply yet (no deadline armed -- e.g. D3 sentinel echo)
+			}
+		}
+	}
+
+	if (resumeRealFiber) {
+		// resume the parked deallocate fiber with the synthesized munmap reply (the UDS path's wakeup).
+		dtape_semaphore_up(_s2cReplySempahore);
+		return true;
+	}
+
+	if (completeSentinel && ringForReply) {
+		// publish the synthetic parent's final reply onto the s2c ring. Reply convention mirrors the
+		// Lane-1 port-trap reply ({reply_hdr.code, uint32 result}); the guest selftest reads `result`.
+		uint32_t body = finalResult;
+		if (!ringForReply->publishReply(finalSeq, DSERVER_RING_DUPLEX_SELFTEST_CALLNUM, finalCode, &body, (uint32_t)sizeof(body))) {
+			// s2c full: the guest will time out on the parent + UDS-fall-back in a real lane. For the
+			// synthetic selftest this is a transient miss; count it as an s2c-full like Lane-1.
+			Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
+		}
+		ringForReply->wakeGuest();
+		return true;
+	}
+	return true;
+};
+
+bool DarlingServer::Thread::drainDuplexReply() {
+	return _drainDuplexReply();
+};
+
+// perf #18 P8 D3: issue ONE synthetic duplex ECHO upcall for the sentinel parent op (seq = the parent
+// request's ring seq). Runs the guarded publish; if the guard passes, the upcall is in flight and the
+// parent reply will be published by _drainDuplexReply when the correlated reply arrives. Returns true
+// if the duplex path was taken (parent reply deferred to the drain); false if the guard declined, in
+// which case the CALLER must publish the synthetic parent's failure reply immediately (no fabricated
+// success). NOT a microthread/fiber path -- this is a synchronous state-machine kickoff from the ring
+// service loop, so it never parks (the brief's "publish upcall + return; later drain completes").
+bool DarlingServer::Thread::duplexSelftestUpcall(uint32_t arg, uint32_t seq) {
+	std::unique_lock lock(_rwlock);
+	if (_duplexUpcallInFlight) {
+		return false; // one-outstanding: a prior selftest is mid-flight on this thread
+	}
+	_duplexSentinelSeq = seq; // mark this in-flight upcall as a sentinel parent (drain completes it)
+	bool took = _s2cTryDuplexLocked(DSERVER_RING_DUPLEX_UPCALL_ECHO, arg, lock);
+	if (!took) {
+		_duplexSentinelSeq = 0; // guard declined -> not in flight; caller publishes the failure reply
+	}
+	return took;
+};
+
+// perf #18 P8 D4 (dar-1il.3.2.1): publish a REAL munmap S2C upcall into the duplex mailbox for a duplex-
+// parent call. The structural sibling of _s2cTryDuplexLocked, but for the MUNMAP shape + the typed
+// addr/len payload, and it ALSO requires DUPLEX_CAP_DEALLOCATE (the echo guard required only SELFTEST).
+// On success it arms the in-flight markers + publishes + wakes, and the CALLER (_s2cPerform) then parks
+// the fiber on _s2cReplySempahore exactly as the UDS S2C path does. The main-loop _drainDuplexReply
+// harvests the correlated munmap reply, synthesizes the _s2cReply Message, and ups _s2cReplySempahore.
+bool DarlingServer::Thread::_s2cTryDuplexMunmapLocked(uint32_t s2cNumber, uint64_t address, uint64_t length, std::unique_lock<std::shared_mutex>& lock) {
+	(void)lock; // documents the held-lock contract
+	auto ring = _ring;
+	// require a v5+ duplex-capable ring AND a munmap-pump cap. The munmap shape is reachable from EITHER a
+	// (D4) mach_port_deallocate parent OR a (D5) vm_deallocate parent; both advertise they can pump munmap,
+	// via CAP_DEALLOCATE (0x2) or CAP_VM_DEALLOCATE (0x4). SELFTEST alone is not enough. The per-op routing
+	// decline (ringServiceThread) already keyed on the SPECIFIC bit before dispatch, so by the time we
+	// publish a munmap upcall the caller has the matching cap; this guard is the belt-and-suspenders check.
+	if (!ring || !ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_MUNMAP_PUMP)) {
+		return false;
+	}
+	dserver_ring_shm_t* cb = ring->liveControlBlock();
+	if (!cb) {
+		return false;
+	}
+	// one-outstanding invariant: nothing already in flight + a clean mailbox (no stale upcall/reply).
+	if (_duplexUpcallInFlight) {
+		return false;
+	}
+	if (dserver_ring_duplex_upcall_available(cb)) {
+		return false;
+	}
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) != 0u) {
+		return false;
+	}
+	// nonzero, monotonic correlation ids (ABA-safe: the mailbox is clean + we bump per upcall).
+	uint32_t parentId = _duplexNextId++;
+	uint32_t upcallId = _duplexNextId++;
+	if (parentId == 0) { parentId = _duplexNextId++; }
+	if (upcallId == 0) { upcallId = _duplexNextId++; }
+
+	_duplexParentId = parentId;
+	_duplexUpcallId = upcallId;
+	_duplexReplyReady = false;
+	_duplexUpcallInFlight = true;
+	_duplexRealUpcallNum = s2cNumber; // mark this as a REAL-op upcall (drain synthesizes _s2cReply)
+	_duplexInFlightFast.store(true, std::memory_order_release);
+	// perf #18 P8 D6: arm the SERVER-side fail-closed deadline (gist failure policy #12). If the guest
+	// never pumps this munmap S2C (a buggy/torn-down/RED-no-pump guest), the main-loop drain resumes the
+	// fiber with a FAILED reply at the deadline instead of leaking the fiber forever. Generous (5s) -- a
+	// real pump replies in microseconds, so this never trips in GREEN; it bounds only the pathological case.
+	{
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		_duplexUpcallDeadlineNs = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec + 5000000000ull;
+	}
+
+	dserver_ring_duplex_publish_munmap_upcall(cb, parentId, upcallId, address, length);
+	ring->wakeGuest();
+	return true;
+};
+
+void DarlingServer::Thread::setRingDuplexParentActive(bool active) {
+	std::unique_lock lock(_rwlock);
+	_ringDuplexParentActive = active;
+};
+
+// perf #18 P8 D5 (dar-1il.3.2.2) boot-scoped proof.
+void DarlingServer::Thread::setRingDuplexVmdeallocProof(bool active) {
+	std::unique_lock lock(_rwlock);
+	_ringDuplexVmdeallocProof = active;
+	if (active) {
+		_ringDuplexVmdeallocS2cFired = false; // reset the per-dispatch sticky flag at arm time
+	}
+};
+
+bool DarlingServer::Thread::takeRingDuplexVmdeallocS2cFired() {
+	std::unique_lock lock(_rwlock);
+	bool v = _ringDuplexVmdeallocS2cFired;
+	_ringDuplexVmdeallocS2cFired = false;
+	return v;
+};
+
+bool DarlingServer::Thread::duplexDeallocateCapable() const {
+	std::unique_lock lock(const_cast<std::shared_mutex&>(_rwlock));
+	auto ring = _ring;
+	if (!ring) {
+		return false;
+	}
+	return ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_DEALLOCATE);
+};
+
+// perf #18 P8 D5 (dar-1il.3.2.2): the per-op routing gate for vm_deallocate. Keys on the SPECIFIC
+// VM_DEALLOCATE cap bit (not the shared munmap-pump mask): a guest that advertised only the (D4)
+// DEALLOCATE cap must NOT have a vm_deallocate routed onto the lane on its behalf.
+bool DarlingServer::Thread::duplexVmDeallocateCapable() const {
+	std::unique_lock lock(const_cast<std::shared_mutex&>(_rwlock));
+	auto ring = _ring;
+	if (!ring) {
+		return false;
+	}
+	return ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE);
+};
+#endif // DSERVER_RING_TRANSPORT
 
 uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int protection, int flags, int fd, off_t offset, int& outErrno) {
 	// XXX: not sure if we want to force all allocations in 32-bit processes to be in the 32-bit address space.
@@ -1441,6 +2183,49 @@ void DarlingServer::Thread::logToStream(Log::Stream& stream) const {
 	stream << "[T:" << _tid << "(" << _nstid << ")]";
 };
 
+#ifdef DSERVER_RING_TRANSPORT
+// perf #18 P3 / P5-bulk: publish a complete reply Message onto the s2c ring if this thread's current
+// call is ring-originated. Returns true if it took ownership of the reply (published, OR consumed it
+// to UDS-fall-back on a full ring); false if this is not a ring call (caller must send it via UDS).
+// Consumes _ringReplyPending. _rwlock MUST be held by the caller. The reply Message data is
+// dserver_rpc_reply_<call>_t = {replyhdr{number,code}, body}; we carry the code + body bytes onto the
+// ring (the guest reconstructs the same body).
+bool DarlingServer::Thread::_publishReplyToRingLocked(Message& reply) {
+	if (!_ringReplyPending || !_ring) {
+		return false;
+	}
+	_ringReplyPending = false;
+	const auto& bytes = reply.data();
+	if (bytes.size() < sizeof(dserver_rpc_replyhdr_t)) {
+		return false; // malformed (too short) -> caller UDS-falls-back
+	}
+	const dserver_rpc_replyhdr_t* rhdr = reinterpret_cast<const dserver_rpc_replyhdr_t*>(bytes.data());
+	const uint8_t* body = bytes.data() + sizeof(dserver_rpc_replyhdr_t);
+	uint32_t bodyLen = static_cast<uint32_t>(bytes.size() - sizeof(dserver_rpc_replyhdr_t));
+	auto ring = _ring; // keep alive across the publish
+	uint32_t seq = _ringReplySeq;
+	uint32_t callnum = static_cast<uint32_t>(rhdr->number);
+	int32_t code = rhdr->code;
+	// publish under the lock is fine (no suspend, no Server-state mutation); the FUTEX_WAKE is a
+	// bare syscall and likewise can't re-enter our locks.
+#ifdef DSERVER_RING_PHASE_PROF
+	uint64_t _pubT0 = Metrics::rdtscCycles();
+#endif
+	bool published = ring->publishReply(seq, callnum, code, body, bodyLen);
+#ifdef DSERVER_RING_PHASE_PROF
+	_ringPublishCycles = Metrics::rdtscCycles() - _pubT0; // read back by ringServiceThread
+#endif
+	if (!published) {
+		// s2c full: fall back to a UDS reply so the guest still gets its answer.
+		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
+		Server::sharedInstance().sendMessage(std::move(reply));
+	} else {
+		ring->wakeGuest();
+	}
+	return true;
+}
+#endif
+
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
 	std::unique_lock lock(_rwlock);
 
@@ -1455,8 +2240,17 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 
 		_interrupts.top().savedReply = std::move(reply);
 	} else if (_deferReplyForS2C) {
+		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
+		// _s2cPerform() (NOT this path) republishes it -- and MUST honor _ringReplyPending or a
+		// ring-waiting guest wedges. We deliberately do NOT consume _ringReplyPending here so the
+		// flush still knows the reply belongs to the ring. (perf #18 P5-bulk / dar-1il.1)
 		_deferredReply = std::move(reply);
 	} else if (!_dead) {
+#ifdef DSERVER_RING_TRANSPORT
+		if (_publishReplyToRingLocked(reply)) {
+			return;
+		}
+#endif
 		Server::sharedInstance().sendMessage(std::move(reply));
 	}
 };
@@ -1541,6 +2335,15 @@ void DarlingServer::Thread::jumpToResume(void* stack, size_t stackSize) {
 void DarlingServer::Thread::notifyDead() {
 	bool canRelease = false;
 
+#ifdef DSERVER_RING_TRANSPORT
+	// perf #18 (dar-dar6x4-perf-5dq.30): grab the ring + its Monitor out from under _rwlock
+	// and release them AFTER unlocking -- removeMonitor() touches Server state and could
+	// otherwise reintroduce the dar-6x4 lock-across-suspend hazard class. The RingBuffer dtor
+	// unmaps + closes the eventfd.
+	std::shared_ptr<RingBuffer> ringToRelease = nullptr;
+	std::shared_ptr<Monitor> ringMonitorToRelease = nullptr;
+#endif
+
 	{
 		std::unique_lock lock(_rwlock);
 		if (_dead) {
@@ -1550,6 +2353,13 @@ void DarlingServer::Thread::notifyDead() {
 		threadLog.info() << *this << ": thread dying" << threadLog.endLog;
 		_dead = true;
 
+#ifdef DSERVER_RING_TRANSPORT
+		ringMonitorToRelease = std::move(_ringMonitor);
+		ringToRelease = std::move(_ring);
+		_ringMonitor = nullptr;
+		_ring = nullptr;
+#endif
+
 		if (!_activeCall) {
 			// if we have no active call, we won't ever need to run again,
 			// so set `_terminating` to make sure that doesn't happen
@@ -1557,6 +2367,19 @@ void DarlingServer::Thread::notifyDead() {
 			canRelease = true;
 		}
 	}
+
+#ifdef DSERVER_RING_TRANSPORT
+	// _rwlock is dropped now; remove ourselves from the main-loop spin registry (perf #18 P4),
+	// tear down the ring's epoll Monitor, and release the mapping.
+	if (ringToRelease) {
+		Server::sharedInstance().unregisterRingThread(shared_from_this());
+	}
+	if (ringMonitorToRelease) {
+		Server::sharedInstance().removeMonitor(ringMonitorToRelease);
+	}
+	ringMonitorToRelease = nullptr;
+	ringToRelease = nullptr; // RingBuffer dtor: munmap + close eventfd
+#endif
 
 	// keep ourselves alive until the duct-taped context is done
 	_selfReference = shared_from_this();
@@ -1576,6 +2399,47 @@ bool DarlingServer::Thread::isDead() const {
 	std::shared_lock lock(_rwlock);
 	return _dead;
 };
+
+#ifdef DSERVER_RING_TRANSPORT
+void DarlingServer::Thread::attachRing(std::shared_ptr<RingBuffer> ring, std::shared_ptr<Monitor> monitor) {
+	std::shared_ptr<RingBuffer> oldRing = nullptr;
+	std::shared_ptr<Monitor> oldMonitor = nullptr;
+	{
+		std::unique_lock lock(_rwlock);
+		// a thread attaches at most once in practice, but replace defensively
+		oldRing = std::move(_ring);
+		oldMonitor = std::move(_ringMonitor);
+		_ring = ring;
+		_ringMonitor = monitor;
+	}
+	// drop any prior ring's Monitor outside the lock (same hazard discipline as notifyDead)
+	if (oldMonitor) {
+		Server::sharedInstance().removeMonitor(oldMonitor);
+	}
+};
+
+std::shared_ptr<DarlingServer::RingBuffer> DarlingServer::Thread::ring() const {
+	std::shared_lock lock(_rwlock);
+	return _ring;
+};
+
+void DarlingServer::Thread::beginRingReply(uint32_t seq) {
+	std::unique_lock lock(_rwlock);
+	_ringReplyPending = true;
+	_ringReplySeq = seq;
+	// perf #18 D9: latch that this call is ring-originated so the heatmap can attribute its transport
+	// at recordCall time (by then _ringReplyPending has been consumed by the reply publish).
+	_heatmapCallWasRing = true;
+};
+#ifdef DSERVER_RING_PHASE_PROF
+uint64_t DarlingServer::Thread::takeRingPublishCycles() {
+	// no lock: only the main loop touches this, in the same ringServiceThread call chain.
+	uint64_t v = _ringPublishCycles;
+	_ringPublishCycles = 0;
+	return v;
+};
+#endif
+#endif
 
 void DarlingServer::Thread::_dispose() {
 	threadLog.debug() << *this << ": dispose thread context" << threadLog.endLog;
