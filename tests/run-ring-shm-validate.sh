@@ -17,23 +17,20 @@ trap 'rm -rf "$TMP"' EXIT
 CXX="${CXX:-g++}"
 CC="${CC:-gcc}"
 
-# The GENERATED rpc.h supplies the dserver_callnum_* values. As of dar-1il.2 item 2 the validator
-# (and so the validate/attach/datapath/wake-race tests that exercise it) folds the C2S opcode set
-# into a hash that needs those callnums, so these tests now need rpc.h on the include path. Discover
-# it once up front; if a tree isn't built, SKIP (don't fail) the rpc.h-dependent arms.
-GEN_RPC=""
-for cand in "${DSERVER_GEN_INC:-}" \
-            "$HERE/../../../../build/src/external/darlingserver/include" \
-            "$HOME/work/darling-build/src/external/darlingserver/include"; do
-	[ -n "$cand" ] && [ -f "$cand/darlingserver/rpc.h" ] && { GEN_RPC="$cand"; break; }
-done
-GEN_INC_FLAG=""
-[ -n "$GEN_RPC" ] && GEN_INC_FLAG="-I$GEN_RPC"
-
-if [ -z "$GEN_RPC" ]; then
-	echo "== validator/attach/datapath gates SKIPPED (generated rpc.h not found; set DSERVER_GEN_INC) =="
-	echo
-else
+# Generate the call numbers from this paired server source unless the caller
+# explicitly supplies its matching generated include directory.
+GEN_RPC="${DSERVER_GEN_INC:-$TMP/generated/include}"
+if [ -z "${DSERVER_GEN_INC:-}" ]; then
+	mkdir -p "$GEN_RPC/darlingserver" "$TMP/generated/internal-include/darlingserver" "$TMP/generated/src" || exit 2
+	python3 -B "$HERE/../scripts/generate-rpc-wrappers.py" \
+		"$GEN_RPC/darlingserver/rpc.h" \
+		"$TMP/generated/internal-include/darlingserver/rpc.internal.h" \
+		"$TMP/generated/src/rpc.c" '"../include/darlingserver/rpc.h"' || exit 2
+fi
+if [ ! -f "$GEN_RPC/darlingserver/rpc.h" ]; then
+	echo "Missing paired generated rpc.h: $GEN_RPC"; exit 2
+fi
+GEN_INC_FLAG="-I$GEN_RPC"
 
 echo "== RED arm (accept-all stub: adversarial cases MUST fail) =="
 if ! "$CXX" -std=c++17 $GEN_INC_FLAG -I"$INC" -DRING_VALIDATE_STUB -o "$TMP/red" "$SRC"; then
@@ -101,21 +98,10 @@ echo
 echo "ring_datapath gate: RED->GREEN OK"
 echo
 
-fi # GEN_RPC present (validator/attach/datapath gates)
 
 # --- ring eligibility ALLOWLIST (P3): the real dserver_callnum_* set that may ride the ring.
-#     Needs the GENERATED rpc.h. Find it under a build dir; skip (don't fail) if not built. ---
+#     Uses the same paired generated header as the transport gates above. ---
 LSRC="$HERE/ring_allowlist_test.cpp"
-GEN_RPC=""
-for cand in "${DSERVER_GEN_INC:-}" \
-            "$HERE/../../../../build/src/external/darlingserver/include" \
-            "$HOME/work/darling-build/src/external/darlingserver/include"; do
-	[ -n "$cand" ] && [ -f "$cand/darlingserver/rpc.h" ] && { GEN_RPC="$cand"; break; }
-done
-if [ -z "$GEN_RPC" ]; then
-	echo "== allowlist gate SKIPPED (generated rpc.h not found; set DSERVER_GEN_INC) =="
-	echo
-else
 	echo "== allowlist GREEN arm (current set, derived from the shared DSERVER_RING_C2S_OPCODES macro) =="
 	# -DDSERVER_RING_TRANSPORT so the macro (defined inside that ifdef in rpc-supplement.h) is visible;
 	# the gate derives eligibility from the SAME macro the server uses, so it can never drift.
@@ -259,7 +245,6 @@ else
 		echo "ring_lane_class gate: RED->GREEN OK"
 		echo
 	fi
-fi
 
 # --- P7 wake-model LOST-WAKE race gate (dar-my8). Hermetic: header-only, real shm, two threads.
 #     GREEN: exhaustive ordering enumeration finds ZERO lost-wake interleavings on both the
