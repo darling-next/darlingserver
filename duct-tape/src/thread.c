@@ -176,9 +176,6 @@ void dtape_thread_entering(dtape_thread_t* thread) {
 	thread->xnu_thread.block_hint = kThreadWaitNone;
 };
 
-void dtape_thread_exiting(dtape_thread_t* thread) {
-	thread->xnu_thread.state &= ~TH_RUN;
-};
 
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr) {
 	thread_lock(&thread->xnu_thread);

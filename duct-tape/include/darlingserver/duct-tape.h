@@ -60,7 +60,6 @@ void dtape_kqchan_mach_port_destroy(dtape_kqchan_mach_port_t* kqchan);
 void dtape_semaphore_destroy(dtape_semaphore_t* semaphore);
 
 void dtape_thread_entering(dtape_thread_t* thread);
-void dtape_thread_exiting(dtape_thread_t* thread);
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr);
 
 typedef struct dtape_thread_cancel_state_snapshot {

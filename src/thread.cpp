@@ -630,7 +630,6 @@ doneWorking:
 	// we must be holding `_rwlock` when we get here
 	bool dispatchPending = false;
 	if (_execution.isRunning()) {
-		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
 		dispatchPending = _execution.finish();
 	}
@@ -777,7 +776,6 @@ bool DarlingServer::Thread::doWorkInline() {
 			_suspended = false;
 		}
 		_activeCall = nullptr;
-		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
 		scheduleAfterWorking = _execution.finish() && !_terminating && !_dead;
 
@@ -891,7 +889,6 @@ bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
 			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
 			_suspended = false;
 		}
-		dtape_thread_exiting(_dtapeThread);
 		currentThreadVar = nullptr;
 		scheduleAfterWorking = _execution.finish() && !_terminating && !_dead;
 
