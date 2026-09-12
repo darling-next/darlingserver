@@ -298,37 +298,6 @@ namespace DarlingServer {
 
 		void doWork();
 
-#ifdef DSERVER_RING_TRANSPORT
-		// perf #18 P6.1 (dar-ohp): run a PROVEN-NON-BLOCKING Call to completion WITHOUT the
-		// microthread fiber. doWork() always allocates a stack and makecontext/setcontext-swaps
-		// onto a fiber so the call can suspend; for a tiny self-trap that never suspends (e.g.
-		// mach_reply_port) that fiber machinery is ~half the hot-path cost. doWorkInline()
-		// establishes the SAME duct-tape context (currentThreadVar + dtape_thread_entering, so
-		// current_task()/current_thread() resolve identically) and calls the SAME processCall()
-		// on the current (main-loop) stack, then runs the same completion cleanup.
-		//
-		// CONTRACT: the caller MUST guarantee the call never suspends (never calls suspend()).
-		// If it does, there is no fiber to switch back to -> UB. Use ONLY for the ring fast-path
-		// allowlist of no-block ops. Returns true if it ran inline to completion; false if it
-		// declined (deferred/running/terminating/dead) so the caller can fall back to doWork().
-		bool doWorkInline();
-
-		// perf #18 P6.1 step 2 (dar-ohp): SURGICAL direct dispatch for EXACTLY mach_reply_port.
-		// doWorkInline() still pays the generic RPC framing (rebuild a Message, callFromMessage
-		// registry re-lookup, heap-allocate a Call, decode) before running the op. For the single
-		// hottest no-arg trap we skip ALL of it: establish the SAME duct-tape context as
-		// doWorkInline (currentThreadVar + dtape_thread_entering, so current_task() resolves), call
-		// dtape_mach_reply_port() DIRECTLY (the identical primitive MachReplyPort::processCall uses
-		// -- no reimplemented ipc_port_alloc), publish the {replyhdr.code=0}{uint32 port} reply
-		// straight onto this thread's s2c ring + wake the guest, then the same completion cleanup.
-		//
-		// CONTRACT: callable ONLY from the ring service loop for this exact thread, with the c2s
-		// request slot ALREADY consumed (consumer_advance) and a non-zero `seq`. The op never
-		// suspends (same as doWorkInline). Returns true if it ran inline + published; false if it
-		// declined (deferred/running/terminating/dead, or the ring publish failed) so the caller
-		// can fall back to the generic step-1 callFromMessage + doWorkInline path.
-		bool doMachReplyPortInline(uint32_t seq);
-#endif
 
 		// perf #2b (dar-dar6x4-perf-5dq.8): the main event loop runs cheap, non-blocking
 		// RPCs inline via doWork() instead of paying a worker-thread wakeup. After an inline

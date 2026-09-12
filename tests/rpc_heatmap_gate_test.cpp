@@ -136,8 +136,6 @@ int main() {
 	// canon simple + observed on the ring:
 	CHECK(heatStr(json, OP_REPLY, "verdict") == "already-on-ring", "reply_port -> already-on-ring");
 	CHECK(heatStr(json, OP_ALLOC, "verdict") == "already-on-ring", "alloc -> already-on-ring");
-	// unclassified, no fiber, no S2C -> tier2 candidate (the prize: hot + cheap + no-fiber-shaped):
-	CHECK(heatStr(json, OP_VMALLOC, "verdict") == "tier2-candidate", "vm_allocate -> tier2-candidate");
 
 	// --- a measured caller-S2C must FORCE duplex-only even for an unclassified op -----------------
 	// D14 (dar-1il.9): caller-S2C is now attributed PER-CALL via recordCallerS2cFor() at the S2C site,

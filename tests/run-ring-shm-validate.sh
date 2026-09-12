@@ -124,47 +124,6 @@ LSRC="$HERE/ring_allowlist_test.cpp"
 	echo "ring_allowlist gate: RED->GREEN OK"
 	echo
 
-	# --- P6.1 fast-path eligibility + escape hatches (dar-ohp). Reuses $GEN_RPC. ---
-	FPSRC="$HERE/ring_fastpath_gate_test.c"
-	if [ -f "$FPSRC" ]; then
-		echo "== fast-path GREEN arm (hatch-aware: allowlist + env kill-switches) =="
-		if ! "$CC" -std=c11 -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_green" "$FPSRC" 2>/dev/null; then
-			echo "fast-path GREEN arm failed to COMPILE"; exit 2
-		fi
-		if ! "$TMP/fp_green"; then
-			echo "fast-path GREEN arm FAILED"; exit 1
-		fi
-		echo
-		echo "== fast-path RED arm (-DFASTPATH_NO_HATCH: ignores hatches, MUST fail) =="
-		if ! "$CC" -std=c11 -DFASTPATH_NO_HATCH -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_red" "$FPSRC" 2>/dev/null; then
-			echo "fast-path RED arm failed to COMPILE -- gate broken"; exit 2
-		fi
-		if "$TMP/fp_red" >/dev/null 2>&1; then
-			echo "fast-path RED arm PASSED but must FAIL -- gate not exercising the hatches"; exit 1
-		fi
-		echo "  fast-path RED arm correctly failed."
-		echo
-		echo "== fast-path shape RED arm (-DNO_SHAPE_GUARD: drops the direct-dispatch shape guard, MUST fail) =="
-		if ! "$CC" -std=c11 -DNO_SHAPE_GUARD -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_shape_red" "$FPSRC" 2>/dev/null; then
-			echo "fast-path shape RED arm failed to COMPILE -- gate broken"; exit 2
-		fi
-		if "$TMP/fp_shape_red" >/dev/null 2>&1; then
-			echo "fast-path shape RED arm PASSED but must FAIL -- gate not exercising the shape guard"; exit 1
-		fi
-		echo "  fast-path shape RED arm correctly failed."
-		echo
-		echo "== mod_refs C2S exclusion RED arm (-DC2S_READD_MODREFS: re-adds the destroy-capable op, MUST fail) =="
-		if ! "$CC" -std=c11 -DC2S_READD_MODREFS -I"$GEN_RPC" -I"$INC" -o "$TMP/fp_c2s_red" "$FPSRC" 2>/dev/null; then
-			echo "mod_refs C2S RED arm failed to COMPILE -- gate broken"; exit 2
-		fi
-		if "$TMP/fp_c2s_red" >/dev/null 2>&1; then
-			echo "mod_refs C2S RED arm PASSED but must FAIL -- gate not pinning mod_refs OUT of the C2S allowlist"; exit 1
-		fi
-		echo "  mod_refs C2S RED arm correctly failed."
-		echo
-		echo "ring_fastpath gate: RED->GREEN OK"
-		echo
-	fi
 
 	# --- P5-bulk (dar-1il.1): no-silent-drop drift gate. Guest "may publish" set == server "will
 	#     service" set (both derived from the shared DSERVER_RING_C2S_OPCODES macro). RED arm

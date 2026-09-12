@@ -452,9 +452,8 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // waiting for its reply) is the right home for destroy-capable ops. Until that lane exists they stay
 // UDS; do NOT smuggle them back onto the simple ring via a "clever subset" that still risks an S2C.
 //
-// NOTE this is the TRANSPORT allowlist (Tier 1 = ride the ring via the generic fiber doWork); it is
-// DISTINCT from the no-fiber inline fast path (ringFastPathEligible / Tier 2), a strictly smaller,
-// separately-proven set. Never conflate the two.
+// Transport eligibility never implies non-suspending execution: every listed call
+// uses the generic fiber-backed dispatcher, including self-port minting traps.
 #define DSERVER_RING_C2S_OPCODES(X) \
 	X(task_self_trap) \
 	X(thread_self_trap) \
@@ -491,26 +490,23 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 //   Lane 0  UDS            -- control/fallback: bootstrap, creds, fd-passing, unknown/complex ops,
 //                             and destroy-capable / caller-S2C ops UNTIL a duplex lane proves them.
 //   Lane 1  simple ring    -- CLOSED request->single-reply transactions, NO caller S2C while parked.
-//                             Two sub-tiers (see below): generic-fiber (Tier 1) and no-fiber (Tier 2).
+//                             Calls retain a fiber: IPC locks can suspend even port-minting traps.
 //   Lane 2  duplex ring    -- FUTURE reentrant lane for caller-S2C-capable ops (dar-1il.3). Not built.
 //
 // The lane an op MAY use is a set of orthogonal, independently-proven properties. Encode them as
 // explicit bits so the code stops overloading "fast op" / "allowlist" / "ring op" (plan.md §6):
 //
 //   SimpleRingC2SEligible  -- may ride the Lane-1 simple ring (== membership in DSERVER_RING_C2S_OPCODES)
-//   NoFiberFastEligible    -- may ALSO skip the generic fiber/Call machinery (Tier 2; ringFastPathEligible)
 //   DuplexRingEligible     -- may ride the FUTURE Lane-2 duplex ring (no op qualifies yet)
 //   UdsOnly                -- must stay on UDS for now (no ring lane is safe for it yet)
 //   DestroyCapable         -- may, for SOME args, drop a last ref / tear down / cause a caller S2C
 //   CallerS2CCapable       -- may synchronously upcall the CALLER (mmap/munmap/...) before its reply
 //
 // POLICY (these are the load-bearing relationships; the static guardrail below enforces #2/#3):
-//   1. SimpleRingC2SEligible, NoFiberFastEligible, and DuplexRingEligible are DISTINCT concepts.
-//      SimpleRingC2SEligible does NOT imply NoFiberFastEligible (Tier 2 is a strictly smaller proven
-//      set). A future DuplexRingEligible op is NOT automatically SimpleRingC2SEligible.
+//   1. SimpleRingC2SEligible and DuplexRingEligible are DISTINCT concepts.
+//      A future DuplexRingEligible op is NOT automatically SimpleRingC2SEligible.
 //   2. DestroyCapable  => NOT SimpleRingC2SEligible. (canon rule 2: a teardown can drive a caller S2C.)
 //   3. CallerS2CCapable => NOT SimpleRingC2SEligible. (canon rule 1: a parked caller can't service it.)
-//   4. NoFiberFastEligible => SimpleRingC2SEligible. (Tier 2 is a sub-lane of Tier 1.)
 //
 // CLASSIFICATION TABLE: every Mach op that is RING-RELEVANT (already on a ring lane, or a known
 // future/duplex candidate the canon has ruled on) is listed here with its lane-class bits, so the
@@ -518,31 +514,21 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // An op that never comes near a ring lane (the vast majority) need NOT be listed -- absence just
 // means "unclassified == treated as UdsOnly by default". X is invoked as X(op, classbits).
 #define DSERVER_RING_CLASS_SIMPLE_C2S   0x01u // SimpleRingC2SEligible: in DSERVER_RING_C2S_OPCODES
-#define DSERVER_RING_CLASS_NOFIBER_FAST 0x02u // NoFiberFastEligible: Tier-2 no-fiber direct dispatch
 #define DSERVER_RING_CLASS_DUPLEX       0x04u // DuplexRingEligible: future Lane-2 (none yet)
 #define DSERVER_RING_CLASS_UDS_ONLY     0x08u // UdsOnly: no ring lane safe yet
 #define DSERVER_RING_CLASS_DESTROY      0x10u // DestroyCapable: can tear down / drop last ref
 #define DSERVER_RING_CLASS_CALLER_S2C   0x20u // CallerS2CCapable: can upcall the caller pre-reply
 
 #define DSERVER_RING_OP_CLASS(X) \
-	/* Lane 1 + Tier 2 (no-fiber): pure mint, never blocks, never an S2C. */ \
-	X(task_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	/* perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap join the pure-mint family. They */ \
-	/* have a BYTE-IDENTICAL shape to task_self_trap (empty request, single uint32 port_name reply; */ \
-	/* generate-rpc-wrappers.py:305-315) and the same processCall structure (dtape_*_self_trap mint + */ \
-	/* _sendReply, call.cpp:617-625) -- pure mint via current_task()/current's space, never blocks, */ \
-	/* never an S2C, never destroys. Chosen by the D9 heatmap (dar-1il.4) as the next migration: 100% */ \
-	/* UDS today, caller_s2c=0, ~12% of workload RPC. Tier-2 no-fiber-safe exactly like task_self_trap. */ \
-	X(thread_self_trap,       DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	X(host_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	X(mach_reply_port,        DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	/* Lane 1 Tier 1 (generic fiber): create/ref bookkeeping, no teardown, no caller S2C. */ \
+	/* Port minting/copyout can wait on shared IPC locks; all calls use a fiber. */ \
+	X(task_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(thread_self_trap,       DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(host_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(mach_reply_port,        DSERVER_RING_CLASS_SIMPLE_C2S) \
+	/* Create/ref bookkeeping, no teardown, no caller S2C. */ \
 	X(mach_port_allocate,     DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(mach_port_insert_right, DSERVER_RING_CLASS_SIMPLE_C2S) \
-	/* perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch -- SIMPLE_C2S ONLY (Tier-1 generic fiber, */ \
-	/* NOT NoFiberFast). These read/mutate process or thread state (creds, pthread handles, suspend/tracer */ \
-	/* flags, 64-bitness) via the generic Call path, NOT pure mint, so they are NOT no-fiber-safe like the */ \
-	/* self-trap family -- they stay Tier 1. None is destroy-capable or caller-S2C, so the canon holds. */ \
+	/* Process/thread state operations also use the generic fiber-backed Call path. */ \
 	X(uidgid,                 DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(set_thread_handles,     DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(started_suspended,      DSERVER_RING_CLASS_SIMPLE_C2S) \

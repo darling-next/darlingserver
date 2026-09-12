@@ -68,16 +68,15 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"inline_handled\": " << inlineHandled.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"queued_to_pool\": " << queuedToPool.load(std::memory_order_relaxed) << ",\n";
 #ifdef DSERVER_RING_TRANSPORT
-	out << "  \"ring_serviced_spin\": " << ringServicedSpin.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_serviced_doorbell\": " << ringServicedDoorbell.load(std::memory_order_relaxed) << ",\n";
+	const auto ringSpinCount = ringServicedSpin.load(std::memory_order_relaxed);
+	const auto ringDoorbellCount = ringServicedDoorbell.load(std::memory_order_relaxed);
+	out << "  \"ring_serviced\": " << ringSpinCount + ringDoorbellCount << ",\n";
+	out << "  \"ring_serviced_spin\": " << ringSpinCount << ",\n";
+	out << "  \"ring_serviced_doorbell\": " << ringDoorbellCount << ",\n";
 	out << "  \"ring_doorbells_received\": " << ringDoorbellsReceived.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_wakes_issued\": " << ringWakesIssued.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_wakes_skipped\": " << ringWakesSkipped.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_hit\": " << ringFastHit.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_fallback\": " << ringFastFallback.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_fail\": " << ringFastFail.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_s2c_full\": " << ringS2cFull.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_suspend\": " << ringFastSuspend.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_s2c\": " << ringDuplexS2c.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_reject\": " << ringDuplexReject.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_parent\": " << ringDuplexParent.load(std::memory_order_relaxed) << ",\n";
@@ -200,14 +199,12 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 			cls = dserver_ring_op_class(static_cast<uint32_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
 		}
 		const bool clsSimple  = (cls & DSERVER_RING_CLASS_SIMPLE_C2S) != 0;
-		const bool clsNoFiber = (cls & DSERVER_RING_CLASS_NOFIBER_FAST) != 0;
 		const bool clsDestroy = (cls & DSERVER_RING_CLASS_DESTROY) != 0;
 		const bool clsS2c     = (cls & DSERVER_RING_CLASS_CALLER_S2C) != 0;
 
 		// Lane VERDICT: combine the canon class (authoritative when present) with measured facts.
 		//  - already-on-ring   : the op is in the simple-ring set and we observed it riding the ring.
 		//  - duplex-only       : canon marks it destroy/caller-S2C, OR we MEASURED a caller-S2C -> Lane 2.
-		//  - tier2-candidate   : never used a fiber AND never an S2C -> a no-fiber direct-dispatch candidate.
 		//  - lane1-candidate   : completed on a fiber, no caller-S2C, currently (mostly) UDS -> Lane 1.
 		//  - needs-review      : anything else (mixed/destroy-unknown) -- a human must classify.
 		const char* verdict;
@@ -215,9 +212,7 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 			verdict = "duplex-only";
 		} else if (clsSimple && ring > 0) {
 			verdict = "already-on-ring";
-		} else if (usedFiber == 0 && callerS2c == 0) {
-			verdict = "tier2-candidate";
-		} else if (callerS2c == 0) {
+		} else if (callerS2c == 0 && usedFiber > 0) {
 			verdict = "lane1-candidate";
 		} else {
 			verdict = "needs-review";
@@ -236,7 +231,6 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 		    << ", \"ring_p50_us\": " << rh.quantile(0.50)
 		    << ", \"ring_p99_us\": " << rh.quantile(0.99)
 		    << ", \"class_simple\": " << (clsSimple ? 1 : 0)
-		    << ", \"class_nofiber\": " << (clsNoFiber ? 1 : 0)
 		    << ", \"class_destroy\": " << (clsDestroy ? 1 : 0)
 		    << ", \"class_caller_s2c\": " << (clsS2c ? 1 : 0)
 		    << ", \"verdict\": \"" << verdict << "\""

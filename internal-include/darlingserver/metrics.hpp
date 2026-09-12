@@ -158,23 +158,9 @@ namespace DarlingServer {
 		std::atomic<uint64_t> ringWakesSkipped {0};
 		std::atomic<uint64_t> ringDoorbellsReceived {0}; // eventfd wakes the server actually drained
 
-		// perf #18 P6.1 step 2 (dar-ohp): surgical direct-dispatch fast path for mach_reply_port.
-		// ringFastHit = a mach_reply_port request serviced WITHOUT building a Call/Message or
-		// re-looking-up the thread in the registry (doMachReplyPortInline -> dtape trap -> ring
-		// publish). ringFastFallback = a request that matched the callnum but failed the shape
-		// guard or whose inline dispatch declined -> took the generic step-1 callFromMessage path.
-		std::atomic<uint64_t> ringFastHit {0};
-		std::atomic<uint64_t> ringFastFallback {0};
-		// perf #18 P7 (dar-my8): the rest of the gist-required per-op fast-path accounting.
-		// ringFastFail  = an inline fast op that could not complete cleanly (declined late / publish
-		//                 lost) -- distinct from a fallback (which is a deliberate route to generic).
 		// ringS2cFull   = publishReply() found the s2c ring full (reply could not be published there;
 		//                 the caller UDS-falls-back). A nonzero value under load = guest not draining.
-		// ringFastSuspend = an op the fast path ran as non-blocking actually SUSPENDED -- a contract
-		//                 violation (allowlist misclassification). MUST stay 0; nonzero = a bug.
-		std::atomic<uint64_t> ringFastFail {0};
 		std::atomic<uint64_t> ringS2cFull {0};
-		std::atomic<uint64_t> ringFastSuspend {0};
 		// perf #18 P8 D3 (dar-1il.3.1.1): the duplex lane. ringDuplexS2c = an S2C upcall delivered to
 		// a ring-parked caller via the duplex mailbox (instead of the UDS S2C path) AND completed (the
 		// correlated reply came back + the server resumed). ringDuplexReject = a duplex reply that

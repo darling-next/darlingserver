@@ -91,37 +91,19 @@ int main(void) {
 	CHECK((op_class_local(dserver_callnum_mach_port_allocate) & DSERVER_RING_CLASS_DESTROY) == 0u,
 	      "mach_port_allocate is NOT DestroyCapable");
 
-	// --- Tier-2 (NoFiberFast) is a SUB-LANE of Tier-1: NoFiberFast => SimpleRingC2S (policy #4) -----
-	CHECK(dserver_ring_op_class(dserver_callnum_mach_reply_port) & DSERVER_RING_CLASS_NOFIBER_FAST,
-	      "mach_reply_port is NoFiberFastEligible (Tier 2)");
-	CHECK(dserver_ring_op_class(dserver_callnum_task_self_trap) & DSERVER_RING_CLASS_NOFIBER_FAST,
-	      "task_self_trap is NoFiberFastEligible (Tier 2)");
-	// perf #18 D10 (dar-1il.5): the rest of the pure-mint self-trap family joined Tier 2. Pin that
-	// they are BOTH SimpleRingC2S (Lane 1) AND NoFiberFast (Tier 2) AND carry NEITHER destroy nor
-	// caller-S2C (so the canon-safe fold over the whole C2S set still holds -- see the static_assert).
-	CHECK(dserver_ring_op_class(dserver_callnum_thread_self_trap) & DSERVER_RING_CLASS_NOFIBER_FAST,
-	      "thread_self_trap is NoFiberFastEligible (Tier 2) [D10]");
 	CHECK(dserver_ring_op_class(dserver_callnum_thread_self_trap) & DSERVER_RING_CLASS_SIMPLE_C2S,
 	      "thread_self_trap is SimpleRingC2SEligible [D10]");
 	CHECK((dserver_ring_op_class(dserver_callnum_thread_self_trap) & (DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)) == 0u,
 	      "thread_self_trap is NEITHER destroy nor caller-S2C [D10]");
-	CHECK(dserver_ring_op_class(dserver_callnum_host_self_trap) & DSERVER_RING_CLASS_NOFIBER_FAST,
-	      "host_self_trap is NoFiberFastEligible (Tier 2) [D10]");
 	CHECK(dserver_ring_op_class(dserver_callnum_host_self_trap) & DSERVER_RING_CLASS_SIMPLE_C2S,
 	      "host_self_trap is SimpleRingC2SEligible [D10]");
 	CHECK((dserver_ring_op_class(dserver_callnum_host_self_trap) & (DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)) == 0u,
 	      "host_self_trap is NEITHER destroy nor caller-S2C [D10]");
-	// allocate/insert_right ride Tier 1 only (generic fiber), NOT the no-fiber path.
-	CHECK((dserver_ring_op_class(dserver_callnum_mach_port_allocate) & DSERVER_RING_CLASS_NOFIBER_FAST) == 0u,
-	      "mach_port_allocate is NOT NoFiberFastEligible (Tier 1 only)");
 
-	// perf #18 D11 (dar-1il.6): the bulk closed-fast Lane-1 batch. Each must be SimpleRingC2SEligible
-	// (Lane 1), Tier-1 ONLY (NOT NoFiberFast -- they read/mutate process/thread state via the generic
-	// Call path, not pure mint), and carry NEITHER destroy nor caller-S2C (so the canon-safe fold holds).
+	// Process/thread state calls remain ring-eligible without destroy/caller-S2C semantics.
 #define D11_OP_CHECK(op) do { \
 		uint32_t _c = dserver_ring_op_class((uint32_t)dserver_callnum_##op); \
 		CHECK((_c & DSERVER_RING_CLASS_SIMPLE_C2S) != 0u, #op " is SimpleRingC2SEligible [D11]"); \
-		CHECK((_c & DSERVER_RING_CLASS_NOFIBER_FAST) == 0u, #op " is NOT NoFiberFastEligible (Tier 1 only) [D11]"); \
 		CHECK((_c & (DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)) == 0u, #op " is NEITHER destroy nor caller-S2C [D11]"); \
 	} while (0);
 	D11_OP_CHECK(uidgid);
@@ -157,13 +139,11 @@ int main(void) {
 	      "mach_port_mod_refs is CallerS2CCapable");
 
 	// --- POLICY relationships hold across the whole table -----------------------------------------
-	// #2 DestroyCapable => NOT SimpleRingC2S ; #3 CallerS2C => NOT SimpleRingC2S ; #4 NoFiber => SimpleC2S
+	// #2 DestroyCapable => NOT SimpleRingC2S; #3 CallerS2C => NOT SimpleRingC2S.
 #define POLICY_CHECK(op, bits) do { \
 		uint32_t _c = dserver_ring_op_class((uint32_t)dserver_callnum_##op); \
 		if (_c & (DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C)) \
 			CHECK((_c & DSERVER_RING_CLASS_SIMPLE_C2S) == 0u, #op " : destroy/caller-S2C => NOT SimpleRingC2S"); \
-		if (_c & DSERVER_RING_CLASS_NOFIBER_FAST) \
-			CHECK((_c & DSERVER_RING_CLASS_SIMPLE_C2S) != 0u, #op " : NoFiberFast => SimpleRingC2S"); \
 	} while (0);
 	DSERVER_RING_OP_CLASS(POLICY_CHECK)
 #undef POLICY_CHECK
