@@ -33,6 +33,7 @@
 #include <sstream>
 #include <cstddef>
 #include <unordered_map>
+#include <filesystem>
 #include <darlingserver/registry.hpp>
 #include <sys/eventfd.h>
 #include <darlingserver/duct-tape.h>
@@ -462,8 +463,9 @@ DarlingServer::Server::Server(
 	_rootlessInitHostPID(rootlessInitHostPID),
 	_socketPath(_prefix + "/.darlingserver.sock"),
 	// abstract-namespace name for the stat socket (see the stat-socket setup below for
-	// why abstract and not a pathname). Keyed off the prefix so distinct prefixes differ.
-	_statSocketPath("darlingserver-stat:" + _prefix),
+	// why abstract and not a pathname). Resolve rootless /proc/self/fd capabilities
+	// to the same canonical prefix identity used by host-side clients.
+	_statSocketPath("darlingserver-stat:" + std::filesystem::canonical(_prefix).string()),
 	_workQueue(std::bind(&Server::_worker, this, std::placeholders::_1))
 {
 	sharedInstancePointer = this;
