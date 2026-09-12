@@ -2462,9 +2462,14 @@ void DarlingServer::Thread::attachRing(std::shared_ptr<RingBuffer> ring, std::sh
 	std::shared_ptr<Monitor> oldMonitor = nullptr;
 	{
 		std::unique_lock lock(_rwlock);
-		// a thread attaches at most once in practice, but replace defensively
+		// dyld and libsystem_kernel keep separate guest lane tables. Retire the
+		// previous mapping before replacing it so its image cannot publish to
+		// an unserviced lane when it next regains control.
 		oldRing = std::move(_ring);
 		oldMonitor = std::move(_ringMonitor);
+		if (oldRing) {
+			oldRing->setServerState(DSERVER_RING_SRV_RETIRED);
+		}
 		_ring = ring;
 		_ringMonitor = monitor;
 	}

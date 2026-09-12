@@ -246,6 +246,9 @@ typedef struct dserver_kqchan_reply_proc_read {
 #define DSERVER_RING_SRV_SLEEPING_EPOLL 0u // server is (or is about to be) blocked in epoll_wait -> MUST doorbell
 #define DSERVER_RING_SRV_ACTIVE_POLLING 1u // server is draining rings in its spin phase -> doorbell NOT needed
 #define DSERVER_RING_SRV_SLEEP_ARMED    2u // server is between "decided to sleep" and epoll_wait -> doorbell (race window)
+// Another image attached a replacement lane for the same thread. This lane
+// will never be serviced again; guests must fall back before publishing.
+#define DSERVER_RING_SRV_RETIRED        3u
 
 // Bounds the server is willing to accept for a guest-proposed ring, so a malicious or buggy
 // guest can't make the server map an absurd region or compute a huge index. Kept modest;
