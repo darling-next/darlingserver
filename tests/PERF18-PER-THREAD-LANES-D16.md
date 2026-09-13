@@ -79,9 +79,12 @@ before init → reader reads garbage) and `-DRACE_REUSE_WITHOUT_GEN_BUMP` (reuse
 epoch false-matches) both fail. Wired into `run-ring-shm-validate.sh`.
 
 ### fork
-`__dserver_ring_postfork_reset()` drops EVERY lane (munmap + close + zero the table, generation back to
-0). The parent's lane mappings/wake-fds belong to the parent's server-side threads; the child re-attaches
-lazily, per thread, on demand. Fork-storm 3/3 DONE with ring health all-0 (no wedge, no lane leak).
+The loader owns ring wake descriptors across both dyld and libsystem_kernel. It
+closes inherited ring descriptors once, before child RPC sockets can reuse their
+numbers. `__dserver_ring_postfork_reset()` releases image-local mappings and resets
+the lane table; it must not close saved descriptor numbers. The child attaches a
+fresh lane lazily. The native `ring_fd_ownership_guest` regression covers application
+descriptor reuse across fork rather than mirroring the former teardown predicate.
 
 ## NON-GOALS (held)
 - NO earlier attach (D15a proved it's not the lever).
