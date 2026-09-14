@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# darling-stat (perf #0, dar-dar6x4-perf-5dq.6)
+# Connect to the darlingserver stat socket and print one JSON metrics snapshot.
+#
+#   darling-stat [PREFIX]
+#
+# PREFIX defaults to $DPREFIX, then $DARLING_PREFIX. The stat socket lives at
+# <PREFIX>/.darlingserver.stat.sock. Exits 0 on success, 2 if it can't connect
+# (server not running / metrics disabled), 1 on bad usage.
+import json
+import os
+import socket
+import sys
+
+
+def main():
+    prefix = None
+    if len(sys.argv) > 1:
+        prefix = sys.argv[1]
+    else:
+        prefix = os.environ.get("DPREFIX") or os.environ.get("DARLING_PREFIX")
+    if not prefix:
+        sys.stderr.write("usage: darling-stat [PREFIX]  (or set $DPREFIX)\n")
+        return 1
+
+    # The stat socket is in the ABSTRACT namespace (the server runs in a private mount
+    # namespace; the net namespace is shared with the host, so an abstract name works
+    # where a pathname socket would not). Abstract address = leading NUL + name.
+    name = "darlingserver-stat:" + os.path.abspath(prefix)
+    addr = "\0" + name
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(addr)
+    except OSError as e:
+        sys.stderr.write(f"darling-stat: cannot connect to abstract:{name}: {e}\n")
+        return 2
+
+    chunks = []
+    try:
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    except OSError as e:
+        sys.stderr.write(f"darling-stat: read error: {e}\n")
+        return 2
+    finally:
+        s.close()
+
+    raw = b"".join(chunks).decode("utf-8", "replace")
+    # validate it's JSON; pretty-print
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        sys.stdout.write(raw)
+        return 0
+    json.dump(obj, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

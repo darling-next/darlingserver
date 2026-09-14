@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+# darling-progress-watch (perf #0, dar-dar6x4-perf-5dq.6)
+#
+# Samples the darlingserver stat socket every INTERVAL seconds and classifies the
+# server state, replacing the unreliable "is the log file growing?" heuristic that
+# misdiagnosed dar-l3a (a slow-but-progressing gettext build) as a stall.
+#
+# Decision rule (per sample, comparing to the previous sample):
+#   PROGRESSING : rpcs_serviced strictly increased.
+#   SLOW        : progressing, but checkin/fork pXX latency is above --slow-us
+#                 (this is the dar-l3a state; it is what the perf fixes must drive down).
+#   WEDGED      : rpcs_serviced flat AND clients_blocked_in_rpc > 0 AND
+#                 last_reply_age_ms >= --wedge-age-ms (work is queued but nothing moves).
+#   IDLE        : flat but nobody is blocked (the server is just waiting for work).
+#
+# Usage:
+#   darling-progress-watch [--prefix PREFIX] [--interval SECS] [--slow-us US]
+#                          [--wedge-age-ms MS] [--count N]
+# Exit: 0 normal; 3 if a WEDGED state was observed at least once.
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+
+
+def abstract_addr(prefix):
+    # stat socket is in the abstract namespace (see darling-stat for why); addr = NUL + name
+    return "\0" + "darlingserver-stat:" + os.path.abspath(prefix)
+
+
+def read_snapshot(addr, timeout=5):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(addr)
+        chunks = []
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        s.close()
+    return json.loads(b"".join(chunks).decode("utf-8", "replace"))
+
+
+def pxx(snap, hist, field):
+    h = snap.get(hist) or {}
+    return h.get(field, 0)
+
+
+def classify(prev, cur, slow_us, wedge_age_ms):
+    rpcs_prev = prev.get("rpcs_serviced", 0)
+    rpcs_cur = cur.get("rpcs_serviced", 0)
+    blocked = cur.get("clients_blocked_in_rpc", 0)
+    age = cur.get("last_reply_age_ms", 0)
+
+    if rpcs_cur > rpcs_prev:
+        checkin_p95 = pxx(cur, "checkin_latency", "p95_us")
+        fork_p95 = pxx(cur, "fork_latency", "p95_us")
+        if checkin_p95 >= slow_us or fork_p95 >= slow_us:
+            return "SLOW", f"+{rpcs_cur - rpcs_prev} rpc/iv, checkin_p95={checkin_p95}us fork_p95={fork_p95}us (>= {slow_us})"
+        return "PROGRESSING", f"+{rpcs_cur - rpcs_prev} rpc/iv, checkin_p95={checkin_p95}us fork_p95={fork_p95}us"
+    # flat
+    if blocked > 0 and age >= wedge_age_ms:
+        return "WEDGED", f"rpcs flat, blocked={blocked}, last_reply_age={age}ms (>= {wedge_age_ms})"
+    return "IDLE", f"rpcs flat, blocked={blocked}, last_reply_age={age}ms"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prefix", default=os.environ.get("DPREFIX") or os.environ.get("DARLING_PREFIX"))
+    ap.add_argument("--interval", type=float, default=2.0)
+    ap.add_argument("--slow-us", type=int, default=50000, help="checkin/fork p95 above this => SLOW (default 50ms)")
+    ap.add_argument("--wedge-age-ms", type=int, default=10000, help="last_reply_age above this (while flat+blocked) => WEDGED")
+    ap.add_argument("--count", type=int, default=0, help="number of samples (0 = forever)")
+    args = ap.parse_args()
+
+    if not args.prefix:
+        sys.stderr.write("error: set --prefix or $DPREFIX\n")
+        return 1
+    addr = abstract_addr(args.prefix)
+
+    prev = None
+    saw_wedged = False
+    n = 0
+    while args.count == 0 or n < args.count:
+        try:
+            cur = read_snapshot(addr)
+        except OSError as e:
+            print(f"{time.strftime('%H:%M:%S')}  NO-SERVER ({e})")
+            prev = None
+            time.sleep(args.interval)
+            n += 1
+            continue
+
+        if prev is not None:
+            state, detail = classify(prev, cur, args.slow_us, args.wedge_age_ms)
+            if state == "WEDGED":
+                saw_wedged = True
+            print(f"{time.strftime('%H:%M:%S')}  {state:12s}  {detail}  "
+                  f"[rpcs={cur.get('rpcs_serviced',0)} forks={cur.get('forks',0)} "
+                  f"wq_depth={cur.get('workqueue_depth',0)} workers={cur.get('workers_busy',0)}/{cur.get('workers_total',0)}]")
+            sys.stdout.flush()
+        prev = cur
+        n += 1
+        if args.count == 0 or n < args.count:
+            time.sleep(args.interval)
+
+    return 3 if saw_wedged else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
