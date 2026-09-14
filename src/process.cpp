@@ -77,7 +77,6 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 		std::shared_lock parentLock(parentProcess->_rwlock);
 
 		// inherit vchroot from parent process
-		_vchrootDescriptor = parentProcess->_vchrootDescriptor;
 		_cachedVchrootPath = parentProcess->_cachedVchrootPath;
 
 		// inherit groups from parent process
@@ -151,23 +150,9 @@ std::string DarlingServer::Process::vchrootPath() const {
 	return _cachedVchrootPath;
 };
 
-void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
+void DarlingServer::Process::setVchrootPath(std::string path) {
 	std::unique_lock lock(_rwlock);
-	_vchrootDescriptor = directoryDescriptor;
-
-	char* tmp = new char[4096];
-
-	auto fdPath = "/proc/self/fd/" + std::to_string(_vchrootDescriptor->fd());
-	auto len = readlink(fdPath.c_str(), tmp, 4095);
-
-	if (len < 0) {
-		throw std::system_error(errno, std::generic_category(), "readlink");
-	}
-
-	tmp[len] = '\0';
-
-	_cachedVchrootPath = std::string(tmp);
-	delete[] tmp;
+	_cachedVchrootPath = path;
 };
 
 std::shared_ptr<DarlingServer::Process> DarlingServer::Process::currentProcess() {

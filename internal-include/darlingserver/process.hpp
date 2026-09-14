@@ -92,7 +92,6 @@ namespace DarlingServer {
 		mutable std::shared_mutex _rwlock;
 		std::unordered_map<uint64_t, std::weak_ptr<Thread>> _threads;
 		std::string _cachedVchrootPath;
-		std::shared_ptr<FD> _vchrootDescriptor;
 		dtape_task_t* _dtapeTask;
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
@@ -163,7 +162,7 @@ namespace DarlingServer {
 		std::vector<std::shared_ptr<Thread>> threads() const;
 
 		std::string vchrootPath() const;
-		void setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor);
+		void setVchrootPath(std::string path);
 
 		std::shared_ptr<Process> parentProcess() const;
 

@@ -24,6 +24,7 @@
 #include <darlingserver/server.hpp>
 #include <sys/uio.h>
 #include <errno.h>
+#include <cstring>
 
 #include <darlingserver/logging.hpp>
 #include <darlingserver/duct-tape.h>
@@ -684,13 +685,35 @@ void DarlingServer::Call::SetThreadHandles::processCall() {
 
 void DarlingServer::Call::Vchroot::processCall() {
 	int code = 0;
+	static constexpr uint64_t kMaxVchrootPath = 4096;
 
 	// TODO: wrap all `processCall` calls in try-catch like this
 	try {
 		if (auto thread = _thread.lock()) {
 			if (auto process = thread->process()) {
-				process->setVchrootDirectory(std::make_shared<FD>(_body.directory_fd));
-				_body.directory_fd = -1;
+				// `path` is a guest pointer. Copy the complete pathname snapshot once,
+				// bounded by the ABI limit, and reject short/faulting reads. Do not parse
+				// any bytes directly from guest memory after this copy.
+				if (_body.path_size == 0 || _body.path_size > kMaxVchrootPath) {
+					code = -EINVAL;
+				} else {
+					char path[kMaxVchrootPath];
+
+					if (process->readMemory(static_cast<uintptr_t>(_body.path), path, static_cast<size_t>(_body.path_size), &code)) {
+						if (path[_body.path_size - 1] != '\0') {
+							code = -EINVAL;
+						} else if (std::memchr(path, '\0', static_cast<size_t>(_body.path_size - 1)) != nullptr) {
+							// Embedded NUL would make the server and guest interpret different
+							// pathname byte strings.
+							code = -EINVAL;
+						} else {
+							process->setVchrootPath(std::string(path, static_cast<size_t>(_body.path_size - 1)));
+						}
+					} else {
+						// readMemory returns a positive error code, but we want a negative one
+						code = -code;
+					}
+				}
 			} else {
 				code = -ESRCH;
 			}

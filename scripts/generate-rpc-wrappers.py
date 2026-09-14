@@ -163,7 +163,8 @@ calls = [
 	], []),
 
 	('vchroot', [
-		('directory_fd', '@fd'),
+		('path', 'const char*', 'uint64_t'),
+		('path_size', 'uint64_t'),
 	], []),
 
 	('mldr_path', [
