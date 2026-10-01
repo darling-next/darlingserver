@@ -139,16 +139,37 @@ struct DTapeHooks {
 
 		struct itimerspec newSpec;
 		memset(&newSpec.it_interval, 0, sizeof(newSpec.it_interval));
-		newSpec.it_value.tv_sec = deadline_ns / 1000000000ull;
-		newSpec.it_value.tv_nsec = deadline_ns % 1000000000ull;
 
 		std::unique_lock lock(server._timerLock);
 
-		if (!override && server._currentTimerDeadline != 0 && deadline_ns >= server._currentTimerDeadline) {
+		/* INVARIANT A (dar-7tq3): an already-EXPIRED recorded deadline must not suppress a later arm. The old rule
+		 * compared only against the recorded value, so a wait armed while that value was already in the past had a
+		 * timer that could never fire. An expired deadline cannot wake anything, so it must not suppress the new arm. */
+		struct timespec armNow;
+		clock_gettime(CLOCK_MONOTONIC, &armNow);
+		uint64_t nowNs = (uint64_t)armNow.tv_sec * 1000000000ull + (uint64_t)armNow.tv_nsec;
+		const bool currentStillPending = server._currentTimerDeadline != 0 && server._currentTimerDeadline > nowNs;
+
+		if (!override && currentStillPending && deadline_ns >= server._currentTimerDeadline) {
 			DarlingServer::__rpctrace("TIMER-ARM-SKIP dl=%llu cur=%llu",
 				(unsigned long long)deadline_ns, (unsigned long long)server._currentTimerDeadline);
 			return;
 		}
+
+		/* INVARIANT B (dar-7tq3, MEASURED 2026-10-01): a still-pending EARLIER deadline must not be postponed by a
+		 * later override arm. Measured on a frozen server: a guest thread waited in semaphore_timedwait (30 s) with
+		 * the stall dump reporting timer=1 tactive=1, the timerfd was in the epoll set, its ticks stayed 0 forever,
+		 * and its remaining time fell from ~450 ms and jumped back to ~500 ms every ~450 ms -- an override arm kept
+		 * pushing the deadline forward, so timer_queue_expire() never ran and every pending deadline in the queue
+		 * was starved. Clamping fixes it; a cancelled timer then costs at most one spurious fire on an already
+		 * passed deadline, which only runs an expire pass that finds nothing due. Disarm (deadline_ns == 0 from
+		 * the UINT64_MAX mapping above) is NOT clamped and keeps its meaning. */
+		if (override && currentStillPending && deadline_ns > server._currentTimerDeadline) {
+			deadline_ns = server._currentTimerDeadline;
+		}
+
+		newSpec.it_value.tv_sec = deadline_ns / 1000000000ull;
+		newSpec.it_value.tv_nsec = deadline_ns % 1000000000ull;
 
 		DarlingServer::__rpctrace("TIMER-ARM dl=%llu ovr=%d (cur was %llu)",
 			(unsigned long long)deadline_ns, override ? 1 : 0,
