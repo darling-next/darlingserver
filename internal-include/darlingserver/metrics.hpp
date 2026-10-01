@@ -157,24 +157,17 @@ namespace DarlingServer {
 		std::atomic<uint64_t> ringWakesIssued {0};
 		std::atomic<uint64_t> ringWakesSkipped {0};
 		std::atomic<uint64_t> ringDoorbellsReceived {0}; // eventfd wakes the server actually drained
+		// perf#28 (ONE doorbell): wakes on the single process doorbell, and the requests its scan
+		// serviced. The per-lane counters above keep their meaning; these name the shared channel.
+		std::atomic<uint64_t> ringProcessDoorbellWakeups {0};
+		std::atomic<uint64_t> ringProcessDoorbellServiced {0};
+		// perf#28c: how many guest process incarnations have created their own doorbell object
+		// (== live kernel eventfd objects for the Ring wake plane).
+		std::atomic<uint64_t> ringDoorbellProcesses {0};
 
-		// perf #18 P6.1 step 2 (dar-ohp): surgical direct-dispatch fast path for mach_reply_port.
-		// ringFastHit = a mach_reply_port request serviced WITHOUT building a Call/Message or
-		// re-looking-up the thread in the registry (doMachReplyPortInline -> dtape trap -> ring
-		// publish). ringFastFallback = a request that matched the callnum but failed the shape
-		// guard or whose inline dispatch declined -> took the generic step-1 callFromMessage path.
-		std::atomic<uint64_t> ringFastHit {0};
-		std::atomic<uint64_t> ringFastFallback {0};
-		// perf #18 P7 (dar-my8): the rest of the gist-required per-op fast-path accounting.
-		// ringFastFail  = an inline fast op that could not complete cleanly (declined late / publish
-		//                 lost) -- distinct from a fallback (which is a deliberate route to generic).
 		// ringS2cFull   = publishReply() found the s2c ring full (reply could not be published there;
 		//                 the caller UDS-falls-back). A nonzero value under load = guest not draining.
-		// ringFastSuspend = an op the fast path ran as non-blocking actually SUSPENDED -- a contract
-		//                 violation (allowlist misclassification). MUST stay 0; nonzero = a bug.
-		std::atomic<uint64_t> ringFastFail {0};
 		std::atomic<uint64_t> ringS2cFull {0};
-		std::atomic<uint64_t> ringFastSuspend {0};
 		// perf #18 P8 D3 (dar-1il.3.1.1): the duplex lane. ringDuplexS2c = an S2C upcall delivered to
 		// a ring-parked caller via the duplex mailbox (instead of the UDS S2C path) AND completed (the
 		// correlated reply came back + the server resumed). ringDuplexReject = a duplex reply that
@@ -213,6 +206,27 @@ namespace DarlingServer {
 		std::atomic<uint64_t> ringDuplexVmdeallocFinal {0};
 		std::atomic<uint64_t> ringDuplexVmdeallocTimeout {0};
 		std::atomic<uint64_t> ringDuplexVmdeallocDisarmed {0};
+		// perf#26 RING-MACH-MSG: transaction-scoped accounting for the mach_msg_overwrite parent that
+		// rides the lane. Parent/final are server-side and must balance; the duplex pair counts the
+		// caller-S2C that the parent provoked. udsMachMsg* count the SAME op on the UDS transport, so a
+		// lane-resident transaction must leave all three UDS counters at 0.
+		std::atomic<uint64_t> ringMachMsgParent {0};       // callnum 38 dispatched from the ring
+		std::atomic<uint64_t> ringMachMsgFinal {0};        // its final reply published onto the s2c ring
+		std::atomic<uint64_t> ringMachMsgDecline {0};      // routed-but-declined pre-dispatch (shape skew)
+		std::atomic<uint64_t> ringMachMsgDuplexS2cPublished {0};
+		std::atomic<uint64_t> ringMachMsgDuplexS2cConsumed {0};
+		std::atomic<uint64_t> udsMachMsgRequest {0};       // callnum 38 received from the UDS listener
+		std::atomic<uint64_t> udsMachMsgReply {0};         // callnum 38 replied over UDS
+		std::atomic<uint64_t> udsMachMsgS2c {0};
+		// perf#26 §3 Case A: a UDS-origin mach_msg parent taking the UDS S2C path is NORMAL (its caller is
+		// parked in recvmsg); only a RING-origin parent taking it is the failure. Same event, two causes.
+		std::atomic<uint64_t> udsParentS2cNormal {0};
+		std::atomic<uint64_t> ringParentS2cUdsFallback {0};
+		// ABI v6: an S2C mmap that needs SCM_RIGHTS (fd >= 0 or offset != 0). Not mailbox-carryable yet.
+		std::atomic<uint64_t> ringDuplexCompletionReplayReject {0};    // case A: a completion with NO upcall in flight
+		std::atomic<uint64_t> ringDuplexReplyMismatchReject {0};        // case B: in flight, wrong (parent, upcall)
+		std::atomic<uint64_t> ringDuplexEarlyComplete {0};              // M1 RED arm: synthetic completion count
+		std::atomic<uint64_t> ringDuplexFdS2cUnsupported {0};           // an S2C raised by a mach_msg_overwrite parent went over UDS
 		// perf #18 P8 D6 (caller-S2C sideband) ATTRIBUTION: for every caller-S2C munmap upcall (_s2cPerform
 		// munmap to the CURRENT thread), classify the active PARENT op's lane. munmapRingParent = the caller
 		// has an active ring-originated parent (_ringReplyPending) -> the direct cure target for the duplex
@@ -286,6 +300,21 @@ namespace DarlingServer {
 		// server-side from the early-call fingerprint instead). attachMldrCallers / attachDylibCallers
 		// are mutually exclusive guesses; attachNoRingCode = a caller that reported no ring transport
 		// compiled in (e.g. the mldr binary).
+		// perf#30: the attach route's own attribution, read from the process-control page.
+		// perf#30 ProcessControlTxn lifecycle. Claimed is ownership transfer, completed is the operation
+		// being durably done, cancelled is a process death retiring its own transaction, and
+		// late_reply_retired is a completion that could not be published because the page incarnation or the
+		// request sequence had moved on -- the counter that proves no stale answer was written anywhere.
+		std::atomic<uint64_t> processControlTxnClaimed {0};
+		std::atomic<uint64_t> processControlTxnWaitFd {0};
+		std::atomic<uint64_t> processControlTxnCompleted {0};
+		std::atomic<uint64_t> processControlTxnCancelled {0};
+		std::atomic<uint64_t> processControlLateReplyRetired {0};
+		std::atomic<uint64_t> attachRouteOk {0};
+		std::atomic<uint64_t> attachRouteNotReady {0};
+		std::atomic<uint64_t> attachRouteRefused {0};
+		std::atomic<uint64_t> attachRouteClaimedNoLane {0};
+		std::atomic<uint64_t> attachRouteNoSlot {0};
 		std::atomic<uint64_t> attachMldrCallers {0};
 		std::atomic<uint64_t> attachDylibCallers {0};
 		std::atomic<uint64_t> attachNoRingCode {0};
@@ -533,8 +562,43 @@ namespace DarlingServer {
 		// The remaining eligibility axes (may_block, destroy-capable, complex/OOL payload, closed
 		// req->reply) are STATIC properties of a call number, so they are classified once at snapshot
 		// time from a table -- not threaded through the hot path. See snapshotJSON / classifyCallnum.
+		// perf#30 COURIER PROTOTYPE counters: peer connections that delivered descriptors, descriptors
+		// received, descriptors verified and closed (no orphan survives an experimental run).
+		std::atomic<uint64_t> fdCourierConnections {0};
+		std::atomic<uint64_t> fdCourierFdsReceived {0};
+		std::atomic<uint64_t> fdCourierFdsClosed {0};
+		// perf#30 FD-COURIER: the mutation surface. Each reject closes the descriptor it refused, so
+		// these counters describe real descriptors, and pendingPeak sizes how far the two halves of an
+		// operation can be apart in time (1 for a correct client: the descriptor is sent first).
+		std::atomic<uint64_t> fdCourierFdMatched {0};
+		std::atomic<uint64_t> fdCourierDuplicateReject {0};
+		std::atomic<uint64_t> fdCourierKindReject {0};
+		std::atomic<uint64_t> fdCourierStaleGenerationReject {0};
+		std::atomic<uint64_t> fdCourierOrphanFdClosed {0};
+		std::atomic<uint64_t> fdCourierSemanticOrphan {0};
+		std::atomic<uint64_t> fdCourierMalformed {0};
+		std::atomic<uint64_t> fdCourierGenerationAdvance {0};
+		// perf#30 PROCESS-CONTROL PLANE: management pages mapped, and requests serviced through them.
+		std::atomic<uint64_t> processControlRegions {0};
+		std::atomic<uint64_t> processControlRequests {0};
+		std::atomic<uint64_t> fdCourierPendingPeak {0};
+		std::atomic<uint64_t> fdCourierFallbackCmsg {0};
+		std::atomic<uint64_t> fdCourierLiveConnections {0};
+		// perf#30 FD-COURIER (round 49, SERVER->GUEST): the reverse direction is counted separately, so
+		// "the courier is used" cannot be claimed from the request direction alone.
+		std::atomic<uint64_t> fdCourierSentToGuest {0};
+		std::atomic<uint64_t> fdCourierSendFail {0};
+		// perf#28d (round 49): one doorbell descriptor delivery per process incarnation; every later
+		// ring_attach must reuse the guest's existing descriptor rather than transfer it again.
+		std::atomic<uint64_t> ringDoorbellSentToGuest {0};
+		std::atomic<uint64_t> ringDoorbellReused {0};
+		std::atomic<uint64_t> ringDoorbellSuppressed {0};
+		// perf#30 PHASE-0: wakes delivered on the courier connection before any doorbell exists.
+		std::atomic<uint64_t> processControlWakes {0};
 		std::atomic<bool> heatmapOn {false}; // armed by DARLING_SERVER_RPC_HEATMAP=1 (warm-server hatch)
 		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallUdsCount {};      // serviced over UDS
+		// perf#30 PHASE-0: calls the management page serviced, kept OUT of the UDS column.
+		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallPlaneCount {};
 		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallRingCount {};     // serviced over the ring (any lane)
 		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallUsedFiber {};     // suspended the microthread (generic doWork)
 		std::array<std::atomic<uint64_t>, kMaxCallNumbers> perCallDidCallerS2c {};  // drove a caller-S2C upcall while servicing
@@ -542,7 +606,7 @@ namespace DarlingServer {
 		std::array<LatencyHistogram, kMaxCallNumbers> perCallRingLatency {};        // service time on the ring path
 
 		// Transport tag for the heatmap (what lane actually serviced this call).
-		enum class CallTransport { Uds, Ring };
+		enum class CallTransport { Uds, Ring, ProcessControl };
 
 		// Record one serviced RPC for the D9 heatmap. Cheap, lock-free; no-op unless armed. Called
 		// alongside recordCall() from the same service-completion sites, passing the runtime facts those
@@ -556,7 +620,9 @@ namespace DarlingServer {
 			if (idx >= kMaxCallNumbers) {
 				return;
 			}
-			if (transport == CallTransport::Ring) {
+			if (transport == CallTransport::ProcessControl) {
+				perCallPlaneCount[idx].fetch_add(1, std::memory_order_relaxed);
+			} else if (transport == CallTransport::Ring) {
 				perCallRingCount[idx].fetch_add(1, std::memory_order_relaxed);
 				perCallRingLatency[idx].record(microseconds);
 			} else {

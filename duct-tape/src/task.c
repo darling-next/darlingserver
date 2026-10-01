@@ -239,20 +239,10 @@ int pid_from_task(task_t xtask) {
 
 int proc_get_effective_task_policy(task_t task, int flavor) {
 	dtape_stub();
-	switch (flavor) {
-	case TASK_POLICY_ROLE:
+	if (flavor == TASK_POLICY_ROLE) {
 		return TASK_UNSPECIFIED;
-	case TASK_POLICY_DARWIN_BG:
-	case TASK_POLICY_ALL_SOCKETS_BG:
-	case TASK_POLICY_SUP_ACTIVE:
-	case TASK_POLICY_LATENCY_QOS:
-	case TASK_POLICY_THROUGH_QOS:
-	case TASK_POLICY_WATCHERS_BG:
-	case TASK_POLICY_SFI_MANAGED:
-		return 0;
-	default:
-		dtape_stub("unknown proc_get_effective_task_policy flavor");
-		return 0;
+	} else {
+		panic("Unimplemented proc_get_effective_task_policy flavor: %d", flavor);
 	}
 };
 

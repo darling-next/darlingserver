@@ -306,6 +306,22 @@ _bsdthread_create(struct proc *p,
 	 * Strip PTHREAD_START_SUSPENDED so that libpthread can observe the kernel
 	 * supports this flag (after the fact).
 	 */
+	{
+		// CREATOR RECORD (bounded, machine-readable): this is the server-side thread creator, and it is the only
+		// place where the TSD decision for a new guest thread is visible. The fault under investigation is a thread
+		// that reaches a trap stub with si_addr=0x8 (a NULL TSD base plus an 8-byte offset), so which creator made
+		// it and whether a TSD base was established HERE is the question, not a guess about it.
+		static unsigned g_srv_thread_create_printed = 0;
+		unsigned n = __atomic_fetch_add(&g_srv_thread_create_printed, 1, __ATOMIC_RELAXED);
+		if (n < 24) {
+			char b[192];
+			int l = snprintf(b, sizeof(b),
+				"[srv-thread-create #%u pid=%d tsd_offset=%u tsd_set=%d flags=0x%x thport=%u]\n",
+				n, (int)((struct proc*)p)->p_pid, (unsigned)tsd_offset,
+				(flags & PTHREAD_START_TSD_BASE_SET) ? 1 : 0, (unsigned)flags, (unsigned)th_thport);
+			if (l > 0) { (void)!write(2, b, (size_t)l); }
+		}
+	}
 	flags &= ~PTHREAD_START_SUSPENDED;
 
 	/*

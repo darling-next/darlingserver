@@ -1,5 +1,7 @@
 #include <darlingserver/duct-tape/test-diagnostics.h>
 
+#include <stdlib.h>
+
 extern char* getenv(const char* name);
 extern int open(const char* pathname, int flags, ...);
 extern long write(int fd, const void* buf, unsigned long count);
@@ -22,6 +24,101 @@ static unsigned long dtape_test_trace_strlen(const char* string) {
 		++result;
 	}
 	return result;
+}
+
+// perf#30 (doc section 241): THE EVENT RING. MEASURED need: the line-per-event trace writes to a file for every
+// send, receive and post, and that I/O is enough to move the very race the trace exists to observe (`basic 20` hangs in
+// three runs of three without it while `basic 2` passes with it). A race can only be judged from a run that is not
+// slowed by its own instrument, so the hot events go into a fixed memory ring -- no syscall, no allocation, no lock --
+// and are written out only when something else asks for them (the server's stall watchdog, or the end of a run).
+#define DTA_ERING_CAP 2048u
+typedef struct {
+	unsigned long long seq;
+	unsigned long long tag;
+	unsigned long long a;
+	unsigned long long b;
+	unsigned long long c;
+	unsigned long long d;
+} dta_ering_record;
+static dta_ering_record dta_ering[DTA_ERING_CAP];
+static unsigned long long dta_ering_reserved;
+static int dta_ering_enabled = -1;
+
+static int dta_ering_on(void) {
+	if (dta_ering_enabled < 0) {
+		const char* p = getenv("DSERVER_TRACE_RING");
+		dta_ering_enabled = (p && p[0] == '1') ? 1 : 0;
+	}
+	return dta_ering_enabled;
+}
+
+void dtape_test_ring_record(unsigned long long tag, unsigned long long a, unsigned long long b, unsigned long long c) {
+	dtape_test_ring_record4(tag, a, b, c, 0);
+}
+
+void dtape_test_ring_record4(unsigned long long tag, unsigned long long a, unsigned long long b, unsigned long long c, unsigned long long d) {
+	if (!dta_ering_on()) {
+		return;
+	}
+	// One atomic reservation per event and a plain store into the reserved slot: a torn record is possible under
+	// concurrency and is accepted, because dropping a diagnostic event must never block the path it observes.
+	unsigned long long seq = __atomic_fetch_add(&dta_ering_reserved, 1, __ATOMIC_RELAXED);
+	dta_ering_record* r = &dta_ering[seq & (DTA_ERING_CAP - 1)];
+	r->seq = seq;
+	r->tag = tag;
+	r->a = a;
+	r->b = b;
+	r->c = c;
+	r->d = d;
+}
+
+// perf#30 (doc section 249): the dump writes to fd 2 itself. MEASURED: it went through `dtape_test_trace_line`, which
+// the LINE TRACE controls, so a run with the ring on (`DSERVER_TRACE_RING=1`) and no trace file -- exactly the
+// combination the ring exists for, since the line trace perturbs the hot path -- produced a stall dump with NO ring
+// records at all. The instrument was on and the output was invisible, which is the same failure as being off.
+// The XNU-flavoured translation unit cannot include the host <unistd.h>, so the one call this needs is declared here.
+extern long write(int fd, const void* buf, unsigned long count);
+
+static void dta_ering_dump_line(const char* line) {
+	unsigned long len = 0;
+	while (line[len] != '\0') { len++; }
+	(void)!write(2, line, len);
+	dtape_test_trace_line(line);
+}
+
+void dtape_test_ring_dump(void) {
+	unsigned long long reserved = __atomic_load_n(&dta_ering_reserved, __ATOMIC_ACQUIRE);
+	unsigned long long count = (reserved < (unsigned long long)DTA_ERING_CAP) ? reserved : (unsigned long long)DTA_ERING_CAP;
+	unsigned long long first = reserved - count;
+	char line[192];
+	snprintf(line, sizeof(line), "dtape.ering dump events=%llu shown=%llu\n", reserved, count);
+	dta_ering_dump_line(line);
+	for (unsigned long long i = first; i < reserved; ++i) {
+		dta_ering_record* r = &dta_ering[i & (DTA_ERING_CAP - 1)];
+		if (r->seq != i) {
+			continue; // overwritten or partly written while we read: reported by omission, never guessed
+		}
+		const char* tag = "?";
+		switch (r->tag) {
+			case 1: tag = "recv_park"; break;
+			case 2: tag = "recv_done"; break;
+			case 3: tag = "send_dest"; break;
+			case 4: tag = "post_wake"; break;
+			case 5: tag = "recv_object"; break;
+			case 6: tag = "recv_woken"; break;
+			// perf#30 (doc section 250): the TIMER path, recorded into the same ring. The question that needed it:
+			// a semaphore timed wait with a 30-second deadline began and never received a reply while the server was
+			// alive and idle. The deadline is armed by the hook below and fired by the server loop reading the
+			// timerfd, so "armed but never fired" is the difference between "the loop never saw the timerfd" and
+			// "the timer fired and the wake was lost" -- and nothing could tell them apart.
+			case 7: tag = "timer_arm"; break;
+			case 8: tag = "timer_fired"; break;
+			default: break;
+		}
+		snprintf(line, sizeof(line), "dtape.ering seq=%llu tag=%s a=0x%llx b=0x%llx c=0x%llx d=0x%llx\n",
+			r->seq, tag, r->a, r->b, r->c, r->d);
+		dta_ering_dump_line(line);
+	}
 }
 
 void dtape_test_trace_line(const char* line) {
@@ -104,6 +201,64 @@ void dtape_test_trace_wait_timer(
 		wait_result,
 		had_timer,
 		active
+	);
+	dtape_test_trace_line(line);
+}
+
+// perf#30 (doc section 236): the mach_msg send/receive pair, traced at the trap level. MEASURED need: the stall dump
+// showed a thread parked in mach_msg_overwrite with a continuation while the only other parked guest thread sat in a
+// semaphore wait that times out and retries, and two ring publishes had no matching consume -- i.e. one message
+// exchange whose two halves never met. `mqueue` and `port_name` are the two things that decide it: the receive parks on
+// ONE mqueue and a send must arrive at THAT one. Addresses of different objects are printed as-is on purpose -- the
+// question is equality, and only the run can answer it.
+void dtape_test_trace_msgq(
+	const char* event,
+	unsigned long long thread,
+	unsigned long long mqueue,
+	unsigned long long port_name,
+	unsigned int bits,
+	int result
+) {
+	// The hot path never writes a file when the ring is on: the SAME call sites feed either the ring or the line
+	// trace, so the two modes cannot drift and a stalled run can be replayed from order rather than from a summary.
+	if (dta_ering_on()) {
+		// Explicit string comparison, not character positions: MEASURED in the first version of this classifier, a
+		// positional test is one rename away from silently labelling every event with the wrong tag, and a ring whose
+		// tags are wrong is worse than no ring. `bits` and `result` are carried in ONE extra field, because the
+		// post's "found a waiter" flag is exactly the bit this instrument exists to preserve.
+		unsigned long long tag = 0;
+		if (dtape_test_trace_streq(event, "trap_recv_park")) {
+			tag = 1;
+		} else if (dtape_test_trace_streq(event, "trap_recv_done")) {
+			tag = 2;
+		} else if (dtape_test_trace_streq(event, "kmsg_send_dest")) {
+			tag = 3;
+		} else if (dtape_test_trace_streq(event, "post_wake")) {
+			tag = 4;
+		} else if (dtape_test_trace_streq(event, "trap_recv_object")) {
+			tag = 5;
+		} else if (dtape_test_trace_streq(event, "recv_woken")) {
+			tag = 6;
+		}
+		unsigned long long packed = ((unsigned long long)(unsigned int)bits << 32)
+			| (unsigned long long)(unsigned int)result;
+		dtape_test_ring_record4(tag, thread, mqueue, port_name, packed);
+		return;
+	}
+	char line[256];
+	snprintf(line, sizeof(line),
+		// perf#30 (doc section 244): the fourth field is NOT a port name. Two call sites pass a PORT OBJECT pointer
+		// (`kmsg_send_dest`) and one passes a RECEIVER THREAD pointer (`post_wake`), which is exactly what the matching
+		// comparisons need -- but a field called `port_name` that holds an address is read as a name, and it was, during
+		// this very investigation: a 13-digit value looked like a corrupt name instead of the pointer it is. Print it as
+		// an address under the name it actually has.
+		"dtape.msgq event=%s thread=0x%llx mqueue=0x%llx arg=0x%llx bits=0x%x result=%d",
+		event,
+		thread,
+		mqueue,
+		port_name,
+		bits,
+		result
 	);
 	dtape_test_trace_line(line);
 }

@@ -51,8 +51,6 @@ namespace DarlingServer {
 	 */
 	class Message {
 	private:
-		static constexpr size_t kDefaultDescriptorSpace = 8;
-
 		struct msghdr _header;
 		struct iovec _dataDescriptor;
 		std::vector<uint8_t> _buffer;
@@ -76,9 +74,7 @@ namespace DarlingServer {
 		/**
 		 * Default-initializes a Message.
 		 *
-		 * By default, the data buffer holds 256 bytes and the control data buffer has enough
-		 * descriptor space for the current maximum-sized RPC reply plus the push_reply
-		 * sync pipe.
+		 * By default, the data buffer holds 256 bytes and the control data buffer has space for 4 descriptors.
 		 *
 		 * If this Message is being used to receive a message from a socket, you must preallocate
 		 * the buffers for the recvmsg/recvmmsg call. The buffers are already preallocated to the
@@ -86,7 +82,7 @@ namespace DarlingServer {
 		 * you can call pushData() with a null buffer pointer and a non-zero size. If you wish to
 		 * grow the control data buffer, you can call pushDescriptor() with a descriptor value of `-1`.
 		 */
-		Message(size_t bufferSpace = 256, size_t descriptorSpace = kDefaultDescriptorSpace, std::function<void()> sendNotificationCallback = nullptr);
+		Message(size_t bufferSpace = 256, size_t descriptorSpace = 4, std::function<void()> sendNotificationCallback = nullptr);
 		~Message();
 
 		Message(Message&&);

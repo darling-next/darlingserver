@@ -5,6 +5,9 @@ cmake_minimum_required(VERSION 3.13)
 option(DSERVER_TOOLS "Build darlingserver tools (for debugging)" OFF)
 option(DSERVER_ASAN "Build darlingserver with ASAN" OFF)
 option(DSERVER_UBSAN "Build darlingserver with UBSAN" OFF)
+option(DARLING_EUNION
+	"Enable E-UNION union-in-vchroot prefix assembly (experimental)"
+	OFF)
 
 if (DSERVER_TOOLS)
 	add_subdirectory(tools)
@@ -130,7 +133,16 @@ add_executable(darlingserver
 	src/stack-pool.cpp
 	src/metrics.cpp
 	src/test-diagnostics.cpp
+	src/runtime-mode.cpp
 	src/ring.cpp
+	# Darling native debugger epic: read-only debug introspection ABI.
+	src/debug-serialize.cpp
+	src/debug-introspection.cpp
+	src/debug-connection.cpp
+	src/debug-collect.cpp
+)
+target_compile_definitions(darlingserver PRIVATE
+	DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
 )
 
 add_executable(dserver_process_identity_tests
@@ -146,36 +158,25 @@ add_custom_target(dserver_process_identity_tests_run
 	DEPENDS dserver_process_identity_tests
 )
 
-add_executable(dserver_stack_pool_tests
-	tests/stack-pool-null-regression.cpp
-	src/stack-pool.cpp
+add_executable(dserver_runtime_mode_tests
+	tests/runtime_mode_test.cpp
+	src/runtime-mode.cpp
 )
-
-target_compile_options(dserver_stack_pool_tests PRIVATE
+target_compile_options(dserver_runtime_mode_tests PRIVATE
 	-std=c++17
 )
-
-add_custom_target(dserver_stack_pool_tests_run
-	COMMAND $<TARGET_FILE:dserver_stack_pool_tests>
-	DEPENDS dserver_stack_pool_tests
+target_include_directories(dserver_runtime_mode_tests PRIVATE
+	include
 )
 
-add_executable(dserver_standard_signal_coalescing_tests
-	tests/standard-signal-coalescing.cpp
+add_executable(dserver_exec_completion_tests
+	tests/exec_completion_test.cpp
+	src/utility.cpp
 )
-
-target_compile_options(dserver_standard_signal_coalescing_tests PRIVATE
+target_compile_options(dserver_exec_completion_tests PRIVATE
 	-std=c++17
 )
-
-target_link_libraries(dserver_standard_signal_coalescing_tests PRIVATE
-	darlingserver_duct_tape
-)
-
-add_custom_target(dserver_standard_signal_coalescing_tests_run
-	COMMAND $<TARGET_FILE:dserver_standard_signal_coalescing_tests>
-	DEPENDS dserver_standard_signal_coalescing_tests
-)
+add_test(NAME dserver_exec_completion COMMAND dserver_exec_completion_tests)
 
 add_dependencies(darlingserver
 	generate_dserver_rpc_wrappers
@@ -189,8 +190,6 @@ target_link_libraries(darlingserver PRIVATE
 target_compile_options(darlingserver PRIVATE
 	-pthread
 	-std=c++17
-	# A0-ARCH: debug info for live crash triage (same -O2 codegen; inline frames + lines in gdb)
-	-g
 )
 target_link_options(darlingserver PRIVATE
 	-pthread

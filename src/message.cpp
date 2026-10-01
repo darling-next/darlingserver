@@ -539,9 +539,14 @@ bool DarlingServer::MessageQueue::sendMany(int socket) {
 				break;
 			} else if (errno == EINTR) {
 				ret = 0;
-			} else if (errno == EPIPE || errno == ECONNREFUSED) {
+			} else if (errno == EPIPE || errno == ECONNREFUSED || errno == ENOTCONN) {
 				// this means that peer of the first message we tried to send has died.
 				// we'll just drop that message and try the others.
+				// perf#30: ENOTCONN is in this list for the same reason and it was MEASURED: a reply to a
+				// peer that has already gone away (a teardown call such as checkout, whose caller is exiting)
+				// raised it, the send path threw `std::system_error`, and the SERVER ABORTED -- which is what
+				// several earlier readings mistook for a boot wedge. A vanished peer is a dropped message,
+				// never a reason to take the process down.
 				_messages.pop_front();
 				ret = 0;
 			} else {
@@ -598,10 +603,6 @@ bool DarlingServer::MessageQueue::receiveMany(int socket) {
 		}
 
 		for (size_t i = 0; i < ret; ++i) {
-			if ((mmsgs[i].msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
-				continue;
-			}
-
 			messages[i].rawHeader() = mmsgs[i].msg_hdr;
 			messages[i].data().resize(mmsgs[i].msg_len);
 			messages[i].setAddress(Address(*(const struct sockaddr_un*)mmsgs[i].msg_hdr.msg_name, mmsgs[i].msg_hdr.msg_namelen));

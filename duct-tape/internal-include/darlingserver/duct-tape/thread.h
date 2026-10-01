@@ -30,12 +30,6 @@ typedef LIST_HEAD(dtape_thread_user_state_head, dtape_thread_user_state) dtape_t
 struct dtape_thread {
 	void* context;
 	dtape_mutex_link_t mutex_link;
-	// A0-ARCH stage 1: generation of the currently-armed XNU wait (set by
-	// thread_mark_wait_locked via the arm_wake hook under the thread lock; read+cleared by
-	// thread_unblock under the same lock so the finalizing wake names exactly the wait it
-	// finalized). 0 = no armed XNU wait (a kernel thread's birth TH_WAIT from
-	// kernel_thread_create arrives here as 0 and is delivered as an untyped start kick).
-	uint64_t xnu_wait_gen;
 	const char* name;
 	uintptr_t pthread_handle;
 	uintptr_t dispatch_qaddr;
@@ -99,3 +93,7 @@ static dtape_task_t* dtape_task_for_thread(dtape_thread_t* thread) {
 };
 
 #endif // _DARLINGSERVER_DUCT_TAPE_THREAD_H_
+
+/* perf#30 R1: the thread-targeted form of the thread_self_trap semantics (see ipc_tt.c). Declared here because the
+ * wrapper below needs it and this header already carries the duct-tape's kernel-side view. */
+extern mach_port_name_t thread_self_trap_for(thread_t thread);

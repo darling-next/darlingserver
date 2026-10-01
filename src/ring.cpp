@@ -34,12 +34,14 @@
 #include <cstring>
 #include <cstdint>
 
-DarlingServer::RingBuffer::RingBuffer(void* map, size_t size, FD&& eventfd, const dserver_ring_shm_t& cb):
+DarlingServer::RingBuffer::RingBuffer(void* map, size_t size, const dserver_ring_shm_t& cb):
 	_map(map),
-	_size(size),
-	_eventfd(std::move(eventfd))
+	_size(size)
 {
 	std::memcpy(&_cb, &cb, sizeof(_cb));
+	// perf#26 RING-MACH-MSG: diagnose-only lane identity (see debugLaneId()).
+	static std::atomic<uint64_t> nextLaneId{1};
+	_debugLaneId = nextLaneId.fetch_add(1, std::memory_order_relaxed);
 };
 
 DarlingServer::RingBuffer::~RingBuffer() {
@@ -47,7 +49,6 @@ DarlingServer::RingBuffer::~RingBuffer() {
 		munmap(_map, _size);
 		_map = nullptr;
 	}
-	// _eventfd (FD) closes itself.
 };
 
 std::shared_ptr<DarlingServer::RingBuffer> DarlingServer::RingBuffer::attach(int ring_fd, uint64_t claimed_size, int32_t scm_nsid, dserver_ring_reject_t* outReject) {
@@ -79,21 +80,12 @@ std::shared_ptr<DarlingServer::RingBuffer> DarlingServer::RingBuffer::attach(int
 	// the fd is no longer needed once mapped; the mapping holds its own reference.
 	dupedFD = FD();
 
-	// The wake eventfd the guest signals; nonblocking + cloexec like the server's own.
-	int efd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	if (efd < 0) {
-		munmap(map, realSize);
-		if (outReject) *outReject = dserver_ring_reject_total_size;
-		return nullptr;
-	}
+	// perf#28 (ONE doorbell): a lane no longer creates or owns a wake descriptor. The whole
+	// transport shares Server::_ringDoorbellFD, whose dup is handed to the guest at attach.
 
 	if (outReject) *outReject = dserver_ring_ok;
 	// private ctor -> can't use make_shared
-	return std::shared_ptr<RingBuffer>(new RingBuffer(map, realSize, FD(efd), cb));
-};
-
-int DarlingServer::RingBuffer::eventfd() const {
-	return _eventfd.fd();
+	return std::shared_ptr<RingBuffer>(new RingBuffer(map, realSize, cb));
 };
 
 const dserver_ring_shm_t& DarlingServer::RingBuffer::controlBlock() const {
@@ -172,11 +164,6 @@ bool DarlingServer::RingBuffer::wakeGuest() {
 	}
 	Metrics::shared().ringWakesSkipped.fetch_add(1, std::memory_order_relaxed);
 	return false;
-};
-
-void DarlingServer::RingBuffer::drainWake() {
-	eventfd_t value;
-	eventfd_read(_eventfd.fd(), &value);
 };
 
 void DarlingServer::RingBuffer::setServerState(uint32_t state) {

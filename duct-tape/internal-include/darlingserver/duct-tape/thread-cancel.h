@@ -21,6 +21,14 @@ dtape_thread_cancel_state_init(dtape_thread_cancel_state_t* state)
 	state->canceled = false;
 }
 
+// NOTE (directive section 7): these transitions are read-modify-write on three plain bools and their two
+// callers are genuinely concurrent -- __pthread_markcancel arms the state from ANOTHER thread while the target
+// observes it at its own cancellation point. That used to be safe only because both ran on the same microthread
+// fiber. The serialization now lives in the SERVER's Thread (a mutex plus Thread::pthreadCanceled /
+// Thread::pthreadMarkcancel / Thread::cancelStateSnapshot), NOT in this shared structure: adding a lock HERE
+// would change a struct that several images link, and a stale consumer of a changed shared layout is a silent
+// memory corruption. Server-side state owns server-side concurrency.
+
 static inline int
 dtape_thread_cancel_state_canceled(dtape_thread_cancel_state_t* state, int action)
 {

@@ -29,6 +29,7 @@
 #include <unordered_set>
 
 #include <darlingserver/fork-checkin.hpp>
+#include <darlingserver/exec-completion.hpp>
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/utility.hpp>
 #include <darlingserver/kqchan.hpp>
@@ -51,6 +52,22 @@ namespace DarlingServer {
 		friend class Registry<Process>;
 
 	public:
+	// perf#30 (doc section 216): the MANAGEMENT PLANE needs the semantic core without a Call. MEASURED: the plane
+	// handler for SET_DYLD_INFO built an ordinary Call and ran it with doWork() on the process's own thread, which
+	// for that request is the very thread parked waiting for the reply -- so the plane pass waited on work that
+	// waited on the pass, and the loader spun on `iter=20000 waited=0 reply=0`. This is the SAME core the Call runs
+	// (Call::SetDyldInfo::processCall), so the semantics still exist exactly once.
+	void setDyldInfo(uint64_t address, uint64_t length) {
+		dtape_task_set_dyld_info(_dtapeTask, address, length);
+	};
+	// perf#30 (doc section 245): the same reason as setDyldInfo, for a much hotter operation. MEASURED: the plane
+	// handler for SEMAPHORE_SIGNAL synthesized an ordinary Call and ran it on this process's own thread, which is
+	// frequently parked in a blocking receive; the thread state machine refused it and the SERVER ABORTED
+	// (pending_call=58, active_call=38), leaving every outstanding RPC unanswered. A signal needs the process's port
+	// namespace and nothing else, so it is served here, directly.
+	int signalSemaphore(unsigned int name, bool all) {
+		return dtape_semaphore_signal_for_task(_dtapeTask, name, all ? 1 : 0);
+	};
 		enum class Architecture {
 			Invalid = dserver_rpc_architecture_invalid,
 			i386 = dserver_rpc_architecture_i386,
@@ -92,16 +109,12 @@ namespace DarlingServer {
 		mutable std::shared_mutex _rwlock;
 		std::unordered_map<uint64_t, std::weak_ptr<Thread>> _threads;
 		std::string _cachedVchrootPath;
-		std::shared_ptr<FD> _vchrootDescriptor;
 		dtape_task_t* _dtapeTask;
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
-		bool _pendingReplacement = false;
-	// perf#25a A0 (Part 4): whether this process's MAIN thread has completed a checkin.
-	// A main-thread re-checkin (that is not a fork checkin) is definitionally an exec
-	// replacement; keying didExec off this makes the decision independent of the
-	// exec-listener-pipe event's arrival timing (see notifyCheckin).
-	bool _mainThreadCheckedIn = false;
+		ExecCompletion _execCompletion;
+		// Only a non-fork main-thread re-checkin replaces the task.
+		bool _mainThreadCheckedIn = false;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -149,6 +162,7 @@ namespace DarlingServer {
 		void _dispose();
 
 		void _setEternalID(EternalID eid);
+		void _traceExecCompletion(); // requires _rwlock
 
 	public:
 		using ID = pid_t;
@@ -178,7 +192,7 @@ namespace DarlingServer {
 		std::vector<std::shared_ptr<Thread>> threads() const;
 
 		std::string vchrootPath() const;
-		void setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor);
+		void setVchrootPath(std::string path);
 
 		std::shared_ptr<Process> parentProcess() const;
 
@@ -189,7 +203,8 @@ namespace DarlingServer {
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;
 
 		void notifyCheckin(Architecture architecture, bool isMainThread, bool isFork);
-		void setPendingReplacement();
+		void beginExec(std::shared_ptr<FD> listener, bool executingMachO);
+		void notifyExecCompletion(const std::shared_ptr<FD>& listener);
 
 		void registerKqchan(std::shared_ptr<Kqchan> kqchan);
 		void unregisterKqchan(std::shared_ptr<Kqchan> kqchan);

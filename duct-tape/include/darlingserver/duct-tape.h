@@ -24,6 +24,9 @@ void dtape_deinit(void);
 uint32_t dtape_task_self_trap(void);
 uint32_t dtape_host_self_trap(void);
 uint32_t dtape_thread_self_trap(void);
+/* The same semantics, addressed at a NAMED thread instead of the current one: the management plane needs this so it
+ * can return a guest thread's self port while running on a server microthread. NULL returns 0. */
+uint32_t dtape_thread_self_trap_for(dtape_thread_t* thread);
 uint32_t dtape_mach_reply_port(void);
 uint32_t dtape_thread_get_special_reply_port(void);
 uint32_t dtape_mk_timer_create(void);
@@ -59,16 +62,7 @@ dtape_semaphore_t* dtape_semaphore_create(dtape_task_t* owning_task, int initial
 void dtape_kqchan_mach_port_destroy(dtape_kqchan_mach_port_t* kqchan);
 void dtape_semaphore_destroy(dtape_semaphore_t* semaphore);
 
-/**
- * A0-ARCH stage 2c: dtape_thread_entering() is GONE. Its unconditional "entering => cannot be
- * waiting" TH_WAIT clobber was the A0 disease (it half-tore committed waits; see the Part 3
- * history in thread.cpp). A fresh-call dispatch is asserted NOT to be waiting instead: this
- * recovery helper checks for a stranded TH_WAIT and clears it exactly like entering used to
- * (returning true so the caller can report the violation). Lock-free read/write, same as the
- * old entering (callers hold the server-side Thread lock, never the XNU thread_lock).
- */
-bool dtape_thread_clear_stranded_wait(dtape_thread_t* thread);
-void dtape_thread_exiting(dtape_thread_t* thread);
+void dtape_thread_entering(dtape_thread_t* thread);
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr);
 
 typedef struct dtape_thread_cancel_state_snapshot {
@@ -104,6 +98,7 @@ int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_s
 int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address);
 void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, int linux_signal_number, int code, uintptr_t signal_address);
 void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread);
+int dtape_thread_wait_timer_state(dtape_thread_t* thread, unsigned long long* active_out);
 void dtape_thread_retain(dtape_thread_t* thread);
 void dtape_thread_release(dtape_thread_t* thread);
 void dtape_thread_sigexc_enter(dtape_thread_t* thread);
@@ -135,6 +130,9 @@ void dtape_semaphore_up(dtape_semaphore_t* semaphore);
 dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore);
 dtape_semaphore_wait_result_t dtape_semaphore_down_timeout(dtape_semaphore_t* semaphore, unsigned int seconds);
 bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore);
+// perf#30 (doc section 245): signal a semaphore by name in the TASK own namespace, with no calling thread,
+// returning the trap kern_return code instead of depending on a synthesized Call.
+int dtape_semaphore_signal_for_task(dtape_task_t* task, unsigned int name, int all);
 
 uint64_t dtape_debug_task_port_count(dtape_task_t* task);
 uint64_t dtape_debug_task_list_ports(dtape_task_t* task, dtape_debug_task_list_ports_iterator_f iterator, void* context);

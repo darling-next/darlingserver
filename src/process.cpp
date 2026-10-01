@@ -17,6 +17,7 @@
  * along with Darling.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <darlingserver/server.hpp>
 #include <darlingserver/process.hpp>
 #include <darlingserver/fork-checkin.hpp>
 #include <darlingserver/process-identity.hpp>
@@ -79,7 +80,6 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 		std::shared_lock parentLock(parentProcess->_rwlock);
 
 		// inherit vchroot from parent process
-		_vchrootDescriptor = parentProcess->_vchrootDescriptor;
 		_cachedVchrootPath = parentProcess->_cachedVchrootPath;
 
 		// inherit groups from parent process
@@ -153,23 +153,9 @@ std::string DarlingServer::Process::vchrootPath() const {
 	return _cachedVchrootPath;
 };
 
-void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
+void DarlingServer::Process::setVchrootPath(std::string path) {
 	std::unique_lock lock(_rwlock);
-	_vchrootDescriptor = directoryDescriptor;
-
-	char* tmp = new char[4096];
-
-	auto fdPath = "/proc/self/fd/" + std::to_string(_vchrootDescriptor->fd());
-	auto len = readlink(fdPath.c_str(), tmp, 4095);
-
-	if (len < 0) {
-		throw std::system_error(errno, std::generic_category(), "readlink");
-	}
-
-	tmp[len] = '\0';
-
-	_cachedVchrootPath = std::string(tmp);
-	delete[] tmp;
+	_cachedVchrootPath = path;
 };
 
 std::shared_ptr<DarlingServer::Process> DarlingServer::Process::currentProcess() {
@@ -289,29 +275,22 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMainThread, bool isFork) {
 	std::unique_lock lock(_rwlock);
 
-	// perf#25a A0 (Part 4): decide exec-vs-fork from WHO is checking in, not from the racy
-	// _pendingReplacement flag alone. The flag is armed by the exec-listener pipe's EOF, an
-	// epoll event whose delivery order against the post-exec checkin RPC is not guaranteed:
-	// under brew's exec churn the pipe event can land AFTER the new image's main checkin was
-	// already processed, leaving the flag armed with no exec in flight. The NEXT checkin from
-	// that process is then a pthread_create THREAD checkin, and treating it as a replacement
-	// runs the thread sweep below -- which kills the very thread that is checking in, so its
-	// checkin reply is dropped (REPLY-DISP disp=DROP-DEAD on the RPC tape) and the guest thread
-	// waits forever in recvmsg: the captured `brew reinstall wget` freeze at the openssl@3
-	// build (ruby cc-shim leaf, no zombies). The timing-independent rule: an exec replacement
-	// is exactly a MAIN-thread re-checkin that is not a fork checkin -- after execve the kernel
-	// killed every other thread and the main thread checks in again from the new image; no
-	// other event has that shape. Thread checkins can never sweep.
-	bool didExec = isMainThread && !isFork && _mainThreadCheckedIn;
-
-	if (isMainThread) {
-		_mainThreadCheckedIn = true;
+	// Consume completion by listener identity before classifying this checkin.
+	// This preserves native-exec teardown and prevents a delayed callback from
+	// arming a later thread checkin or consuming a newer exec attempt.
+	auto completion = _execCompletion.poll();
+	if (completion == ExecCompletion::Result::Darling) {
+		_traceExecCompletion();
+	} else if (completion == ExecCompletion::Result::Native) {
+		lock.unlock();
+		notifyDead();
+		return;
 	}
 
-	if (_pendingReplacement && !didExec && !isMainThread) {
-		// stale arm from a late pipe event (the matching exec checkin already ran); clear it
-		// below like every checkin does, and note it for the log.
-		processLog.info() << *this << ": clearing stale pending-replacement on a non-main checkin" << processLog.endLog;
+	// Pipe notification order cannot turn a pthread or fork checkin into exec.
+	bool didExec = isMainThread && !isFork && _mainThreadCheckedIn;
+	if (isMainThread) {
+		_mainThreadCheckedIn = true;
 	}
 
 	if (didExec) {
@@ -363,8 +342,8 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMai
 		// notifyDead() for exactly this reason; do the same for the dtape work here.
 		//
 		// It is safe to drop the lock for this block: all other threads have been
-		// cleared (only mainThread remains in _threads), _pendingReplacement is still
-		// true, and the dtape handles being swapped (_dtapeTask, mainThread->_dtapeThread,
+		// cleared (only mainThread remains in _threads), and the dtape handles
+		// being swapped (_dtapeTask, mainThread->_dtapeThread,
 		// the semaphores) are not traversed by _rwlock readers -- readers consult
 		// _threads / _listeningKqchannels / _kqchannels / scalar fields, none of which
 		// we mutate while unlocked.
@@ -451,8 +430,6 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMai
 		}
 	}
 
-	_pendingReplacement = false;
-
 	lock.unlock();
 
 	if (didExec) {
@@ -498,16 +475,30 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMai
 	}
 };
 
-void DarlingServer::Process::setPendingReplacement() {
+void DarlingServer::Process::beginExec(std::shared_ptr<FD> listener, bool executingMachO) {
 	std::unique_lock lock(_rwlock);
+	_execCompletion.begin(std::move(listener), executingMachO);
+};
 
-	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
+void DarlingServer::Process::notifyExecCompletion(const std::shared_ptr<FD>& listener) {
+	std::unique_lock lock(_rwlock);
+	auto completion = _execCompletion.poll(listener);
+	if (completion == ExecCompletion::Result::Darling) {
+		_traceExecCompletion();
+	}
+	lock.unlock();
+
+	if (completion == ExecCompletion::Result::Native) {
+		notifyDead();
+	}
+};
+
+void DarlingServer::Process::_traceExecCompletion() {
+	processLog.info() << "Process " << id() << " (" << nsid() << ") completed Darling exec" << processLog.endLog;
 	TestDiagnostics::traceLine(
-		"process.pending_replacement pid=" + std::to_string(id()) +
+		"process.exec_completion pid=" + std::to_string(id()) +
 		" nsid=" + std::to_string(nsid())
 	);
-
-	_pendingReplacement = true;
 };
 
 void DarlingServer::Process::registerKqchan(std::shared_ptr<Kqchan> kqchan) {
@@ -918,6 +909,11 @@ void DarlingServer::Process::notifyDead() {
 };
 
 void DarlingServer::Process::_dispose() {
+	// perf#30 FD-COURIER: this incarnation is going away, so any descriptor half it delivered but never
+	// paired, and any semantic half still waiting for one, die with it. Both are counted so a mutation
+	// that leaves a half behind is visible as a counter, not as a silent descriptor leak. Keyed by the
+	// Linux pid, which is exactly what SO_PEERCRED reports for the courier connection.
+	Server::sharedInstance()._closeFdCourierForPid(id());
 	_selfReference = nullptr;
 };
 

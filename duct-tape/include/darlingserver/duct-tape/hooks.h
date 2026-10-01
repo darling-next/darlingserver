@@ -31,42 +31,12 @@ typedef void (*dtape_hook_log_f)(dtape_log_level_t level, const char* message);
 typedef void (*dtape_hook_get_load_info_f)(dtape_load_info_t* load_info);
 
 typedef void (*dtape_hook_thread_suspend_f)(void* thread_context, dtape_thread_continuation_callback_f continuation_callback, void* continuation_contex, libsimple_lock_t* unlock_me);
-
-// A0-ARCH stage 1: typed wake tokens. Every wake names the WAIT it is waking: the waiter
-// ARMS a (kind, generation) pair before publishing itself to any waker (TH_WAIT under the
-// thread lock, TAILQ insert under the queue lock), the waker passes that pair back through
-// thread_resume, and the suspension machinery only consumes a wake whose pair matches a
-// currently-armed wait. A mismatched (stale) wake -- the raw mutex/condvar vs XNU-wait
-// crosstalk family that produced the A0 hangs -- is logged and DROPPED instead of being
-// delivered as a spurious resume. generation 0 from a waker means "whatever generation of
-// this kind is currently armed" (used by wakers that cannot know the generation, e.g.
-// thread_release; safe because those parks re-check their predicate in a loop).
-typedef enum dtape_wake_kind {
-	// an XNU wait finalized by thread_unblock (TH_WAIT cleared, wait_result written)
-	dtape_wake_kind_xnu = 0,
-	// a raw dtape mutex/condvar queue handoff (dtape_mutex_unlock / dtape_condvar_signal)
-	dtape_wake_kind_raw = 1,
-	// sigexc user-suspension release (thread_release ending a wait_while_user_suspended park)
-	dtape_wake_kind_user_suspension = 2,
-} dtape_wake_kind_t;
-
-// Arm a wait of the given kind for this thread and return its generation. Must be called
-// BEFORE the thread becomes visible to the wait's waker.
-typedef uint64_t (*dtape_hook_thread_arm_wake_f)(void* thread_context, dtape_wake_kind_t kind);
-// Disarm the currently-armed wait of the given kind (idempotent). Called by the WAITER once
-// its wait concluded -- including the wait-finalized-before-suspend case (old Part 3d), where
-// this also drops the now-satisfied pending wake so it cannot go stale.
-typedef void (*dtape_hook_thread_disarm_wake_f)(void* thread_context, dtape_wake_kind_t kind);
-// Deliver a wake for the wait (kind, generation); generation 0 = the currently-armed one.
-typedef void (*dtape_hook_thread_resume_f)(void* thread_context, dtape_wake_kind_t kind, uint64_t generation);
-// A0-ARCH stage 2c: every write of the XNU wait state (TH_WAIT/TH_RUN/TH_UNINT/TH_TERMINATE
-// bits and wait_result) is routed through ONE dtape-side funnel, which reports each named
-// transition here. The server records it on the thread's run-state transition tape; when
-// flags carry DTAPE_XWAIT_VIOLATION it additionally logs an MSTATE VIOLATION, dumps the tape,
-// and aborts under DSERVER_MSTATE_ABORT=1 (same policy as MicroState violations).
-#define DTAPE_XWAIT_VIOLATION 0x1
-#define DTAPE_XWAIT_WROTE_RESULT 0x2
-typedef void (*dtape_hook_thread_xwait_transition_f)(void* thread_context, const char* reason, uint32_t old_state, uint32_t new_state, int32_t wait_result, uint8_t flags);
+typedef void (*dtape_hook_thread_resume_f)(void* thread_context);
+// perf#25a A0 (Part 3d): consume a wake permit minted by thread_resume for a wait that was
+// finalized (thread_unblock) BEFORE the microthread physically suspended. thread_block skips the
+// suspension in that case, so the permit would otherwise go stale and spuriously satisfy the
+// thread's NEXT suspend() with wait_result still THREAD_WAITING.
+typedef void (*dtape_hook_thread_clear_resume_permit_f)(void* thread_context);
 typedef void (*dtape_hook_thread_terminate_f)(void* thread_context);
 typedef dtape_thread_t* (*dtape_hook_thread_create_kernel_f)(void);
 typedef void (*dtape_hook_thread_setup_f)(void* thread_context, dtape_thread_continuation_callback_f continuation_callback, void* continuation_context);
@@ -83,7 +53,6 @@ typedef void (*dtape_hook_current_thread_interrupt_disable_f)(void);
 typedef void (*dtape_hook_current_thread_interrupt_enable_f)(void);
 typedef void (*dtape_hook_current_thread_syscall_return_f)(int return_code);
 typedef void (*dtape_hook_current_thread_set_bsd_retval_f)(uint32_t retval);
-typedef void (*dtape_hook_current_thread_dump_state_tape_f)(void);
 
 typedef bool (*dtape_hook_task_read_memory_f)(void* task_context, uintptr_t remote_address, void* local_buffer, size_t length);
 typedef bool (*dtape_hook_task_write_memory_f)(void* task_context, uintptr_t remote_address, const void* local_buffer, size_t length);
@@ -119,9 +88,7 @@ typedef struct dtape_hooks {
 
 	dtape_hook_thread_suspend_f thread_suspend;
 	dtape_hook_thread_resume_f thread_resume;
-	dtape_hook_thread_arm_wake_f thread_arm_wake;
-	dtape_hook_thread_disarm_wake_f thread_disarm_wake;
-	dtape_hook_thread_xwait_transition_f thread_xwait_transition;
+	dtape_hook_thread_clear_resume_permit_f thread_clear_resume_permit;
 	dtape_hook_thread_terminate_f thread_terminate;
 	dtape_hook_thread_create_kernel_f thread_create_kernel;
 	dtape_hook_thread_setup_f thread_setup;
@@ -138,9 +105,6 @@ typedef struct dtape_hooks {
 	dtape_hook_current_thread_interrupt_enable_f current_thread_interrupt_enable;
 	dtape_hook_current_thread_syscall_return_f current_thread_syscall_return;
 	dtape_hook_current_thread_set_bsd_retval_f current_thread_set_bsd_retval;
-	// A0-ARCH stage 2a: best-effort dump of the current microthread's run-state transition
-	// tape from the duct-tape panic funnel (no locks; the process is dying)
-	dtape_hook_current_thread_dump_state_tape_f current_thread_dump_state_tape;
 
 	dtape_hook_task_read_memory_f task_read_memory;
 	dtape_hook_task_write_memory_f task_write_memory;

@@ -1,6 +1,5 @@
 #include <darlingserver/duct-tape/stubs.h>
 #include <darlingserver/duct-tape/log.h>
-#include <darlingserver/duct-tape/hooks.internal.h>
 
 // declared by hand: <execinfo.h>'s __nonnull annotation collides with XNU's macros in this TU
 extern int backtrace(void** array, int size);
@@ -89,11 +88,6 @@ void panic(const char* message, ...) {
 	va_end(args);
 	printf("\n");
 	fflush(stdout);
-	// A0-ARCH stage 2a: dump the panicking microthread's run-state transition tape
-	// (replaces printf archaeology for state-machine panics)
-	if (dtape_hooks && dtape_hooks->current_thread_dump_state_tape) {
-		dtape_hooks->current_thread_dump_state_tape();
-	}
 	{
 		// A0 diagnosis: name the panicking microthread + host backtrace so a fiber-context
 		// panic (e.g. semaphore_convert_wait_result) is attributable without a debugger.
@@ -206,7 +200,7 @@ boolean_t machine_timeout_suspended(void) {
 
 boolean_t IOTaskHasEntitlement(task_t task, const char* entitlement) {
 	dtape_stub_safe();
-	return FALSE;
+	return TRUE;
 };
 
 kern_return_t kmod_create(host_priv_t host_priv, vm_address_t addr, kmod_t* id) {

@@ -22,9 +22,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <system_error>
 
 #if DSERVER_ASAN
@@ -38,14 +35,6 @@ bool DarlingServer::StackPool::Stack::isValid() const {
 DarlingServer::StackPool::Stack::operator bool() const {
 	return isValid();
 };
-
-static bool stackPoolTraceEnabled() {
-	static const bool enabled = []() {
-		const char* value = getenv("DSERVER_STACKPOOL_TRACE");
-		return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
-	}();
-	return enabled;
-}
 
 DarlingServer::StackPool::StackPool(size_t idleStackCount, size_t stackSize, bool useGuardPages):
 	_idleStackCount(idleStackCount),
@@ -97,46 +86,24 @@ void DarlingServer::StackPool::_free(void* stack, size_t stackSize, bool useGuar
 void DarlingServer::StackPool::allocate(Stack& stack) {
 	std::scoped_lock lock(_mutex);
 
-	while (_stacks.size() > 0) {
-		// Great, we can use one from the pool. Older buggy frees could leave a
-		// null entry behind; do not ever hand that to makecontext().
-		void* base = _stacks.back();
+	if (_stacks.size() > 0) {
+		// great, we can use one from the pool
+
+		stack.base = _stacks.back();
+		stack.size = _stackSize;
+		stack.usesGuardPages = _useGuardPages;
+
 		_stacks.pop_back();
-
-		if (base != nullptr) {
-			stack.base = base;
-			stack.size = _stackSize;
-			stack.usesGuardPages = _useGuardPages;
-			return;
-		}
-
-		if (stackPoolTraceEnabled()) {
-			fprintf(stderr, "DSERVER_STACKPOOL_TRACE: dropped null idle stack\n");
-			fflush(stderr);
-		}
+	} else {
+		// we don't have any available, so we have to allocate one now
+		stack.base = _allocate(_stackSize, _useGuardPages);
+		stack.size = _stackSize;
+		stack.usesGuardPages = _useGuardPages;
 	}
-
-	// we don't have any available, so we have to allocate one now
-	stack.base = _allocate(_stackSize, _useGuardPages);
-	stack.size = _stackSize;
-	stack.usesGuardPages = _useGuardPages;
 };
 
 void DarlingServer::StackPool::free(Stack& stack) {
 	std::scoped_lock lock(_mutex);
-
-	if (!stack.isValid()) {
-		if (stackPoolTraceEnabled()) {
-			fprintf(stderr,
-					"DSERVER_STACKPOOL_TRACE: ignored invalid free base=%p size=%zu guard=%d\n",
-					stack.base,
-					stack.size,
-					stack.usesGuardPages ? 1 : 0);
-			fflush(stderr);
-		}
-		stack = Stack();
-		return;
-	}
 
 	// for now, we only support a single standard stack size and guard page usage
 	assert(stack.size == _stackSize);

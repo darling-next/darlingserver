@@ -2855,13 +2855,9 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 			ret = wq_prepost_foreach_locked(wqset, NULL,
 			    prepost_exists_cb);
 			if (ret == WQ_ITERATE_FOUND) {
-				// A0-ARCH stage 2c (darling): wait_result writes route through the duct-tape
-				// wait-state funnel (defined in duct-tape/src/thread.c) so they land on the
-				// thread's transition tape
-				extern void dtape_xwait_prepost_awakened(thread_t thread);
 				s = splsched();
 				thread_lock(thread);
-				dtape_xwait_prepost_awakened(thread);
+				thread->wait_result = THREAD_AWAKENED;
 				thread_unlock(thread);
 				splx(s);
 				return THREAD_AWAKENED;

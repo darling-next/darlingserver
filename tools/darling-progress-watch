@@ -27,7 +27,7 @@ import time
 
 def abstract_addr(prefix):
     # stat socket is in the abstract namespace (see darling-stat for why); addr = NUL + name
-    return "\0" + "darlingserver-stat:" + os.path.abspath(prefix)
+    return "\0" + "darlingserver-stat:" + os.path.realpath(prefix)
 
 
 def read_snapshot(addr, timeout=5):

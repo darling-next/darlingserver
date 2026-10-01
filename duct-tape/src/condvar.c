@@ -21,7 +21,7 @@ void dtape_condvar_signal(dtape_condvar_t* condvar, size_t count) {
 		TAILQ_REMOVE(&condvar->queue_head, link, link);
 		link->_dbg_queued = 0;
 		dtape_thread_t* thread = __container_of(link, dtape_thread_t, mutex_link);
-		dtape_hooks->thread_resume(thread->context, dtape_wake_kind_raw, link->wake_gen);
+		dtape_hooks->thread_resume(thread->context);
 
 		--count;
 	}
@@ -40,18 +40,12 @@ void dtape_condvar_wait(dtape_condvar_t* condvar, dtape_mutex_t* mutex) {
 	dtape_mutex_unlock(mutex);
 
 	// add ourselves to the wait queue
-	// A0-ARCH stage 1: arm the raw wake token for this queuing (see dtape_mutex_lock).
-	thread->mutex_link.wake_gen = dtape_hooks->thread_arm_wake(thread->context, dtape_wake_kind_raw);
 	thread->mutex_link._dbg_queued = 1;
 	TAILQ_INSERT_TAIL(&condvar->queue_head, &thread->mutex_link, link);
 
 	// now let's suspend ourselves to wait;
 	// this also drops the queue lock.
 	dtape_hooks->thread_suspend(thread->context, NULL, NULL, &condvar->queue_lock);
-
-	// A0-ARCH stage 1: this queuing episode is over (signaled, or aborted early by an outer
-	// wait's wake) -- disarm so a late signal for it is detectably stale.
-	dtape_hooks->thread_disarm_wake(thread->context, dtape_wake_kind_raw);
 
 	// perf#25a A0: we've been awoken -- but by WHAT? A normal dtape_condvar_signal
 	// dequeued us (TAILQ_REMOVE + _dbg_queued=0) before resuming us. A SIGNAL-ABORT

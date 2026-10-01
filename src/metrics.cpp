@@ -68,16 +68,43 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"inline_handled\": " << inlineHandled.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"queued_to_pool\": " << queuedToPool.load(std::memory_order_relaxed) << ",\n";
 #ifdef DSERVER_RING_TRANSPORT
-	out << "  \"ring_serviced_spin\": " << ringServicedSpin.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_serviced_doorbell\": " << ringServicedDoorbell.load(std::memory_order_relaxed) << ",\n";
+	const auto ringSpinCount = ringServicedSpin.load(std::memory_order_relaxed);
+	const auto ringDoorbellCount = ringServicedDoorbell.load(std::memory_order_relaxed);
+	out << "  \"ring_serviced\": " << ringSpinCount + ringDoorbellCount << ",\n";
+	out << "  \"ring_serviced_spin\": " << ringSpinCount << ",\n";
+	out << "  \"ring_serviced_doorbell\": " << ringDoorbellCount << ",\n";
 	out << "  \"ring_doorbells_received\": " << ringDoorbellsReceived.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_process_doorbell_wakeups\": " << ringProcessDoorbellWakeups.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_doorbell_processes\": " << ringDoorbellProcesses.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_process_doorbell_serviced\": " << ringProcessDoorbellServiced.load(std::memory_order_relaxed) << ",\n";
+	// perf#30 FD-COURIER: the process-scoped descriptor channel. One connection per Linux process,
+	// reused for every transfer; matched counts the descriptor halves that paired with a semantic
+	// request, and every reject counter describes a descriptor that was really closed.
+	out << "  \"fd_courier_connections\": " << fdCourierConnections.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_fds_received\": " << fdCourierFdsReceived.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_fds_closed\": " << fdCourierFdsClosed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_fd_matched\": " << fdCourierFdMatched.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_duplicate_reject\": " << fdCourierDuplicateReject.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_kind_reject\": " << fdCourierKindReject.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_stale_generation_reject\": " << fdCourierStaleGenerationReject.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_orphan_fd_closed\": " << fdCourierOrphanFdClosed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_semantic_orphan\": " << fdCourierSemanticOrphan.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_malformed\": " << fdCourierMalformed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_generation_advance\": " << fdCourierGenerationAdvance.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_pending_peak\": " << fdCourierPendingPeak.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_fallback_cmsg\": " << fdCourierFallbackCmsg.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_regions\": " << processControlRegions.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_requests\": " << processControlRequests.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_live_connections\": " << fdCourierLiveConnections.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_sent_to_guest\": " << fdCourierSentToGuest.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"fd_courier_send_fail\": " << fdCourierSendFail.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_doorbell_sent_to_guest\": " << ringDoorbellSentToGuest.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_doorbell_reused\": " << ringDoorbellReused.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_doorbell_suppressed\": " << ringDoorbellSuppressed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_wakes\": " << processControlWakes.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_wakes_issued\": " << ringWakesIssued.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_wakes_skipped\": " << ringWakesSkipped.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_hit\": " << ringFastHit.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_fallback\": " << ringFastFallback.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_fail\": " << ringFastFail.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_s2c_full\": " << ringS2cFull.load(std::memory_order_relaxed) << ",\n";
-	out << "  \"ring_fast_suspend\": " << ringFastSuspend.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_s2c\": " << ringDuplexS2c.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_reject\": " << ringDuplexReject.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_parent\": " << ringDuplexParent.load(std::memory_order_relaxed) << ",\n";
@@ -88,6 +115,20 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"ring_duplex_vmdealloc_final\": " << ringDuplexVmdeallocFinal.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_vmdealloc_timeout\": " << ringDuplexVmdeallocTimeout.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"ring_duplex_vmdealloc_disarmed\": " << ringDuplexVmdeallocDisarmed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_machmsg_parent\": " << ringMachMsgParent.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_machmsg_final\": " << ringMachMsgFinal.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_machmsg_decline\": " << ringMachMsgDecline.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_machmsg_duplex_s2c_published\": " << ringMachMsgDuplexS2cPublished.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_machmsg_duplex_s2c_consumed\": " << ringMachMsgDuplexS2cConsumed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"uds_machmsg_request\": " << udsMachMsgRequest.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"uds_machmsg_reply\": " << udsMachMsgReply.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"uds_machmsg_s2c\": " << udsMachMsgS2c.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"uds_parent_s2c_normal\": " << udsParentS2cNormal.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_parent_s2c_uds_fallback\": " << ringParentS2cUdsFallback.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_completion_replay_reject\": " << ringDuplexCompletionReplayReject.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_reply_mismatch_reject\": " << ringDuplexReplyMismatchReject.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_early_complete\": " << ringDuplexEarlyComplete.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"ring_duplex_fd_s2c_unsupported\": " << ringDuplexFdS2cUnsupported.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"s2c_munmap_ring_parent\": " << s2cMunmapRingParent.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"s2c_munmap_uds_parent\": " << s2cMunmapUdsParent.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"s2c_munmap_no_parent\": " << s2cMunmapNoParent.load(std::memory_order_relaxed) << ",\n";
@@ -174,8 +215,9 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	bool hfirst = true;
 	for (size_t i = 0; i < kMaxCallNumbers; ++i) {
 		uint64_t uds = perCallUdsCount[i].load(std::memory_order_relaxed);
+		uint64_t plane = perCallPlaneCount[i].load(std::memory_order_relaxed);
 		uint64_t ring = perCallRingCount[i].load(std::memory_order_relaxed);
-		if (uds == 0 && ring == 0) {
+		if (uds == 0 && ring == 0 && plane == 0) {
 			continue;
 		}
 		const char* name = dserver_callnum_to_string(static_cast<dserver_callnum_t>(i));
@@ -187,7 +229,7 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 			std::snprintf(numbuf, sizeof(numbuf), "callnum_%zu", i);
 			name = numbuf;
 		}
-		uint64_t total = uds + ring;
+		uint64_t total = uds + ring + plane;
 		uint64_t usedFiber = perCallUsedFiber[i].load(std::memory_order_relaxed);
 		uint64_t callerS2c = perCallDidCallerS2c[i].load(std::memory_order_relaxed);
 		const LatencyHistogram& uh = perCallUdsLatency[i];
@@ -200,14 +242,12 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 			cls = dserver_ring_op_class(static_cast<uint32_t>(DSERVER_CALL_UNMANAGED_FLAG | i));
 		}
 		const bool clsSimple  = (cls & DSERVER_RING_CLASS_SIMPLE_C2S) != 0;
-		const bool clsNoFiber = (cls & DSERVER_RING_CLASS_NOFIBER_FAST) != 0;
 		const bool clsDestroy = (cls & DSERVER_RING_CLASS_DESTROY) != 0;
 		const bool clsS2c     = (cls & DSERVER_RING_CLASS_CALLER_S2C) != 0;
 
 		// Lane VERDICT: combine the canon class (authoritative when present) with measured facts.
 		//  - already-on-ring   : the op is in the simple-ring set and we observed it riding the ring.
 		//  - duplex-only       : canon marks it destroy/caller-S2C, OR we MEASURED a caller-S2C -> Lane 2.
-		//  - tier2-candidate   : never used a fiber AND never an S2C -> a no-fiber direct-dispatch candidate.
 		//  - lane1-candidate   : completed on a fiber, no caller-S2C, currently (mostly) UDS -> Lane 1.
 		//  - needs-review      : anything else (mixed/destroy-unknown) -- a human must classify.
 		const char* verdict;
@@ -215,9 +255,7 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 			verdict = "duplex-only";
 		} else if (clsSimple && ring > 0) {
 			verdict = "already-on-ring";
-		} else if (usedFiber == 0 && callerS2c == 0) {
-			verdict = "tier2-candidate";
-		} else if (callerS2c == 0) {
+		} else if (callerS2c == 0 && usedFiber > 0) {
 			verdict = "lane1-candidate";
 		} else {
 			verdict = "needs-review";
@@ -228,6 +266,7 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 		out << "    \"" << name << "\": {"
 		    << "\"total\": " << total
 		    << ", \"uds\": " << uds
+		    << ", \"plane\": " << plane
 		    << ", \"ring\": " << ring
 		    << ", \"used_fiber\": " << usedFiber
 		    << ", \"caller_s2c\": " << callerS2c
@@ -236,7 +275,6 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 		    << ", \"ring_p50_us\": " << rh.quantile(0.50)
 		    << ", \"ring_p99_us\": " << rh.quantile(0.99)
 		    << ", \"class_simple\": " << (clsSimple ? 1 : 0)
-		    << ", \"class_nofiber\": " << (clsNoFiber ? 1 : 0)
 		    << ", \"class_destroy\": " << (clsDestroy ? 1 : 0)
 		    << ", \"class_caller_s2c\": " << (clsS2c ? 1 : 0)
 		    << ", \"verdict\": \"" << verdict << "\""
@@ -260,6 +298,16 @@ std::string DarlingServer::Metrics::snapshotJSON(const std::string& extraGauges)
 	out << "  \"attach_rejects\": " << attachRejects.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"attach_mldr_callers\": " << attachMldrCallers.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"attach_dylib_callers\": " << attachDylibCallers.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_route_ok\": " << attachRouteOk.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_txn_claimed\": " << processControlTxnClaimed.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_txn_wait_fd\": " << processControlTxnWaitFd.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_txn_completed\": " << processControlTxnCompleted.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_txn_cancelled\": " << processControlTxnCancelled.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"process_control_late_reply_retired\": " << processControlLateReplyRetired.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_route_not_ready\": " << attachRouteNotReady.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_route_refused\": " << attachRouteRefused.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_route_claimed_no_lane\": " << attachRouteClaimedNoLane.load(std::memory_order_relaxed) << ",\n";
+	out << "  \"attach_route_no_slot\": " << attachRouteNoSlot.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"attach_no_ring_code\": " << attachNoRingCode.load(std::memory_order_relaxed) << ",\n";
 	out << "  \"attach_reject_by_reason\": {";
 	{

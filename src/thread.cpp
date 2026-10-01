@@ -19,23 +19,27 @@
 
 #include "darlingserver/registry.hpp"
 #include <darlingserver/thread.hpp>
+#include <darlingserver/microthread-resume.hpp>
+#include <darlingserver/processcall-guard.hpp>
 #include <darlingserver/process.hpp>
 #include <darlingserver/call.hpp>
+#include <darlingserver/s2c-trace.hpp>
 #include <darlingserver/server.hpp>
 #include <darlingserver/logging.hpp>
 #include <darlingserver/metrics.hpp>
+#include <darlingserver/test-diagnostics.hpp>
 #ifdef DSERVER_RING_TRANSPORT
 	#include <darlingserver/ring.hpp>
 	#include <darlingserver/monitor.hpp>
 #endif
 #include <filesystem>
+#include <cstring>
 #include <fstream>
 
 #include <sys/mman.h>
 #include <signal.h>
 
 #include <darlingserver/duct-tape.h>
-#include <darlingserver/duct-tape/hooks.h> // A0-ARCH stage 2c: DTAPE_XWAIT_* flags
 #include <atomic>
 
 #include <sys/syscall.h>
@@ -52,7 +56,6 @@
 #include <limits>
 #include <system_error>
 #include <cerrno>
-#include <cstdio>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -68,7 +71,6 @@ static thread_local bool returningToThreadTop = false;
 static thread_local ucontext_t backToThreadTopContext;
 static thread_local libsimple_lock_t* unlockMeWhenSuspending = nullptr;
 static thread_local std::function<void()> currentContinuation = nullptr;
-static thread_local char lastMakecontextTrace[256] = "none";
 
 /**
  * Our microthreads use cooperative multitasking, so we don't really use interrupts per-se.
@@ -79,92 +81,6 @@ static thread_local char lastMakecontextTrace[256] = "none";
  * This is primarily of use for debugging duct-tape code and ensuring certain assumptions made in the duct-tape code hold true.
  */
 static thread_local uint64_t interruptDisableCount = 0;
-
-static bool envFlagEnabled(const char* name) {
-	const char* value = getenv(name);
-	return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
-}
-
-static bool contextTraceEnabled() {
-	static const bool enabled = envFlagEnabled("DSERVER_CONTEXT_TRACE");
-	return enabled;
-}
-
-extern "C" const char* dserver_last_makecontext_trace() {
-	return lastMakecontextTrace;
-}
-
-static void recordMakecontextTrace(const char* branch, const DarlingServer::Thread* thread, const DarlingServer::StackPool::Stack& stack, const std::shared_ptr<DarlingServer::Call>& call) {
-	auto callNumber = call ? call->number() : DarlingServer::Call::Number::Invalid;
-	snprintf(lastMakecontextTrace,
-			sizeof(lastMakecontextTrace),
-			"branch=%s thread=%p stack=%p size=%zu call=%u(%s)",
-			branch,
-			static_cast<const void*>(thread),
-			stack.base,
-			stack.size,
-			static_cast<unsigned int>(callNumber),
-			DarlingServer::Call::callNumberToString(callNumber));
-
-	if (!contextTraceEnabled()) {
-		return;
-	}
-
-	fprintf(stderr, "DSERVER_CONTEXT_TRACE: %s\n", lastMakecontextTrace);
-	fflush(stderr);
-}
-
-// A0-ARCH stage 0: scheduling-order fuzzer. Every A0 wake/wait bug was a 2-event reorder
-// (dispatch vs wake, wake-before-suspend, stale re-run); this injects exactly that class of
-// reorders on purpose so the a0-gate synth legs can find protocol holes in minutes instead
-// of waiting for brew to hit them. Enabled ONLY when DSERVER_SCHED_FUZZ=<seed> is set in the
-// server's environment (seed 0 disables); DSERVER_SCHED_FUZZ_RATE=<N> tunes the per-site
-// injection probability to 1/N (default 16). Zero cost when disabled: one predictable branch
-// on a plain bool per site.
-static bool schedFuzzEnabled = false;
-static uint64_t schedFuzzRate = 16;
-static std::atomic<uint64_t> schedFuzzState = 0;
-
-static void schedFuzzInit() {
-	const char* seedStr = getenv("DSERVER_SCHED_FUZZ");
-	if (!seedStr || !*seedStr) {
-		return;
-	}
-	uint64_t seed = strtoull(seedStr, nullptr, 0);
-	if (seed == 0) {
-		return;
-	}
-	const char* rateStr = getenv("DSERVER_SCHED_FUZZ_RATE");
-	if (rateStr && *rateStr) {
-		uint64_t rate = strtoull(rateStr, nullptr, 0);
-		if (rate >= 2) {
-			schedFuzzRate = rate;
-		}
-	}
-	schedFuzzState.store(seed, std::memory_order_relaxed);
-	schedFuzzEnabled = true;
-	fprintf(stderr, "darlingserver: sched-fuzz ENABLED seed=%llu rate=1/%llu\n",
-		(unsigned long long)seed, (unsigned long long)schedFuzzRate);
-}
-static const bool schedFuzzInitDone = (schedFuzzInit(), true);
-
-// deterministic per-seed xorshift64*; thread-safe via CAS so concurrent runners draw from
-// one stream (cross-thread interleaving makes exact replay approximate, but the DIVERSITY
-// of orderings per seed is the point, not exact replay).
-static bool schedFuzzChance() {
-	if (!schedFuzzEnabled) {
-		return false;
-	}
-	uint64_t x = schedFuzzState.load(std::memory_order_relaxed);
-	uint64_t next;
-	do {
-		next = x;
-		next ^= next >> 12;
-		next ^= next << 25;
-		next ^= next >> 27;
-	} while (!schedFuzzState.compare_exchange_weak(x, next, std::memory_order_relaxed));
-	return ((next * 0x2545f4914f6cdd1dULL) >> 33) % schedFuzzRate == 0;
-}
 
 #if DSERVER_ASAN
 	static thread_local void* asanOldFakeStack = nullptr;
@@ -352,6 +268,26 @@ void DarlingServer::Thread::_setEternalID(EternalID eid) {
 	_eid = eid;
 };
 
+int DarlingServer::Thread::pthreadCanceled(int action) {
+	// The single semantic core. call.cpp's PthreadCanceled Call and the management plane both end up here.
+	std::lock_guard<std::mutex> guard(_cancelLock);
+	return -dtape_thread_canceled(_dtapeThread, action);
+}
+
+int DarlingServer::Thread::pthreadMarkcancel() {
+	std::lock_guard<std::mutex> guard(_cancelLock);
+	return -dtape_thread_markcancel(_dtapeThread);
+}
+
+void DarlingServer::Thread::cancelStateSnapshot(bool* disabled, bool* pending, bool* canceled) {
+	dtape_thread_cancel_state_snapshot_t snap = {};
+	std::lock_guard<std::mutex> guard(_cancelLock);
+	dtape_thread_cancel_state_snapshot(_dtapeThread, &snap);
+	if (disabled) { *disabled = snap.disabled; }
+	if (pending) { *pending = snap.pending; }
+	if (canceled) { *canceled = snap.canceled; }
+}
+
 std::shared_ptr<DarlingServer::Process> DarlingServer::Thread::process() const {
 	return _process;
 };
@@ -389,25 +325,10 @@ void DarlingServer::Thread::makePendingCallActive() {
 };
 
 void DarlingServer::Thread::_deactivateCallLocked(std::shared_ptr<Call> expectedCall) {
-	// A0-ARCH stage 3: a call can live in one of three slots -- the plain active slot, or
-	// (with an interrupt window open) the frame's interruptedCall / deferred-reply enterCall.
-	// Deactivate whichever slot holds it. (The old version keyed on the transient
-	// _interruptedForSignal window, which no longer exists.)
-	if (_activeCall.get() == expectedCall.get()) {
-		_activeCall = nullptr;
-		return;
+	if ((_interruptedForSignal ? _interrupts.top().interruptedCall : _activeCall).get() != expectedCall.get()) {
+		throw std::runtime_error("Upon deactivating the active call found active/interrupted call != expected call");
 	}
-	if (!_interrupts.empty()) {
-		if (_interrupts.top().interruptedCall.get() == expectedCall.get()) {
-			_interrupts.top().interruptedCall = nullptr;
-			return;
-		}
-		if (_interrupts.top().enterCall.get() == expectedCall.get()) {
-			_interrupts.top().enterCall = nullptr;
-			return;
-		}
-	}
-	throw std::runtime_error("Upon deactivating the active call found active/interrupted call != expected call");
+	(_interruptedForSignal ? _interrupts.top().interruptedCall : _activeCall) = nullptr;
 };
 
 void DarlingServer::Thread::deactivateCall(std::shared_ptr<Call> expectedCall) {
@@ -472,34 +393,19 @@ void DarlingServer::Thread::microthreadWorker() {
 	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
 	auto _callNumber = currentThreadVar->_activeCall->number();
 
-	try {
+	int guardedReplyCode = DarlingServer::processCallBasicReplyCode([&]() {
 		currentThreadVar->_activeCall->processCall();
-	} catch (const std::system_error& err) {
-		microthreadLog.error()
-			<< "Uncaught std::system_error from processCall (call "
-			<< DarlingServer::Call::callNumberToString(currentThreadVar->_activeCall->number())
-			<< "): " << err.what() << " (code " << err.code().value() << ")" << microthreadLog.endLog;
-		try {
-			currentThreadVar->_activeCall->sendBasicReply(-err.code().value());
-		} catch (...) {
-			// call has no basic reply (returns data); nothing more we can do but survive
-		}
-	} catch (const std::exception& ex) {
+	});
+	if (guardedReplyCode < 0) {
 		microthreadLog.error()
 			<< "Uncaught exception from processCall (call "
 			<< DarlingServer::Call::callNumberToString(currentThreadVar->_activeCall->number())
-			<< "): " << ex.what() << microthreadLog.endLog;
+			<< "); replying " << guardedReplyCode << microthreadLog.endLog;
 		try {
-			currentThreadVar->_activeCall->sendBasicReply(-EINVAL);
-		} catch (...) {}
-	} catch (...) {
-		microthreadLog.error()
-			<< "Uncaught non-std exception from processCall (call "
-			<< DarlingServer::Call::callNumberToString(currentThreadVar->_activeCall->number())
-			<< ")" << microthreadLog.endLog;
-		try {
-			currentThreadVar->_activeCall->sendBasicReply(-EINVAL);
-		} catch (...) {}
+			currentThreadVar->_activeCall->sendBasicReply(guardedReplyCode);
+		} catch (...) {
+			// call has no basic reply (returns data); nothing more we can do but survive
+		}
 	}
 
 	// perf #0: record service latency (worker entry -> completion).
@@ -518,23 +424,32 @@ void DarlingServer::Thread::microthreadWorker() {
 		// _s2cPerform via Metrics::recordCallerS2cFor(activeCall), so there is no cross-op leak.
 		_metrics.recordCallHeatmap(
 			static_cast<uint32_t>(_callNumber), serviceUs,
-			currentThreadVar->_heatmapCallWasRing ? DarlingServer::Metrics::CallTransport::Ring
-			                                      : DarlingServer::Metrics::CallTransport::Uds,
+			currentThreadVar->_heatmapCallWasProcessControl ? DarlingServer::Metrics::CallTransport::ProcessControl
+				: (currentThreadVar->_heatmapCallWasRing ? DarlingServer::Metrics::CallTransport::Ring
+			                                             : DarlingServer::Metrics::CallTransport::Uds),
 			/* usedFiber */ true,
 			/* didCallerS2c */ false);
 		currentThreadVar->_heatmapCallWasRing = false;
+		currentThreadVar->_heatmapCallWasProcessControl = false;
 		if (_callNumber == DarlingServer::Call::Number::Checkin) {
 			_metrics.checkinLatency.record(serviceUs);
 		}
 	}
 
-	// A0-ARCH stage 3: no more _syscallReturnHereDuringInterrupt detour -- every fiber exits
-	// through its own doneWorking, on its own stack, exactly once.
+	if (currentThreadVar->_handlingInterruptedCall) {
+		currentThreadVar->_didSyscallReturnDuringInterrupt = true;
 #if DSERVER_ASAN
-	// we're exiting normally, so we might not re-enter this microthread; tell ASAN to drop the fake stack
-	__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
+		__sanitizer_start_switch_fiber(NULL, currentThreadVar->_stack.base, currentThreadVar->_stack.size);
 #endif
-	setcontext(&backToThreadTopContext);
+		setcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
+	} else {
+#if DSERVER_ASAN
+		// we're exiting normally, so we might not re-enter this microthread; tell ASAN to drop the fake stack
+		__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
+#endif
+
+		setcontext(&backToThreadTopContext);
+	}
 	__builtin_unreachable();
 };
 
@@ -552,11 +467,19 @@ void DarlingServer::Thread::microthreadContinuation() {
 		currentContinuation = nullptr;
 	}
 
+	if (currentThreadVar->_handlingInterruptedCall) {
+		currentThreadVar->_didSyscallReturnDuringInterrupt = true;
 #if DSERVER_ASAN
-	// see microthreadWorker()
-	__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
+		__sanitizer_start_switch_fiber(NULL, currentThreadVar->_stack.base, currentThreadVar->_stack.size);
 #endif
-	setcontext(&backToThreadTopContext);
+		setcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
+	} else {
+#if DSERVER_ASAN
+		// see microthreadWorker()
+		__sanitizer_start_switch_fiber(NULL, asanOldStackBottom, asanOldStackSize);
+#endif
+		setcontext(&backToThreadTopContext);
+	}
 	__builtin_unreachable();
 };
 
@@ -565,28 +488,10 @@ void DarlingServer::Thread::doWork() {
 	//       this method is actually major UB because the compiler is free to do whatever it likes with the stack,
 	//       but we know what reasonable compilers (i.e. GCC and Clang) do with it and we're specifically targeting Clang, so it's okay for us.
 
-	// perf#25a A0 (Part 3c): whether THIS dispatch consumed a genuine resume() wake permit.
-	// Only such a dispatch (or a pending-call override) may resume a suspended context: every
-	// legitimate waker goes through resume() (thread_unblock finalizes wait_result first), so a
-	// dispatch that finds the thread suspended WITHOUT a permit is a stale re-run (e.g. an owed
-	// _rerunPending whose wake was already consumed) and must not touch the parked wait --
-	// resuming it would deliver a spurious wakeup with wait_result == THREAD_WAITING.
+	// A deferred dispatch is not itself a wake permit. Only a real resume or
+	// pending-call override may enter a suspended context.
 	bool hadResumePermit = false;
-	bool preDispatchParked = false;
-	bool parkedContextIntact = false;
-
-	// A0-ARCH stage 0 fuzzer: reorder this dispatch behind whatever else is queued (models the
-	// dispatch-vs-wake races), and/or inject an extra permit-less dispatch (models stale re-runs).
-	// Both are events the protocol MUST tolerate; compiled-in but dormant unless DSERVER_SCHED_FUZZ set.
-	if (schedFuzzEnabled) {
-		if (schedFuzzChance()) {
-			Server::sharedInstance().scheduleThread(shared_from_this());
-			return;
-		}
-		if (schedFuzzChance()) {
-			Server::sharedInstance().scheduleThread(shared_from_this());
-		}
-	}
+	bool preserveWaitState = false;
 
 	_rwlock.lock();
 
@@ -597,17 +502,9 @@ void DarlingServer::Thread::doWork() {
 		return;
 	}
 
-	if (_isRunningLocked()) {
-		// perf#25a A0: this dispatch was popped while the microthread is still
-		// running on another worker (it is mid suspend()/doneWorking transition;
-		// the running view only clears at the doneWorking tail). We cannot run it now,
-		// but we MUST NOT silently drop it -- otherwise a wake that a waker
-		// delivered via scheduleThread() (rather than via a pending wake token) is lost
-		// forever and the microthread deadlocks. Record the owed re-run; the
-		// doneWorking tail will reschedule exactly once after _running clears.
-		_rerunPending = true;
-		_mstateEventLocked(StateEvent::RerunDeferred, "dispatch-while-running");
-		microthreadLog.debug() << _tid << "(" << _nstid << "): dispatch arrived while still running; deferring re-run" << microthreadLog.endLog;
+	if (_execution.deferDispatch()) {
+		// Coalesce dispatches under the same owner used by fiber and inline
+		// execution, and hand them back only after that owner physically stops.
 		_rwlock.unlock();
 		return;
 	}
@@ -622,37 +519,20 @@ void DarlingServer::Thread::doWork() {
 		goto doneWorking;
 	}
 
-	// A0-ARCH stage 2b: whether this dispatch found a parked (resumable) context. Captured
-	// BEFORE the transition to Running because the dispatch-decision logic below needs the
-	// pre-dispatch view (the state field is authoritative now; there is no lingering
-	// _suspended residue to read). Parking is impossible here (the running guard above).
-	preDispatchParked = _isSuspendedLocked();
-	// A0-ARCH stage 3 (fix 4): the wake-consume moved DOWN into the second locked section,
-	// atomically with the resume-vs-stack branch. Consuming here (the old shape, partially
-	// gated by fix 1) left a hole: between this section's unlock and the second lock an
-	// interrupt_enter can become the pending call, so the dispatch that consumed the permit
-	// takes the interrupt-STACKING branch instead of resuming -- the permit is eaten, the
-	// nested cancel finds the wait already finalized (fires no replacement wake), and the
-	// restored context reparks forever holding a committed grant (captured verbatim on the
-	// tape: wake-consumed gen N -> interrupt-push -> repark-interrupt-cancel -> wedge).
-	_mstateTransitionLocked(MicroState::Running,
-		preDispatchParked ? "dispatch-onto-parked" : "dispatch-fresh");
+	if (_suspended && _resumePermit) {
+		// This execution was scheduled by resume(); consume that wake permit.
+		hadResumePermit = microthreadConsumePendingResume(_resumePermit);
+	}
+	_execution.begin();
 	currentThreadVar = shared_from_this();
-	// A0-ARCH stage 2c: dtape_thread_entering() is GONE, and with it the whole
-	// preserveWaitState dance that existed only to keep its unconditional TH_WAIT clobber away
-	// from committed waits (the Part 3 history: half-torn waits, zombie children, the brew
-	// hang). The dispatch paths never touch the XNU wait state anymore; the wait tear-down
-	// paths (thread_unblock / clear_wait_internal / dying) own it, all through the stage-2c
-	// write funnel. What remains here is the ASSERTION the old skip-condition encoded: an
-	// unambiguous fresh-call dispatch (nothing parked, no override, a fresh non-interrupt
-	// call, nothing in flight) must find the guest thread NOT waiting -- a stranded TH_WAIT
-	// means some tear-down path failed to clear it (the recovery clear keeps release builds
-	// as robust as the old silent launder, but LOUDLY).
-	if (!preDispatchParked && !_pendingCallOverride
-			&& _pendingCall && _pendingCall->number() != Call::Number::InterruptEnter
-			&& !_activeCall && !_continuationCallback
-			&& dtape_thread_clear_stranded_wait(_dtapeThread)) {
-		_strandedWaitViolationLocked("doWork-fresh-dispatch");
+	// Preserve an existing wait across raw-lock resumes and interrupts stacked
+	// onto in-flight work. Only fresh calls perform the entering transition.
+	preserveWaitState =
+		(_pendingCall && _pendingCall->number() == Call::Number::InterruptEnter
+			&& !_pendingCallOverride && (_activeCall || _suspended || _continuationCallback))
+		|| (_suspended && (_pendingCallOverride || !_pendingCall));
+	if (!preserveWaitState) {
+		dtape_thread_entering(_dtapeThread);
 	}
 
 	returningToThreadTop = false;
@@ -673,9 +553,9 @@ void DarlingServer::Thread::doWork() {
 
 		_rwlock.lock();
 
-		if ((_microState != MicroState::Parking || _continuationCallback) && _stack.isValid()) {
+		if (!_suspended || _continuationCallback) {
 			// we discard the old stack when either:
-			//   * we exit normally (i.e. without suspending -- state stayed Running);
+			//   * we exit normally (i.e. without suspending); this includes syscall returns.
 			//   * or when we suspend with a continuation callback.
 			stackPool.free(_stack);
 		}
@@ -688,42 +568,48 @@ void DarlingServer::Thread::doWork() {
 		_rwlock.lock();
 
 		if (!_pendingCallOverride && _pendingCall && _pendingCall->number() == Call::Number::InterruptEnter) {
-			// A0-ARCH stage 3: the frame is the PARKING SPOT for the interrupted context while
-			// the enter fiber runs -- nothing ever jumps into it from another stack anymore;
-			// doneWorking moves it back into the live slots once the enter fiber completes.
 			_interrupts.emplace();
 			_interrupts.top().savedStack = _stack;
-			_interrupts.top().savedResumeContext = _resumeContext;
 			_stack = StackPool::Stack();
-			_interrupts.top().savedContinuation = _continuationCallback;
+			_interruptedContinuation = _continuationCallback;
 			_continuationCallback = nullptr;
 			_interrupts.top().interruptedCall = _activeCall;
 			_activeCall = nullptr;
-			_mstateEventLocked(StateEvent::InterruptPush, "interrupt-enter-stacked", 0, _interrupts.size());
 		}
 
 		if (_continuationCallback && _pendingCall) {
-			// we can only have one of the two
-			throw std::runtime_error("Thread has both a pending call and a pending continuation");
-		}
-
-		// A0-ARCH stage 3 (fix 4): consume the resume permit HERE, under the same lock as the
-		// branch decision -- a dispatch consumes a wake if and only if it actually resumes the
-		// parked context. An interrupt_enter that became pending in the meantime takes the
-		// stacking branch above and the wake SURVIVES for the post-restore dispatch.
-		if (preDispatchParked && !_pendingCall && _consumePendingWakeLocked()) {
-			hadResumePermit = true;
+			// we can only have one of the two.
+			//
+			// The message NAMES THE CALL. Without it the crash says a thread was in an impossible state but not
+			// which request created it -- and the plane is the prime suspect, because it synthesizes a Call on a
+			// thread that may already be suspended on a continuation. An exception that cannot answer "which
+			// call" is the "instrument that cannot answer" class: it costs a whole rebuild-and-run cycle to add
+			// something that was known at throw time.
+			char why[320];
+			// perf#30 (doc section 233): the continuation's OWNER is what the next decision needs, and it was not
+			// printed. MEASURED: the throw named only the new call (`pending_call=35`) and left "which call parked
+			// this thread, and on what" to be inferred from a trace that cannot answer it. `_activeCall` is the call
+			// whose continuation is parked (the interrupting call has already been moved to `_interrupts`, and its
+			// size says whether this thread is inside a nested interrupt).
+			snprintf(why, sizeof(why),
+				"Thread has both a pending call and a pending continuation"
+				" (pending_call=%d tid=%d suspended=%d interrupts=%zu active_call=%d interrupted_cont=%d)",
+				static_cast<int>(_pendingCall->number()), _tid, _suspended ? 1 : 0, _interrupts.size(),
+				_activeCall ? static_cast<int>(_activeCall->number()) : -1,
+				_interruptedContinuation ? 1 : 0);
+			throw std::runtime_error(why);
 		}
 
 		// perf#25a A0 (Part 3c): resume the suspended context only for a dispatch that carried a
 		// real wake (permit consumed above) or an explicit override; a permit-less dispatch of a
 		// suspended thread is stale and falls through to the else-branch, which parks it again
 		// (no pending call -> doneWorking) instead of spuriously resuming a live wait.
-		if (preDispatchParked && (_pendingCallOverride || (!_pendingCall && hadResumePermit))) {
+		if (_suspended && (_pendingCallOverride || (!_pendingCall && hadResumePermit))) {
 			if (_pendingCallOverride) {
 				microthreadLog.info() << _tid << "(" << _nstid << "): thread was suspended with a pending call override and is now resuming with a pending call" << microthreadLog.endLog;
 			}
 			// we were in the middle of processing a call and we need to resume now
+			_suspended = false;
 			_resumeContext.uc_link = &backToThreadTopContext;
 			_rwlock.unlock();
 
@@ -737,7 +623,6 @@ void DarlingServer::Thread::doWork() {
 				_resumeContext.uc_stack.ss_size = _stack.size;
 				_resumeContext.uc_stack.ss_flags = 0;
 				_resumeContext.uc_link = &backToThreadTopContext;
-				recordMakecontextTrace("continuation", this, _stack, _pendingCall);
 				makecontext(&_resumeContext, microthreadContinuation, 0);
 			} else {
 				// otherwise, we expect to have a valid stack to continue where we left off
@@ -751,15 +636,10 @@ void DarlingServer::Thread::doWork() {
 			setcontext(&_resumeContext);
 		} else {
 			if (!_pendingCall) {
-				// if we don't actually have a pending call, we have nothing to do.
-				// A0-ARCH stage 2b: if this no-op dispatch found a parked context, that
-				// context was never touched -- doneWorking must REPARK it, not idle the
-				// thread (idling here loses the park: the next genuine wake finds
-				// "no-park" and is dropped -- captured live as a fuzz boot wedge, the
-				// launchd tape ending Parked->Running->Idle then wake-dropped no-park).
-				parkedContextIntact = preDispatchParked;
+				// if we don't actually have a pending call, we have nothing to do
 				goto doneWorking;
 			}
+			_suspended = false;
 			_rwlock.unlock();
 
 			// we might've had a valid stack if we're overwriting a previous suspension, so handle that.
@@ -775,7 +655,6 @@ void DarlingServer::Thread::doWork() {
 			newContext.uc_stack.ss_size = _stack.size;
 			newContext.uc_stack.ss_flags = 0;
 			newContext.uc_link = &backToThreadTopContext;
-			recordMakecontextTrace("worker", this, _stack, _pendingCall);
 			makecontext(&newContext, microthreadWorker, 0);
 
 #if DSERVER_ASAN
@@ -791,64 +670,19 @@ void DarlingServer::Thread::doWork() {
 
 doneWorking:
 	// we must be holding `_rwlock` when we get here
-	if (_microState == MicroState::Running || _microState == MicroState::Parking) {
-		// A0-ARCH stage 3: if this completed stint was an interrupt_enter whose processCall
-		// armed a cancellation, the frame's saved (interrupted) context now moves BACK into
-		// the live slots and the thread REPARKS with it -- the machine stays honest (the
-		// thread genuinely has a resumable context again), and the pending Xnu wake that
-		// sigexc_enter fired makes it Ready -> dispatched normally on its own fiber. The
-		// enter fiber's own stack was already freed at return-to-top (its own completion,
-		// exactly once); the interruptedCall returns to the active slot for the normal
-		// syscall-return/deactivation flow. Only a RUNNING (completed) stint restores: a
-		// Parking stint means the enter fiber itself is just suspending mid-flight.
-		bool restoredInterrupted = false;
-		if (_microState == MicroState::Running && !_interrupts.empty() && _interrupts.top().cancellationArmed) {
-			auto& frame = _interrupts.top();
-			frame.cancellationArmed = false;
-			// the enter call's deferred reply (if owed) lives on in frame.enterCall; the
-			// active slot goes back to the interrupted call (null for context-only frames)
-			_activeCall = frame.interruptedCall;
-			_stack = frame.savedStack;
-			frame.savedStack = StackPool::Stack();
-			_resumeContext = frame.savedResumeContext;
-			_continuationCallback = frame.savedContinuation;
-			frame.savedContinuation = nullptr;
-			restoredInterrupted = _stack.isValid() || _continuationCallback;
-			_mstateEventLocked(StateEvent::Note, "interrupt-cancel-restored", 0, _interrupts.size());
-		}
-		// Repark when the park was committed THIS stint (Parking), when a no-op
-		// dispatch left a previously-parked context untouched (parkedContextIntact --
-		// the old `_suspended` flag carried this implicitly; the state field must not
-		// lose it or the next wake drops as "no-park" and the thread wedges), or when a
-		// cancelled interrupted context was just restored (restoredInterrupted).
-		dtape_thread_exiting(_dtapeThread);
+	bool dispatchPending = false;
+	if (_execution.isRunning()) {
 		currentThreadVar = nullptr;
-		if (_microState == MicroState::Parking || parkedContextIntact || restoredInterrupted) {
-			_mstateTransitionLocked(
-				_hasDeliverablePendingWakeLocked() ? MicroState::Ready : MicroState::Parked,
-				_microState == MicroState::Parking ? "park-committed"
-					: (restoredInterrupted ? "repark-interrupt-cancel" : "repark-noop-dispatch"));
-		} else {
-			_mstateTransitionLocked(MicroState::Idle, "done");
-		}
+		dispatchPending = _execution.finish();
 	}
 	// A wake can arrive after suspend()'s final permit check but before it
-	// physically switches back here. Now that the running view is clear, rescheduling
+	// physically switches back here. Now that execution is released, rescheduling
 	// is safe and cannot race another worker running this microthread.
-	//
-	// perf#25a A0: also honor a dispatch that a worker popped and deferred while
-	// we were still running (doWork() set _rerunPending instead of dropping it).
-	// Now that the running view is clear it is safe to reschedule; consume the flag so we
-	// reschedule exactly once. Only reschedule if the microthread is actually
-	// parked with a resumable context and still alive -- if it is
-	// terminating/dead or has no context, the owed re-run is moot.
-	bool rerunPending = _rerunPending;
-	_rerunPending = false;
-	// A deliverable pending wake only makes sense when there is a suspended context to
-	// resume. _rerunPending is a dropped dispatch (from doWork's running guard): it must be
-	// honored whether the microthread is suspended (resume its context) OR has a
-	// pending call to process -- i.e. NOT gated on the suspended view. Gate only on liveness.
-	bool resumeAfterWorking = ((_hasDeliverablePendingWakeLocked() && _isSuspendedLocked()) || rerunPending) && !_terminating && !_dead;
+	// Return every coalesced dispatch once. A stale dispatch cannot resume a
+	// suspended wait without a permit, but must not be silently stranded here.
+	bool scheduleAfterWorking =
+		microthreadShouldScheduleAfterStop(_resumePermit, _suspended, _terminating, _dead) ||
+		(dispatchPending && !_terminating && !_dead);
 	bool canRelease = false;
 	if (_dead) {
 		threadLog.debug() << *this << ": dead thread returning. active call? " << (!!_activeCall ? "true" : "false") << " terminating? " << (_terminating ? "true" : "false") << threadLog.endLog;
@@ -858,7 +692,6 @@ doneWorking:
 		// but we had an active call and had to finish it first
 		_terminating = true;
 		canRelease = true;
-		_mstateTransitionLocked(MicroState::Terminated, "dead-after-last-call");
 	}
 	if (_terminating && !_dead) {
 		// this will not destroy our thread immediately;
@@ -876,7 +709,7 @@ doneWorking:
 			_pendingCall = _pendingInterrupts.front();
 			_pendingInterrupts.pop();
 
-			Server::sharedInstance().scheduleThread(shared_from_this());
+			scheduleAfterWorking = true;
 		}
 
 		_rwlock.unlock();
@@ -886,7 +719,7 @@ doneWorking:
 		unlockMeWhenSuspending = nullptr;
 	}
 	_runningCondvar.notify_all();
-	if (resumeAfterWorking) {
+	if (scheduleAfterWorking) {
 		Server::sharedInstance().scheduleThread(shared_from_this());
 	}
 	if (canRelease) {
@@ -895,261 +728,6 @@ doneWorking:
 	return;
 };
 
-#ifdef DSERVER_RING_TRANSPORT
-bool DarlingServer::Thread::doWorkInline() {
-	// perf #18 P6.1 (dar-ohp): run a proven-non-blocking Call without the microthread fiber.
-	// This is doWork() with the fiber stripped: same guards, same context-enter (so current_task
-	// resolves identically), same processCall + exception containment + metrics as
-	// microthreadWorker(), then the same essential completion cleanup as doneWorking -- but the
-	// call runs on the CURRENT (main-loop) stack instead of a makecontext fiber.
-	//
-	// SAFETY: the caller guarantees the call never suspends. We therefore never touch the fiber
-	// state (backToThreadTopContext / _resumeContext / _stack) and assert it stays non-suspended.
-	std::unique_lock<std::shared_mutex> lock(_rwlock);
-
-	if (_deferralState != DeferralState::NotDeferred) {
-		_deferralState = DeferralState::DeferredPending;
-		return false;
-	}
-	if (_isRunningLocked()) {
-		microthreadLog.warning() << _tid << "(" << _nstid << "): doWorkInline on already-running microthread" << microthreadLog.endLog;
-		return false;
-	}
-	if (_terminating || (_dead && !_activeCall) || _isSuspendedLocked() || _continuationCallback || !_pendingCall) {
-		// any of these means this is NOT the simple "fresh non-blocking call" case the inline
-		// path is for; let the caller fall back to the full doWork() which handles them.
-		return false;
-	}
-
-	currentThreadVar = shared_from_this();
-	// stage 2c: the guards above proved this a genuinely fresh dispatch (not suspended, no
-	// continuation); a stranded TH_WAIT here is the same violation as doWork's
-	if (dtape_thread_clear_stranded_wait(_dtapeThread)) {
-		_strandedWaitViolationLocked("doWorkInline-dispatch");
-	}
-	_mstateTransitionLocked(MicroState::Running, "inline-dispatch");
-	lock.unlock();
-	_runningCondvar.notify_all();
-
-	// --- body: mirror microthreadWorker() without the fiber-return setcontext ---------------
-	makePendingCallActive(); // moves _pendingCall -> _activeCall (same as the fiber path)
-
-	auto& _metrics = DarlingServer::Metrics::shared();
-	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
-	auto _callNumber = _activeCall->number();
-
-	try {
-		_activeCall->processCall();
-	} catch (const std::system_error& err) {
-		microthreadLog.error() << "Uncaught std::system_error from inline processCall ("
-			<< DarlingServer::Call::callNumberToString(_callNumber) << "): " << err.what()
-			<< " (code " << err.code().value() << ")" << microthreadLog.endLog;
-		try { _activeCall->sendBasicReply(-err.code().value()); } catch (...) {}
-	} catch (const std::exception& ex) {
-		microthreadLog.error() << "Uncaught exception from inline processCall ("
-			<< DarlingServer::Call::callNumberToString(_callNumber) << "): " << ex.what() << microthreadLog.endLog;
-		try { _activeCall->sendBasicReply(-EINVAL); } catch (...) {}
-	} catch (...) {
-		microthreadLog.error() << "Uncaught non-std exception from inline processCall ("
-			<< DarlingServer::Call::callNumberToString(_callNumber) << ")" << microthreadLog.endLog;
-		try { _activeCall->sendBasicReply(-EINVAL); } catch (...) {}
-	}
-
-	{
-		uint64_t now = DarlingServer::Metrics::nowMonoUs();
-		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
-		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
-		_metrics.rpcLatency.record(serviceUs);
-		_metrics.recordCall(static_cast<uint32_t>(_callNumber), serviceUs);
-		// perf #18 D9 (dar-1il.4): heatmap. This is doWorkInline -- the Tier-2 NO-FIBER ring path. By
-		// construction it ran a ring-originated allowlisted op without suspending (used_fiber=false); a
-		// real suspend here is a contract violation handled below. transport=ring. perf #18 D14
-		// (dar-1il.9): caller-S2C attributed per-call at _s2cPerform, not via a sticky latch here.
-		_metrics.recordCallHeatmap(
-			static_cast<uint32_t>(_callNumber), serviceUs,
-			DarlingServer::Metrics::CallTransport::Ring,
-			/* usedFiber */ false,
-			/* didCallerS2c */ false);
-		_heatmapCallWasRing = false;
-	}
-
-	// processCall() on a non-blocking op must have run to completion. If somehow it suspended
-	// (a misclassified op), that is a contract violation -> we'd have corrupted the fiber model.
-	// Detect it loudly rather than silently mishandle.
-	bool canRelease = false;
-	{
-		std::unique_lock<std::shared_mutex> relock(_rwlock);
-		if (_microState == MicroState::Parking) {
-			// Should be impossible for an allowlisted op. The microthread "suspended" without a
-			// fiber to resume onto -> we cannot honor it. Log; the Idle transition below
-			// recovers (the one legal Parking->Idle edge) so the thread isn't wedged.
-			// (The guest will time out on this op and UDS-fall-back.)
-			microthreadLog.error() << *this << ": doWorkInline call suspended -- not fast-path eligible!" << microthreadLog.endLog;
-			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
-		}
-		_activeCall = nullptr;
-		dtape_thread_exiting(_dtapeThread);
-		currentThreadVar = nullptr;
-		_mstateTransitionLocked(MicroState::Idle, "inline-done");
-
-		if (_dead && !_activeCall && !_terminating) {
-			_terminating = true;
-			canRelease = true;
-			_mstateTransitionLocked(MicroState::Terminated, "dead-after-last-call");
-		}
-		if (_terminating && !_dead) {
-			relock.unlock();
-			notifyDead();
-		} else {
-			if (!_terminating && !_dead && !_pendingInterrupts.empty()) {
-				if (!_pendingCall) {
-					_pendingCall = _pendingInterrupts.front();
-					_pendingInterrupts.pop();
-					Server::sharedInstance().scheduleThread(shared_from_this());
-				}
-			}
-			relock.unlock();
-		}
-	}
-	_runningCondvar.notify_all();
-	if (canRelease) {
-		_scheduleRelease();
-	}
-	return true;
-};
-
-bool DarlingServer::Thread::doMachReplyPortInline(uint32_t seq) {
-	// perf #18 P6.1 step 2 (dar-ohp): the surgical one-op path. This is doWorkInline() with the
-	// Call/Message framing ALSO removed: no _pendingCall, no processCall(), no callFromMessage --
-	// we run the bare dtape primitive and publish the reply onto the ring ourselves. The duct-tape
-	// context setup/teardown is IDENTICAL to doWorkInline (so current_task() resolves to this
-	// thread's space exactly as MachReplyPort::processCall would see it).
-	auto ring = _ring;
-	if (!ring) {
-		return false; // caller falls back to the generic path
-	}
-
-	std::unique_lock<std::shared_mutex> lock(_rwlock);
-
-	if (_deferralState != DeferralState::NotDeferred) {
-		_deferralState = DeferralState::DeferredPending;
-		return false;
-	}
-	if (_isRunningLocked()) {
-		microthreadLog.warning() << _tid << "(" << _nstid << "): doMachReplyPortInline on already-running microthread" << microthreadLog.endLog;
-		return false;
-	}
-	if (_terminating || _dead || _isSuspendedLocked() || _continuationCallback || _pendingCall || _activeCall) {
-		// Not the simple "fresh, idle thread servicing a no-arg trap" case. There is no Call to run
-		// here (we bypass callFromMessage), so a _pendingCall/_activeCall would be left dangling --
-		// decline and let the caller take the generic step-1 path which handles all of these.
-		return false;
-	}
-
-	currentThreadVar = shared_from_this();
-	if (dtape_thread_clear_stranded_wait(_dtapeThread)) {
-		_strandedWaitViolationLocked("doMachReplyPortInline-dispatch");
-	}
-	_mstateTransitionLocked(MicroState::Running, "inline-mrp-dispatch");
-	lock.unlock();
-	_runningCondvar.notify_all();
-
-	// --- body: the bare Mach primitive, identical to what MachReplyPort::processCall calls ------
-	auto& _metrics = DarlingServer::Metrics::shared();
-	uint64_t _callStartUs = DarlingServer::Metrics::nowMonoUs();
-	uint32_t port = dtape_mach_reply_port();
-
-	// publish {replyhdr.code=0}{uint32 port_name} straight onto the s2c ring + wake the guest.
-	// Byte-identical to the reply the generic path produces via pushCallReply for this op.
-#ifdef DSERVER_RING_PHASE_PROF
-	uint64_t _pubT0 = Metrics::rdtscCycles();
-#endif
-	bool published = ring->publishReply(seq, static_cast<uint32_t>(dserver_callnum_mach_reply_port), 0, &port, sizeof(port));
-#ifdef DSERVER_RING_PHASE_PROF
-	_ringPublishCycles = Metrics::rdtscCycles() - _pubT0;
-#endif
-	if (published) {
-		ring->wakeGuest();
-	} else {
-		// s2c ring full: the reply will be sent via UDS below (no double-mint). Account it so a
-		// nonzero ring_s2c_full under load flags a guest that isn't draining its s2c ring.
-		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
-	}
-
-	{
-		uint64_t now = DarlingServer::Metrics::nowMonoUs();
-		uint64_t serviceUs = (now >= _callStartUs) ? (now - _callStartUs) : 0;
-		_metrics.rpcsServiced.fetch_add(1, std::memory_order_relaxed);
-		_metrics.rpcLatency.record(serviceUs);
-		_metrics.recordCall(static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs);
-		// perf #18 D9 (dar-1il.4): heatmap. The surgical mach_reply_port path: ring transport, no fiber,
-		// pure mint (never an S2C). It bypasses beginRingReply/processCall, so pass the facts directly.
-		_metrics.recordCallHeatmap(
-			static_cast<uint32_t>(dserver_callnum_mach_reply_port), serviceUs,
-			DarlingServer::Metrics::CallTransport::Ring,
-			/* usedFiber */ false, /* didCallerS2c */ false);
-	}
-
-	// --- completion cleanup: mirror doWorkInline's (no fiber, no _activeCall ever set) ----------
-	bool canRelease = false;
-	{
-		std::unique_lock<std::shared_mutex> relock(_rwlock);
-		if (_microState == MicroState::Parking) {
-			// Impossible for mach_reply_port (it never blocks). Log loudly; the Idle
-			// transition below recovers so we don't wedge.
-			microthreadLog.error() << *this << ": doMachReplyPortInline suspended -- mach_reply_port must never block!" << microthreadLog.endLog;
-			DarlingServer::Metrics::shared().ringFastSuspend.fetch_add(1, std::memory_order_relaxed);
-		}
-		dtape_thread_exiting(_dtapeThread);
-		currentThreadVar = nullptr;
-		_mstateTransitionLocked(MicroState::Idle, "inline-mrp-done");
-
-		if (_dead && !_activeCall && !_terminating) {
-			_terminating = true;
-			canRelease = true;
-			_mstateTransitionLocked(MicroState::Terminated, "dead-after-last-call");
-		}
-		if (_terminating && !_dead) {
-			relock.unlock();
-			notifyDead();
-		} else {
-			if (!_terminating && !_dead && !_pendingInterrupts.empty()) {
-				if (!_pendingCall) {
-					_pendingCall = _pendingInterrupts.front();
-					_pendingInterrupts.pop();
-					Server::sharedInstance().scheduleThread(shared_from_this());
-				}
-			}
-			relock.unlock();
-		}
-	}
-	_runningCondvar.notify_all();
-	if (canRelease) {
-		_scheduleRelease();
-	}
-
-	// If the publish failed (s2c full), tell the caller to fall back so the guest still gets a
-	// reply via the generic path. The dtape trap already ran (it minted a real port); re-running
-	// it via callFromMessage would leak that port. So instead of "return false to re-dispatch",
-	// we treat a publish failure as a HARD inline failure only when nothing was minted. Here the
-	// port WAS minted and the only loss is the wake; publishReply already UDS-falls-back inside
-	// pushCallReply for the generic path, but we don't have that here. Simplest correct choice:
-	// if publish failed, send the reply via UDS directly so we never double-mint.
-	if (!published) {
-		// Build the minimal UDS reply and send it. Reuse the same reply convention.
-		dserver_rpc_reply_mach_reply_port_t reply;
-		reply.header.number = dserver_callnum_mach_reply_port;
-		reply.header.code = 0;
-		reply.body.port_name = port;
-		Message replyMsg(sizeof(reply), 0);
-		replyMsg.data().resize(sizeof(reply));
-		memcpy(replyMsg.data().data(), &reply, sizeof(reply));
-		replyMsg.setAddress(_address);
-		Server::sharedInstance().sendMessage(std::move(replyMsg));
-	}
-	return true;
-};
-#endif
 
 void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, libsimple_lock_t* unlockMe) {
 	if (this != currentThreadVar.get()) {
@@ -1161,24 +739,16 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 
 	_rwlock.lock();
-	// Consume a matching wake that arrived before suspend() marked us suspended.
-	if (_consumeWakeBeforeSuspendLocked()) {
+	// Consume a wake that arrived before suspend() marked us suspended.
+	if (microthreadConsumePendingResume(_resumePermit)) {
+		TestDiagnostics::traceLine("microthread.suspend.consume_pending_resume");
 		_rwlock.unlock();
 		if (unlockMe) {
 			libsimple_lock_unlock(unlockMe);
 		}
 		return;
 	}
-	{
-		// tape the armed-kind mask so a stuck park names what it is waiting for
-		uint64_t armedMask = 0;
-		for (size_t kindIndex = 0; kindIndex < wakeKindCount; kindIndex++) {
-			if (_armedWakeGen[kindIndex] != 0) {
-				armedMask |= (1ull << kindIndex);
-			}
-		}
-		_mstateTransitionLocked(MicroState::Parking, "park", 0, armedMask);
-	}
+	_suspended = true;
 	_rwlock.unlock();
 
 	unlockMeWhenSuspending = unlockMe;
@@ -1186,8 +756,9 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	getcontext(&_resumeContext);
 
 	_rwlock.lock();
-	// Consume a matching wake that arrived while the resume context was being captured.
-	if (_consumeWakeAfterContextCaptureLocked()) {
+	// Consume a wake that arrived while the resume context was being captured.
+	if (microthreadConsumeResumeDuringSuspend(_suspended, _resumePermit)) {
+		TestDiagnostics::traceLine("microthread.suspend.consume_resume_during_suspend");
 		_rwlock.unlock();
 		if (unlockMeWhenSuspending) {
 			libsimple_lock_unlock(unlockMeWhenSuspending);
@@ -1195,7 +766,7 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 		}
 		return;
 	}
-	if (_microState == MicroState::Parking) {
+	if (_suspended) {
 		if (continuationCallback) {
 			// when suspendeding with a continuation, the current continuation and call are discarded (since they can no longer be safely returned to)
 			currentContinuation = nullptr;
@@ -1228,347 +799,30 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	}
 };
 
-// A0-ARCH stage 2a: shadow run-state machine. Violations are log-and-survive by default
-// so a mismodeled edge cannot take down a production server; DSERVER_MSTATE_ABORT=1
-// (fuzz/gate legs) makes them fatal so the fuzzer can catch them as crashes.
-static bool mstateAbortOnViolation = false;
-static bool mstateAbortInit() {
-	const char* value = getenv("DSERVER_MSTATE_ABORT");
-	return value && value[0] && value[0] != '0';
-};
-static const bool mstateAbortInitDone = (mstateAbortOnViolation = mstateAbortInit(), true);
-
-bool DarlingServer::Thread::_isRunningLocked() const {
-	return _microState == MicroState::Running || _microState == MicroState::Parking || _impersonationPin;
-};
-
-bool DarlingServer::Thread::_isSuspendedLocked() const {
-	return _microState == MicroState::Parking || _microState == MicroState::Parked || _microState == MicroState::Ready;
-};
-
-const char* DarlingServer::Thread::microStateName(MicroState state) {
-	switch (state) {
-		case MicroState::Idle:       return "Idle";
-		case MicroState::Running:    return "Running";
-		case MicroState::Parking:    return "Parking";
-		case MicroState::Parked:     return "Parked";
-		case MicroState::Ready:      return "Ready";
-		case MicroState::Terminated: return "Terminated";
-	}
-	return "?";
-};
-
-const char* DarlingServer::Thread::stateEventName(StateEvent event) {
-	switch (event) {
-		case StateEvent::Transition:       return "transition";
-		case StateEvent::ArmWake:          return "arm";
-		case StateEvent::DisarmWake:       return "disarm";
-		case StateEvent::WakePending:      return "wake-pending";
-		case StateEvent::WakeDropped:      return "wake-dropped";
-		case StateEvent::WakeConsumed:     return "wake-consumed";
-		case StateEvent::InterruptPush:    return "interrupt-push";
-		case StateEvent::InterruptPop:     return "interrupt-pop";
-		case StateEvent::RerunDeferred:    return "rerun-deferred";
-		case StateEvent::ImpersonatePin:   return "impersonate-pin";
-		case StateEvent::ImpersonateUnpin: return "impersonate-unpin";
-		case StateEvent::Note:             return "note";
-		case StateEvent::XnuWait:          return "xwait";
-	}
-	return "?";
-};
-
-static bool mstateLegalTransition(DarlingServer::Thread::MicroState from, DarlingServer::Thread::MicroState to) {
-	using MS = DarlingServer::Thread::MicroState;
-	switch (from) {
-		case MS::Idle:
-			// Running = fresh dispatch; Parked = kernel-thread birth park;
-			// Terminated = died with nothing left to run
-			return to == MS::Running || to == MS::Parked || to == MS::Terminated;
-		case MS::Running:
-			// Running->Parked is the no-op-dispatch repark: a stale/permit-less dispatch of a
-			// Parked thread takes ownership (Parked->Running "dispatch-stale"), never touches
-			// the parked context (no pending call, no consumable wake), and doneWorking reparks
-			// it directly -- the park was never un-committed, so suspend()/Parking is not
-			// re-traversed. (First 2a fuzz finding: every fuzz leg tripped exactly this edge.)
-			// Running->Ready is the same repark with a wake that landed DURING the no-op
-			// dispatch window (wake() only records a pending while the state is Running;
-			// doneWorking's tail then resolves the repark to Ready instead of Parked).
-			return to == MS::Parking || to == MS::Parked || to == MS::Ready || to == MS::Idle || to == MS::Terminated;
-		case MS::Parking:
-			// Parked/Ready = doneWorking committed the park; Running = a wake raced the park
-			// (suspend()'s post-getcontext check); Idle = inline-path suspend contract
-			// violation recovery (that site logs loudly on its own)
-			return to == MS::Parked || to == MS::Ready || to == MS::Running || to == MS::Idle;
-		case MS::Parked:
-			// Running covers both a consuming resume and a stale/fresh-call dispatch
-			return to == MS::Running || to == MS::Ready || to == MS::Terminated;
-		case MS::Ready:
-			return to == MS::Running || to == MS::Terminated;
-		case MS::Terminated:
-			return false;
-	}
-	return false;
-};
-
-void DarlingServer::Thread::_mstateRecordLocked(StateEvent event, MicroState from, MicroState to, const char* reason, uint8_t aux8, uint64_t aux64) {
-	StateTapeEntry& entry = _stateTape[_stateTapeCount % stateTapeCapacity];
-	_stateTapeCount++;
-	entry.timeUs = DarlingServer::Metrics::nowMonoUs();
-	entry.aux64 = aux64;
-	entry.reason = reason;
-	entry.event = event;
-	entry.from = from;
-	entry.to = to;
-	entry.aux8 = aux8;
-};
-
-void DarlingServer::Thread::_mstateEventLocked(StateEvent event, const char* reason, uint8_t aux8, uint64_t aux64) {
-	_mstateRecordLocked(event, _microState, _microState, reason, aux8, aux64);
-};
-
-void DarlingServer::Thread::_mstateTransitionLocked(MicroState to, const char* reason, uint8_t aux8, uint64_t aux64) {
-	MicroState from = _microState;
-	_microState = to;
-	_mstateRecordLocked(StateEvent::Transition, from, to, reason, aux8, aux64);
-
-	// legality assertion. (Stage 2b flipped authority: the old _running/_suspended flags
-	// are now derived views of this field, so the 2a flag-consistency checks are
-	// tautological and gone; the from->to table is the contract.)
-	const char* violation = nullptr;
-	if (!mstateLegalTransition(from, to)) {
-		violation = "illegal transition";
-	}
-	if (violation) {
-		microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION: " << violation
-			<< " (" << microStateName(from) << " -> " << microStateName(to) << ", " << reason << ")" << microthreadLog.endLog;
-		_dumpStateTapeLocked(violation);
-		if (mstateAbortOnViolation) {
-			abort();
-		}
-	}
-};
-
-void DarlingServer::Thread::_dumpStateTapeLocked(const char* why) const {
-	microthreadLog.error() << _tid << "(" << _nstid << "): state tape dump (" << why << "): state="
-		<< microStateName(_microState) << ", " << _stateTapeCount << " events total" << microthreadLog.endLog;
-	uint64_t count = (_stateTapeCount < stateTapeCapacity) ? _stateTapeCount : stateTapeCapacity;
-	for (uint64_t i = _stateTapeCount - count; i < _stateTapeCount; i++) {
-		const StateTapeEntry& entry = _stateTape[i % stateTapeCapacity];
-		microthreadLog.error() << _tid << ": tape[" << i << "] t=" << entry.timeUs << "us "
-			<< stateEventName(entry.event) << " " << microStateName(entry.from) << "->" << microStateName(entry.to)
-			<< " reason=" << (entry.reason ? entry.reason : "-")
-			<< " aux8=" << (int)entry.aux8 << " aux64=" << entry.aux64 << microthreadLog.endLog;
-	}
-};
-
-void DarlingServer::Thread::dumpCurrentThreadStateTape() {
-	// panic funnel: no locks (the process is dying and may hold them), print like panic()
-	Thread* self = currentThreadVar.get();
-	if (!self) {
-		printf("mstate: no current microthread at panic\n");
-		fflush(stdout);
-		return;
-	}
-	printf("mstate: tid=%d nstid=%d state=%s events=%llu\n", self->_tid, self->_nstid,
-		microStateName(self->_microState), (unsigned long long)self->_stateTapeCount);
-	uint64_t total = self->_stateTapeCount;
-	uint64_t count = (total < stateTapeCapacity) ? total : stateTapeCapacity;
-	for (uint64_t i = total - count; i < total; i++) {
-		const StateTapeEntry& entry = self->_stateTape[i % stateTapeCapacity];
-		printf("mstate: tape[%llu] t=%lluus %s %s->%s reason=%s aux8=%u aux64=%llu\n",
-			(unsigned long long)i, (unsigned long long)entry.timeUs,
-			stateEventName(entry.event), microStateName(entry.from), microStateName(entry.to),
-			entry.reason ? entry.reason : "-", (unsigned)entry.aux8, (unsigned long long)entry.aux64);
-	}
-	fflush(stdout);
-};
-
-void DarlingServer::Thread::recordXnuWaitTransition(const char* reason, uint32_t oldState, uint32_t newState, int32_t waitResult, uint8_t flags) {
-	std::unique_lock lock(_rwlock);
-	_mstateEventLocked(StateEvent::XnuWait, reason, (uint8_t)(newState & 0xff),
-		((uint64_t)(oldState & 0xff) << 32) | (uint64_t)(uint32_t)waitResult);
-	if (flags & DTAPE_XWAIT_VIOLATION) {
-		microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION (xwait): " << reason
-			<< " (state 0x" << std::hex << oldState << " -> 0x" << newState << std::dec
-			<< ", wait_result " << waitResult << ")" << microthreadLog.endLog;
-		_dumpStateTapeLocked(reason);
-		if (mstateAbortOnViolation) {
-			abort();
-		}
-	}
-};
-
-void DarlingServer::Thread::_strandedWaitViolationLocked(const char* site) {
-	_mstateEventLocked(StateEvent::XnuWait, site, 0, 0);
-	microthreadLog.error() << _tid << "(" << _nstid << "): MSTATE VIOLATION (xwait): fresh dispatch found"
-		<< " stranded TH_WAIT (recovery-cleared) at " << site << microthreadLog.endLog;
-	_dumpStateTapeLocked(site);
-	if (mstateAbortOnViolation) {
-		abort();
-	}
-};
-
-uint64_t DarlingServer::Thread::armWake(WakeKind kind) {
-	std::unique_lock lock(_rwlock);
-	uint64_t gen = ++_wakeGenCounter;
-	const size_t k = static_cast<size_t>(kind);
-	if (_armedWakeGen[k] != 0) {
-		// the previous wait of this kind ended without its arm-site disarm running (its wake
-		// was consumed elsewhere, or the park was aborted); re-arming supersedes it
-		microthreadLog.info() << _tid << "(" << _nstid << "): re-arming wake kind " << (int)k
-			<< " over live gen " << _armedWakeGen[k] << microthreadLog.endLog;
-	}
-	_armedWakeGen[k] = gen;
-	if (_pendingWakeGen[k] != 0) {
-		// any wake still pending for this kind was for a PREVIOUS wait -- stale by
-		// construction (gen is fresh); drop it so it cannot satisfy the new wait
-		microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
-			<< (int)k << " gen " << _pendingWakeGen[k] << " at re-arm" << microthreadLog.endLog;
-		_mstateEventLocked(StateEvent::WakeDropped, "stale-at-re-arm", (uint8_t)k, _pendingWakeGen[k]);
-		_pendingWakeGen[k] = 0;
-	}
-	_mstateEventLocked(StateEvent::ArmWake, "arm", (uint8_t)k, gen);
-	return gen;
-};
-
-void DarlingServer::Thread::disarmWake(WakeKind kind) {
-	std::unique_lock lock(_rwlock);
-	const size_t k = static_cast<size_t>(kind);
-	_mstateEventLocked(StateEvent::DisarmWake, "disarm", (uint8_t)k, _armedWakeGen[k]);
-	_armedWakeGen[k] = 0;
-	// old Part 3d lives here now: a wake already delivered for this (concluded) wait is
-	// satisfied by definition -- drop it so it cannot go stale and spuriously satisfy the
-	// thread's NEXT suspend() while wait_result is still THREAD_WAITING.
-	_pendingWakeGen[k] = 0;
-};
-
-bool DarlingServer::Thread::_consumePendingWakeLocked() {
-	// Abort outranks everything and matches unconditionally (doWork routes a resumed dying
-	// thread into its terminating paths).
-	constexpr size_t abortIdx = static_cast<size_t>(WakeKind::Abort);
-	if (_pendingWakeGen[abortIdx] != 0) {
-		_pendingWakeGen[abortIdx] = 0;
-		_mstateEventLocked(StateEvent::WakeConsumed, "consume-abort", (uint8_t)abortIdx, 1);
-		return true;
-	}
-	// Prefer the innermost park kinds: a raw queue handoff belongs to the park physically on
-	// the stack right now; an XNU-wait finalization may belong to an OUTER wait (nested
-	// arming) whose early pop the loop-guarded parks tolerate by re-checking.
-	static constexpr WakeKind order[] = { WakeKind::Raw, WakeKind::Xnu, WakeKind::UserSuspension, WakeKind::Kick };
-	for (WakeKind kind : order) {
-		const size_t k = static_cast<size_t>(kind);
-		if (_pendingWakeGen[k] == 0) {
-			continue;
-		}
-		if (_pendingWakeGen[k] == _armedWakeGen[k]) {
-			// consuming clears BOTH slots: the wait is being delivered right now, so the
-			// arm-site's own disarm (which would drop a still-pending wake) becomes a no-op
-			_mstateEventLocked(StateEvent::WakeConsumed, "consume", (uint8_t)k, _pendingWakeGen[k]);
-			_pendingWakeGen[k] = 0;
-			_armedWakeGen[k] = 0;
-			return true;
-		}
-		// pending no longer matches the armed wait of its kind -- its wait is gone; drop
-		microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale pending wake kind "
-			<< (int)k << " gen " << _pendingWakeGen[k] << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
-		_mstateEventLocked(StateEvent::WakeDropped, "stale-at-consume", (uint8_t)k, _pendingWakeGen[k]);
-		_pendingWakeGen[k] = 0;
-	}
-	return false;
-};
-
-bool DarlingServer::Thread::_consumeWakeBeforeSuspendLocked() {
-	if (!_consumePendingWakeLocked()) {
-		return false;
-	}
-	TestDiagnostics::traceLine("microthread.suspend.consume_pending_resume");
-	return true;
-};
-
-bool DarlingServer::Thread::_consumeWakeAfterContextCaptureLocked() {
-	if (!_consumePendingWakeLocked()) {
-		return false;
-	}
-	TestDiagnostics::traceLine("microthread.suspend.consume_resume_during_suspend");
-	if (_microState == MicroState::Parking) {
-		_mstateTransitionLocked(MicroState::Running, "wake-raced-park");
-	}
-	return true;
-};
-
-bool DarlingServer::Thread::_hasDeliverablePendingWakeLocked() const {
-	if (_pendingWakeGen[static_cast<size_t>(WakeKind::Abort)] != 0) {
-		return true;
-	}
-	for (size_t k = 0; k < wakeKindCount; k++) {
-		if (_pendingWakeGen[k] != 0 && _pendingWakeGen[k] == _armedWakeGen[k]) {
-			return true;
-		}
-	}
-	return false;
-};
-
-void DarlingServer::Thread::wake(WakeKind kind, uint64_t generation) {
+void DarlingServer::Thread::resume() {
 	bool schedule = false;
 	{
 		std::unique_lock lock(_rwlock);
-		if (!_isRunningLocked() && !_isSuspendedLocked()) {
-			// nothing to deliver to (no parked context and no owner mid-transition);
-			// same no-op as the old untyped resume()
-			_mstateEventLocked(StateEvent::WakeDropped, "no-park", (uint8_t)kind, generation);
-			return;
-		}
-		if (kind == WakeKind::Abort) {
-			_pendingWakeGen[static_cast<size_t>(WakeKind::Abort)] = 1;
-			_mstateEventLocked(StateEvent::WakePending, "abort", (uint8_t)WakeKind::Abort, 1);
-		} else {
-			size_t k = static_cast<size_t>(kind);
-			if (generation == 0) {
-				// waker cannot know the generation (thread_release; kernel-thread birth
-				// unblock): target the currently-armed wait of this kind
-				generation = _armedWakeGen[k];
-				if (generation == 0 && kind == WakeKind::Xnu) {
-					// kernel_thread_create sets TH_WAIT directly without
-					// thread_mark_wait_locked, so the thread's FIRST unblock arrives
-					// untyped -- deliver it as the startup kick
-					kind = WakeKind::Kick;
-					k = static_cast<size_t>(WakeKind::Kick);
-					generation = _armedWakeGen[k];
-				}
-				if (generation == 0) {
-					microthreadLog.info() << _tid << "(" << _nstid << "): dropping untyped wake kind "
-						<< (int)k << ": nothing armed" << microthreadLog.endLog;
-					_mstateEventLocked(StateEvent::WakeDropped, "untyped-nothing-armed", (uint8_t)k, 0);
-					return;
-				}
-			} else if (_armedWakeGen[k] != generation) {
-				// STALE WAKE: the wait this wake was minted for is gone (consumed early by
-				// an abort, superseded by a re-arm). This is the A0 crosstalk class -- the
-				// old untyped permit would have delivered it as a spurious resume; drop it.
-				microthreadLog.info() << _tid << "(" << _nstid << "): dropping stale wake kind "
-					<< (int)k << " gen " << generation << " (armed " << _armedWakeGen[k] << ")" << microthreadLog.endLog;
-				_mstateEventLocked(StateEvent::WakeDropped, "stale-wake", (uint8_t)k, generation);
-				return;
-			}
-			_pendingWakeGen[k] = generation;
-			_mstateEventLocked(StateEvent::WakePending, "wake", (uint8_t)k, generation);
-		}
-		if (_microState == MicroState::Parked && _hasDeliverablePendingWakeLocked()) {
-			// the park is committed and this wake matches it: the thread now owes a dispatch
-			_mstateTransitionLocked(MicroState::Ready, "wake-deliverable", (uint8_t)kind, generation);
-		}
-		schedule = _isSuspendedLocked() && !_isRunningLocked();
-	}
-
-	// A0-ARCH stage 0 fuzzer: occasionally force a dispatch even though the thread is still
-	// running / not yet parked -- models the wake-while-running reorder (_rerunPending path).
-	if (schedFuzzEnabled && !schedule && schedFuzzChance()) {
-		schedule = true;
+		// Coalesce repeated wakes into one permit. If the microthread is still
+		// running, it will either consume the permit in suspend() or reschedule
+		// itself from doWork() after physically stopping.
+		schedule = microthreadRecordResume(_execution.isRunning(), _suspended, _resumePermit);
 	}
 
 	if (schedule) {
 		Server::sharedInstance().scheduleThread(shared_from_this());
 	}
+};
+
+void DarlingServer::Thread::clearResumePermit() {
+	// perf#25a A0 (Part 3d): called by duct-tape's thread_block_parameter when the wait was
+	// finalized (thread_unblock ran: wait_result written, TH_WAIT cleared) BEFORE the microthread
+	// physically suspended -- thread_block skips the suspension, so the wake permit resume()
+	// minted for that unblock is already satisfied. Left set, it would go stale and let the
+	// thread's NEXT suspend() return immediately with wait_result still THREAD_WAITING (panics
+	// semaphore_convert_wait_result; corrupts other wait protocols silently).
+	std::unique_lock lock(_rwlock);
+	_resumePermit = false;
 };
 
 void DarlingServer::Thread::terminate() {
@@ -1582,7 +836,6 @@ void DarlingServer::Thread::terminate() {
 
 	_rwlock.lock();
 	_terminating = true;
-	_mstateEventLocked(StateEvent::Note, "terminate");
 
 	if (currentThreadVar.get() == this) {
 		// if it's the current thread, just suspend it;
@@ -1594,7 +847,7 @@ void DarlingServer::Thread::terminate() {
 	} else {
 		// if it's not the current thread and it's not currently running, just tell it died;
 		// it should die once the caller releases their reference(s) on us
-		if (!_isRunningLocked()) {
+		if (!_execution.isRunning()) {
 			_rwlock.unlock();
 			notifyDead();
 		} else {
@@ -1611,18 +864,13 @@ std::shared_ptr<DarlingServer::Thread> DarlingServer::Thread::currentThread() {
 void DarlingServer::Thread::setupKernelThread(std::function<void()> startupCallback) {
 	std::unique_lock lock(_rwlock);
 	_continuationCallback = startupCallback;
-	// A0-ARCH stage 1: the birth park of a kernel thread; woken exactly once by a startup
-	// kick (startKernelThread below, or an untyped first thread_unblock for kernel threads
-	// created via kernel_thread_create -- see wake()).
-	_armedWakeGen[static_cast<size_t>(WakeKind::Kick)] = ++_wakeGenCounter;
-	_mstateEventLocked(StateEvent::ArmWake, "kthread-birth-kick", (uint8_t)WakeKind::Kick, _armedWakeGen[static_cast<size_t>(WakeKind::Kick)]);
-	_mstateTransitionLocked(MicroState::Parked, "kthread-birth");
+	_suspended = true;
 	getcontext(&_resumeContext);
 };
 
 void DarlingServer::Thread::startKernelThread(std::function<void()> startupCallback) {
 	setupKernelThread(startupCallback);
-	wake(WakeKind::Kick, 0);
+	resume();
 };
 
 void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
@@ -1635,11 +883,7 @@ void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
 		{
 			std::unique_lock lock(thread->_rwlock);
 			thread->_deferLocked(true, lock);
-			// A0-ARCH stage 2b: the lockout is its own field now (it used to be smuggled
-			// through `_running = true` on a non-running thread); _isRunningLocked folds
-			// it in so defer/waitUntil* readers see the same "busy" they always did
-			thread->_impersonationPin = true;
-			thread->_mstateEventLocked(StateEvent::ImpersonatePin, "impersonate");
+			thread->_execution.begin();
 		}
 		thread->_runningCondvar.notify_all();
 	}
@@ -1653,8 +897,7 @@ void DarlingServer::Thread::impersonate(std::shared_ptr<Thread> thread) {
 	if (oldThread) {
 		{
 			std::unique_lock lock(oldThread->_rwlock);
-			oldThread->_impersonationPin = false;
-			oldThread->_mstateEventLocked(StateEvent::ImpersonateUnpin, "impersonate-end");
+			oldThread->_execution.finish();
 			oldThread->_undeferLocked(lock);
 		}
 		oldThread->_runningCondvar.notify_all();
@@ -1682,11 +925,7 @@ void DarlingServer::Thread::syscallReturn(int resultCode) {
 	}
 
 	{
-		// A0-ARCH stage 3: a cancelled interrupted call runs here via the NORMAL dispatch
-		// path, with itself restored as the active call -- no special interrupt-slot lookup,
-		// no setcontext detour. Its reply lands in pushCallReply, which stashes it on the
-		// open interrupt frame and sends the owed interrupt_enter reply.
-		auto call = currentThreadVar->_activeCall;
+		auto call = (currentThreadVar->_interruptedForSignal) ? currentThreadVar->_interrupts.top().interruptedCall : currentThreadVar->_activeCall;
 		if (!call || !call->isXNUTrap()) {
 			throw std::runtime_error("Attempt to return from syscall on thread with no active syscall");
 		}
@@ -1695,6 +934,17 @@ void DarlingServer::Thread::syscallReturn(int resultCode) {
 		} else {
 			call->sendBasicReply(resultCode);
 		}
+	}
+
+	if (currentThreadVar->_interruptedForSignal) {
+		currentThreadVar->_didSyscallReturnDuringInterrupt = true;
+#if DSERVER_ASAN
+		if (currentThreadVar->_handlingInterruptedCall) {
+			__sanitizer_start_switch_fiber(nullptr, currentThreadVar->_stack.base, currentThreadVar->_stack.size);
+		}
+#endif
+		setcontext(&currentThreadVar->_syscallReturnHereDuringInterrupt);
+		__builtin_unreachable();
 	}
 
 	// jump back to the top of the thread
@@ -1874,24 +1124,26 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 
 	{
 		std::unique_lock lock(_rwlock);
+		// perf#30 (doc section 246): `_interrupts` is EMPTY for a signal that arrives while the thread has no interrupt
+		// context, and `top()` on an empty `std::stack` returned 0 here, so this line wrote through a null pointer and
+		// the server died with SIGSEGV at addr=0x0 -- `dwdiag crash` decoded the fault to this very instruction
+		// (`processSignal + 0x6b`). The signal is still delivered below: what the empty stack means is that there is no
+		// interrupt marker of this thread's to clear, not that the signal must be dropped. The anomaly is REPORTED once
+		// instead of being written through, because an instrument that silently does nothing cannot be told from no
+		// instrument -- and this one, silent, cost several runs that looked like transport hangs.
 		if (!_interrupts.empty()) {
 			_interrupts.top().signal = 0;
 		} else {
-			microthreadLog.error() << _tid << "(" << _nstid << "): processSignal with empty interrupt stack (desync)" << microthreadLog.endLog;
+			static bool reportedMissingInterrupt = false;
+			if (!reportedMissingInterrupt) {
+				reportedMissingInterrupt = true;
+				static DarlingServer::Log log("thread");
+				log.error() << "[sigprocess-no-interrupt] delivering a signal without an interrupt context"
+					<< " tid=" << _tid << " nstid=" << _nstid << log.endLog;
+			}
 		}
 		_processingSignal = true;
 	}
-
-	struct StandardSignalPendingClear {
-		Thread* thread;
-		int linuxSignalNumber;
-		~StandardSignalPendingClear() {
-			if (linuxSignalNumber > 0 && linuxSignalNumber < 32) {
-				std::unique_lock lock(thread->_rwlock);
-				thread->_pendingStandardSignalMask &= ~(1ull << linuxSignalNumber);
-			}
-		}
-	} clearPendingStandardSignal{this, linuxSignalNumber};
 
 	dtape_thread_process_signal(_dtapeThread, bsdSignalNumber, linuxSignalNumber, code, signalAddress);
 
@@ -1911,11 +1163,7 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 void DarlingServer::Thread::handleSignal(int signal) {
 	std::unique_lock lock(_rwlock);
 	if (_processingSignal) {
-		if (!_interrupts.empty()) {
-			_interrupts.top().signal = signal;
-		} else {
-			microthreadLog.error() << _tid << "(" << _nstid << "): handleSignal with empty interrupt stack (desync); signal " << signal << " dropped" << microthreadLog.endLog;
-		}
+		_interrupts.top().signal = signal;
 	} else {
 		throw std::runtime_error("Attempt to handle signal while not processing signal");
 	}
@@ -2000,7 +1248,7 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 				// munmap). RING parent => curable by the duplex sideband; UDS parent => today not a ring-
 				// deadlock (caller services via recvmsg) but a FUTURE hazard if that op is ever ring-
 				// migrated; no managed call => pure server-internal.
-				if (_ringReplyPending) {
+				if (_activeCall && _activeCall->ringContext()) {
 					Metrics::shared().s2cMunmapRingParent.fetch_add(1, std::memory_order_relaxed);
 				} else if (_activeCall) {
 					Metrics::shared().s2cMunmapUdsParent.fetch_add(1, std::memory_order_relaxed);
@@ -2054,20 +1302,120 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 	// (the routing layer already verified the cap + clean mailbox); we log + take the UDS path as a
 	// last resort (the bounded guest wait then UDS-falls-back the op). In practice the guard passes.
 	bool duplexUpcallTaken = false;
-	if (_ringDuplexParentActive && expectedReplyNumber == dserver_s2c_msgnum_munmap) {
-		auto* mcall = reinterpret_cast<const dserver_s2c_call_munmap_t*>(call.data().data());
-		uint64_t addr = mcall->address;
-		uint64_t len = mcall->length;
+	// Duplex eligibility is a property of the ACTIVE CALL's ring context. It must NOT be a
+	// dispatch-scoped Thread flag: a blocking parent suspends inside doWork() (which then returns to the
+	// main loop) and raises its caller-S2C much later, so a flag cleared when doWork() returned would
+	// have been gone exactly when it was needed.
+	const RingCallContext* duplexCtx = (_activeCall ? _activeCall->ringContext() : nullptr);
+
+	// perf#26 §1: ONE complete duplex-decision event. Every condition the guard evaluates is printed
+	// together with the decision, and the decline reason is produced by the SAME predicate chain the
+	// guard uses -- never inferred afterwards from several unrelated log lines.
+	{
+		auto ring = this->ring(); // takes the shared lock internally; we hold no lock here
+		dserver_ring_shm_t* cb = ring ? ring->liveControlBlock() : nullptr;
+		uint32_t mbUpcallReady = cb ? __atomic_load_n(&cb->duplex_upcall_ready, __ATOMIC_ACQUIRE) : 0u;
+		uint32_t mbReplyReady  = cb ? __atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) : 0u;
+		bool mbUpcallBusy = cb && dserver_ring_duplex_upcall_available(cb);
+		bool callerIsTarget = (currentThread().get() == this);
+		bool capPump = ring && ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_MUNMAP_PUMP);
+		const char* reason = "NONE";
+		if (!_activeCall)                        reason = "NO_ACTIVE_CALL";
+		else if (!duplexCtx)                     reason = "NO_RING_CONTEXT";
+		else if (!duplexCtx->duplexCapable)      reason = "NOT_DUPLEX_CAPABLE";
+		else if (expectedReplyNumber == dserver_s2c_msgnum_mmap) {
+			auto* mc = reinterpret_cast<const dserver_s2c_call_mmap_t*>(call.data().data());
+			if (mc->fd >= 0 || mc->offset != 0) reason = "FD_S2C_UNSUPPORTED";
+		}
+		else if (expectedReplyNumber != dserver_s2c_msgnum_munmap) reason = "UNSUPPORTED_S2C_OP";
+		else if (!callerIsTarget)                reason = "TARGET_NOT_CALLER";
+		else if (!capPump)                       reason = "NOT_DUPLEX_CAPABLE";
+		else if (_duplexUpcallInFlight)          reason = "MAILBOX_UPCALL_BUSY";
+		else if (mbUpcallBusy)                   reason = "MAILBOX_UPCALL_BUSY";
+		else if (mbReplyReady)                   reason = "MAILBOX_REPLY_BUSY";
+		bool willAttempt = (std::strcmp(reason, "NONE") == 0);
+		S2CTrace::line("S2C_DUPLEX_DECISION target_nsid=%lld exec_tid=%d exec_nsid=%lld current_is_target=%d "
+		               "active_callnum=%u ring_context=%d lane=%llu seq=%u duplex_capable=%d "
+		               "mb_upcall_ready=%u mb_reply_ready=%u s2c_op=0x%x decision=%s reason=%s",
+		               (long long)nsid(), id(), (long long)nsid(), (int)callerIsTarget,
+		               _activeCall ? (unsigned)_activeCall->number() : 0u, duplexCtx ? 1 : 0,
+		               (unsigned long long)((duplexCtx && duplexCtx->ring) ? duplexCtx->ring->debugLaneId() : 0),
+		               duplexCtx ? duplexCtx->seq : 0u,
+		               (duplexCtx && duplexCtx->duplexCapable) ? 1 : 0,
+		               mbUpcallReady, mbReplyReady, (unsigned)expectedReplyNumber,
+		               willAttempt ? "ATTEMPT" : "DECLINE", reason);
+	}
+
+	if (duplexCtx && duplexCtx->duplexCapable
+	    && (expectedReplyNumber == dserver_s2c_msgnum_munmap
+	        || expectedReplyNumber == dserver_s2c_msgnum_mmap)) {
 		std::unique_lock lock(_rwlock);
-		duplexUpcallTaken = _s2cTryDuplexMunmapLocked(dserver_s2c_msgnum_munmap, addr, len, lock);
+		if (expectedReplyNumber == dserver_s2c_msgnum_munmap) {
+			auto* mcall = reinterpret_cast<const dserver_s2c_call_munmap_t*>(call.data().data());
+			duplexUpcallTaken = _s2cTryDuplexMunmapLocked(dserver_s2c_msgnum_munmap,
+				mcall->address, mcall->length, lock);
+		} else {
+			auto* mcall = reinterpret_cast<const dserver_s2c_call_mmap_t*>(call.data().data());
+			// Only the ANONYMOUS shape is mailbox-carryable: fd < 0 and offset == 0. A file mapping needs
+			// SCM_RIGHTS, which is the fd-courier milestone -- refuse it here so it keeps the UDS path
+			// instead of silently dropping the descriptor.
+			// perf#27 #10 (F1) RED arm. The refusal below is fail-closed but, as written, UNREACHABLE from
+			// the current ring op set: the only S2C mmap a Ring parent can raise is allocatePages()'s
+			// anonymous one (fd < 0, offset 0), while a file-backed map is raised by a guest mmap RPC,
+			// which is not a ring call. An unreachable refusal is not evidence that it refuses, so
+			// DSERVER_DUPLEX_FORCE_FD_SHAPE=1 forces the fd-shaped branch and the run must show the
+			// counter, the trace, a correct result, and no hang.
+			static const bool s_forceFdShape = []() {
+				const char* v = getenv("DSERVER_DUPLEX_FORCE_FD_SHAPE");
+				return v && v[0] == '1';
+			}();
+			if (mcall->fd < 0 && mcall->offset == 0 && !s_forceFdShape) {
+				duplexUpcallTaken = _s2cTryDuplexMmapLocked(dserver_s2c_msgnum_mmap,
+					mcall->address, mcall->length,
+					(uint32_t)mcall->protection, (uint32_t)mcall->flags, lock);
+			} else {
+				Metrics::shared().ringDuplexFdS2cUnsupported.fetch_add(1, std::memory_order_relaxed);
+				S2CTrace::line("DUPLEX_FD_S2C_UNSUPPORTED target_tid=%lld fd=%d off=%lld",
+					(long long)nsid(), (int)mcall->fd, (long long)mcall->offset);
+			}
+		}
 		if (!duplexUpcallTaken) {
-			s2cLog.error() << *this << ": duplex munmap guard declined mid-op (mailbox busy?); "
-			               << "falling through to UDS S2C (caller may be ring-parked)" << s2cLog.endLog;
+			s2cLog.error() << *this << ": duplex guard declined mid-op for s2c op " << (int)expectedReplyNumber
+			               << " (mailbox busy?); falling through to UDS S2C (caller may be ring-parked)"
+			               << s2cLog.endLog;
 		}
 	}
 	if (!duplexUpcallTaken)
 #endif
 	{
+		// perf#26 RING-MACH-MSG: if this S2C belongs to a mach_msg_overwrite parent that did not take the
+		// duplex mailbox, the transaction fell back to the UDS S2C path; record it so the
+		// transaction-scoped accounting can prove the lane-resident case never does.
+		if (!duplexUpcallTaken && _activeCall
+		    && (unsigned)_activeCall->number() == (unsigned)dserver_callnum_mach_msg_overwrite) {
+			// §3 Case A: a UDS-origin parent taking the UDS S2C path is NORMAL -- its caller is parked in
+			// recvmsg and can service it.
+			if (_activeCall->ringContext()) {
+				// perf#27 #10 (F1): a RING-origin parent's caller is parked on its LANE, so it can never
+				// service a UDS S2C. Attempting one does not degrade gracefully: the server waits out its
+				// bounded deadline (MEASURED 31s in the forced-fd-shape RED arm) and the parent op fails
+				// anyway. Fail now and say why, so an unsupported S2C shape is a DEFINED IMMEDIATE error
+				// rather than a stall. This is also why ringParentS2cUdsFallback stays 0: we do not fall
+				// back at all.
+				_s2cUdsFallbackThisCall = true;
+				S2CTrace::line("RING_PARENT_S2C_FAIL_FAST target_tid=%lld s2c=0x%x active_callnum=%u "
+				               "fd_unsupported=%llu",
+				               (long long)nsid(), (unsigned)expectedReplyNumber,
+				               (unsigned)_activeCall->number(),
+				               (unsigned long long)Metrics::shared().ringDuplexFdS2cUnsupported.load(std::memory_order_relaxed));
+				dtape_semaphore_up(_s2cPerformSempahore); // undo the entry down; no interrupt-exit to undo
+				                                          // (a ring parent always has an active call, so
+				                                          // usingInterrupt is false on this path)
+				return std::nullopt; // defined failure for the parent op, immediately
+			}
+			Metrics::shared().udsParentS2cNormal.fetch_add(1, std::memory_order_relaxed);
+			S2CTrace::line("UDS_PARENT_S2C_NORMAL target_tid=%lld", (long long)nsid());
+		}
 		// send the call (UDS S2C -- the unchanged path)
 		Server::sharedInstance().sendMessage(std::move(call));
 	}
@@ -2103,12 +1451,13 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 				// upcall deferred its reply; it MUST go back onto the s2c ring, not UDS, or the
 				// ring-waiting guest never wakes. _publishReplyToRingLocked consumes _ringReplyPending
 				// and returns false (not a ring call) -> fall through to the UDS send below.
-				if (!_publishReplyToRingLocked(*_deferredReply))
+				if (!_deferredRingContext || !_publishReplyToRingContextLocked(*_deferredRingContext, *_deferredReply))
 #endif
 				{
 					Server::sharedInstance().sendMessage(std::move(*_deferredReply));
 				}
 				_deferredReply = std::nullopt;
+				_deferredRingContext = std::nullopt;
 				// A0 RPC TRACE: the STASH-DEFERRED[s2c] reply is now flushed. Its absence for a tid that
 				// logged STASH-DEFERRED is the stall signature (deferred reply never flushed).
 				DarlingServer::__rpctrace("FLUSH-DEFERRED htid=%d nstid=%lld", id(), (long long)nsid());
@@ -2210,11 +1559,94 @@ bool DarlingServer::Thread::_s2cTryDuplexLocked(uint32_t upcallOp, uint32_t arg,
 	return true;
 };
 
+// ABI v6: the ANONYMOUS-mmap sibling of _s2cTryDuplexMunmapLocked. allocatePages() issues an fd-less,
+// offset-0 mmap to give the guest server-allocated pages; that is a caller-local S2C, and a ring-parked
+// caller cannot service it over UDS, so it takes the same mailbox. The fd-carrying mapFile() shape is
+// deliberately NOT routed here (offset != 0 or fd >= 0): carrying a descriptor is the fd-courier
+// milestone, and pretending the mailbox can carry one would silently lose the fd.
+bool DarlingServer::Thread::_s2cTryDuplexMmapLocked(uint32_t s2cNumber, uint64_t address, uint64_t length,
+                                                    uint32_t protection, uint32_t flags,
+                                                    std::unique_lock<std::shared_mutex>& lock) {
+	(void)lock; // documents the held-lock contract
+	auto ring = _ring;
+	if (!ring || !ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_MUNMAP_PUMP)) {
+		return false;
+	}
+	dserver_ring_shm_t* cb = ring->liveControlBlock();
+	if (!cb) {
+		return false;
+	}
+	if (_duplexUpcallInFlight) {
+		return false;
+	}
+	// M6: this function has already established that NO upcall is in flight (the early return above), so a
+	// reply sitting in the slot now is unsolicited/stale by the invariant: reject and clear it before the
+	// cleanliness checks, so it can neither look "busy" nor be harvested later. NOTE the position -- this
+	// must come AFTER the in-flight early return, otherwise it would clear a reply that belongs to an upcall
+	// that IS in flight (measured: doing it earlier turned the GREEN base RED).
+	(void)_duplexScrubReplySlot(cb, false);
+	if (dserver_ring_duplex_upcall_available(cb)) {
+		return false;
+	}
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) != 0u) {
+		return false;
+	}
+	uint32_t parentId = _duplexNextId++;
+	uint32_t upcallId = _duplexNextId++;
+	if (parentId == 0) { parentId = _duplexNextId++; }
+	if (upcallId == 0) { upcallId = _duplexNextId++; }
+
+	_duplexParentId = parentId;
+	_duplexUpcallId = upcallId;
+	_duplexReplyReady = false;
+	_duplexUpcallInFlight = true;
+	_duplexRealUpcallNum = s2cNumber;
+	_duplexInFlightFast.store(true, std::memory_order_release);
+	{
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		_duplexUpcallDeadlineNs = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec + 5000000000ull;
+	}
+	dserver_ring_duplex_publish_mmap_upcall(cb, parentId, upcallId, address, length, protection, flags);
+
+	// perf#27 M1 RED arm. Publish the COMPLETION as if the guest had already performed the effect, so the
+	// parent op completes successfully while the caller-S2C never happened. That is precisely the "early
+	// parent reply" violation: the guest must not be able to observe a successful parent result before its
+	// own caller-S2C completes. The arm exists to show the workload DETECTS it (the OOL payload check fails
+	// when the mapping was never made), not merely that the flag is set.
+	{
+		static const bool s_earlyComplete = []() {
+			const char* v = getenv("DSERVER_DUPLEX_EARLY_COMPLETE");
+			return v && v[0] == '1';
+		}();
+		if (s_earlyComplete) {
+			Metrics::shared().ringDuplexEarlyComplete.fetch_add(1, std::memory_order_relaxed);
+			S2CTrace::line("DUPLEX_EARLY_PARENT_REPLY parent=%u upcall=%u target_tid=%lld",
+			               (unsigned)parentId, (unsigned)upcallId, (long long)nsid());
+			dserver_ring_duplex_publish_mmap_reply(cb, parentId, upcallId, 0, 0, address);
+		}
+	}
+
+	if (_activeCall && (unsigned)_activeCall->number() == (unsigned)dserver_callnum_mach_msg_overwrite) {
+		Metrics::shared().ringMachMsgDuplexS2cPublished.fetch_add(1, std::memory_order_relaxed);
+		S2CTrace::line("DUPLEX_MMAP_PUBLISH parent=%u upcall=%u addr=%llu len=%llu prot=%u flags=%u target_tid=%lld",
+			(unsigned)parentId, (unsigned)upcallId, (unsigned long long)address, (unsigned long long)length,
+			(unsigned)protection, (unsigned)flags, (long long)nsid());
+	}
+	ring->wakeGuest();
+	return true;
+};
+
 // perf #18 P8 D3: harvest a correlated duplex reply for this thread, if one is in flight + ready, and
 // COMPLETE the parent op. Called from the main-loop ring drain for every ring thread -- this is the
 // resume point that keeps the server wait SCOPED to the op (no dedicated waiter thread, no blocking of
 // the dserver). For the D3 synthetic sentinel, completion = publish the parent FINAL reply onto the
 // s2c ring (routing #8). Returns true iff it did work (harvest or reject). Takes _rwlock itself.
+bool DarlingServer::Thread::duplexInFlight() const {
+	std::shared_lock lock(_rwlock);
+	return _duplexUpcallInFlight;
+};
+
 bool DarlingServer::Thread::_drainDuplexReply() {
 	// Hot path: the overwhelming common case is no duplex in flight on this thread. Skip the _rwlock
 	// entirely with a single relaxed atomic load so the Lane-1 drain cost is unchanged (one load per
@@ -2242,6 +1674,12 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 			return false;
 		}
 		int mismatch = 0;
+		// M6: the drain by definition has an upcall IN FLIGHT, so this is the validation step of case C --
+		// a reply that is not for the current pair is case B (mismatch: reject, clear, keep waiting), and a
+		// reply that IS for the current pair is left for the accept path below. Passing `false` here would
+		// classify the legitimate reply as case A and destroy the transaction (measured: it turned the
+		// GREEN base RED with ring_duplex_s2c=0).
+		(void)_duplexScrubReplySlot(cb, true);
 		if (dserver_ring_duplex_reply_ready(cb, _duplexParentId, _duplexUpcallId, &mismatch)) {
 			// correlated reply: harvest it, consume the slot, clear the in-flight state.
 			_duplexReplyStatus = cb->duplex_reply_status;
@@ -2249,12 +1687,18 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 			int32_t replyErrno = cb->duplex_reply_errno;
 			_duplexReplyReady = true;
 			uint32_t realUpcallNum = _duplexRealUpcallNum;
+			_duplexRecordClosed(_duplexParentId, _duplexUpcallId); // M6: this identity is now CLOSED
 			dserver_ring_duplex_consume_reply(cb);
 			_duplexUpcallInFlight = false;
 			_duplexRealUpcallNum = 0;
 			_duplexUpcallDeadlineNs = 0; // perf #18 P8 D6: disarm the fail-closed deadline on success
 			_duplexInFlightFast.store(false, std::memory_order_release);
 			Metrics::shared().ringDuplexS2c.fetch_add(1, std::memory_order_relaxed);
+			if (_activeCall && (unsigned)_activeCall->number() == (unsigned)dserver_callnum_mach_msg_overwrite) {
+				Metrics::shared().ringMachMsgDuplexS2cConsumed.fetch_add(1, std::memory_order_relaxed);
+				S2CTrace::line("DUPLEX_COMPLETION_CONSUME parent=%u upcall=%u status=%d errno=%d",
+					(unsigned)_duplexParentId, (unsigned)_duplexUpcallId, (int)_duplexReplyStatus, (int)replyErrno);
+			}
 			if (_duplexSentinelSeq != 0) {
 				// D3 synthetic sentinel completion: stage the parent final reply (published below, lock
 				// dropped). The parent op's result IS the echo result the guest computed for the upcall.
@@ -2264,6 +1708,26 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 				finalResult = _duplexReplyArg;
 				finalCode = (_duplexReplyStatus == 0) ? 0 : -1;
 				_duplexSentinelSeq = 0;
+			} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_mmap) {
+				// ABI v6: the anonymous-mmap upcall completed. Synthesize the same
+				// dserver_s2c_reply_mmap_t the UDS path would deliver, so _s2cPerform's extraction +
+				// validation is byte-identical to UDS, then resume the parked fiber.
+				uint64_t mappedValue = cb->duplex_reply_value;
+				Message s2cReply(sizeof(dserver_s2c_reply_mmap_t), 0);
+				auto* r = reinterpret_cast<dserver_s2c_reply_mmap_t*>(s2cReply.data().data());
+				r->header.call_number = 0;
+				r->header.pid = 0;
+				r->header.tid = 0;
+				r->header.architecture = 0;
+				r->header.s2c_number = dserver_s2c_msgnum_mmap;
+				r->address = mappedValue;         // the address the guest's mmap(2) returned
+				r->errno_result = replyErrno;
+				if (_s2cReply) {
+					s2cLog.error() << *this << ": duplex mmap reply but an _s2cReply was already pending" << s2cLog.endLog;
+				} else {
+					_s2cReply = std::move(s2cReply);
+					resumeRealFiber = true;
+				}
 			} else if (realUpcallNum == (uint32_t)dserver_s2c_msgnum_munmap) {
 				// perf #18 P8 D5 (dar-1il.3.2.2) boot-scoped proof: a REAL caller-S2C munmap just completed
 				// over the duplex mailbox for a vm_deallocate proof parent. Count it + mark the sticky flag
@@ -2412,6 +1876,45 @@ bool DarlingServer::Thread::_drainDuplexReply() {
 	return true;
 };
 
+// perf#27 M6: record a closed identity FOR DIAGNOSTIC CLASSIFICATION ONLY (never a correctness input).
+void DarlingServer::Thread::_duplexRecordClosed(uint32_t parentId, uint32_t upcallId) {
+	_duplexClosedParent[_duplexClosedNext] = parentId;
+	_duplexClosedUpcall[_duplexClosedNext] = upcallId;
+	_duplexClosedNext = (_duplexClosedNext + 1) % kClosedHistory;
+}
+
+// The invariant scrubber. See the header for the three cases; this implements A and B (C is the caller's
+// accept path). Return value: true iff an invalid reply was found and cleared.
+bool DarlingServer::Thread::_duplexScrubReplySlot(dserver_ring_shm_t* cb, bool upcallInFlight) {
+	if (__atomic_load_n(&cb->duplex_reply_ready, __ATOMIC_ACQUIRE) == 0u) {
+		return false;
+	}
+	if (upcallInFlight && cb->duplex_reply_parent == _duplexParentId &&
+	    cb->duplex_reply_id == _duplexUpcallId) {
+		return false; // case C: valid for the CURRENT upcall -- leave it for the accept path
+	}
+	uint32_t rp = cb->duplex_reply_parent, ru = cb->duplex_reply_id;
+	if (upcallInFlight) {
+		// case B: someone else's reply. Clear it so it cannot be harvested later, and keep waiting.
+		Metrics::shared().ringDuplexReplyMismatchReject.fetch_add(1, std::memory_order_relaxed);
+		S2CTrace::line("DUPLEX_REPLY_MISMATCH_REJECT got_parent=%u got_upcall=%u want_parent=%u "
+		               "want_upcall=%u target_tid=%lld", (unsigned)rp, (unsigned)ru,
+		               (unsigned)_duplexParentId, (unsigned)_duplexUpcallId, (long long)nsid());
+	} else {
+		// case A: no upcall is in flight, so NO completion can be valid -- reject and clear
+		// unconditionally, independent of any history window.
+		Metrics::shared().ringDuplexCompletionReplayReject.fetch_add(1, std::memory_order_relaxed);
+		bool known = false;
+		for (unsigned i = 0; i < kClosedHistory; ++i) {
+			if (rp == _duplexClosedParent[i] && ru == _duplexClosedUpcall[i]) { known = true; break; }
+		}
+		S2CTrace::line("DUPLEX_COMPLETION_REPLAY_REJECT parent=%u upcall=%u recently_closed=%d target_tid=%lld",
+		               (unsigned)rp, (unsigned)ru, known ? 1 : 0, (long long)nsid());
+	}
+	dserver_ring_duplex_consume_reply(cb);
+	return true;
+}
+
 bool DarlingServer::Thread::drainDuplexReply() {
 	return _drainDuplexReply();
 };
@@ -2461,6 +1964,12 @@ bool DarlingServer::Thread::_s2cTryDuplexMunmapLocked(uint32_t s2cNumber, uint64
 	if (_duplexUpcallInFlight) {
 		return false;
 	}
+	// M6: this function has already established that NO upcall is in flight (the early return above), so a
+	// reply sitting in the slot now is unsolicited/stale by the invariant: reject and clear it before the
+	// cleanliness checks, so it can neither look "busy" nor be harvested later. NOTE the position -- this
+	// must come AFTER the in-flight early return, otherwise it would clear a reply that belongs to an upcall
+	// that IS in flight (measured: doing it earlier turned the GREEN base RED).
+	(void)_duplexScrubReplySlot(cb, false);
 	if (dserver_ring_duplex_upcall_available(cb)) {
 		return false;
 	}
@@ -2490,13 +1999,14 @@ bool DarlingServer::Thread::_s2cTryDuplexMunmapLocked(uint32_t s2cNumber, uint64
 	}
 
 	dserver_ring_duplex_publish_munmap_upcall(cb, parentId, upcallId, address, length);
+	if (_activeCall && (unsigned)_activeCall->number() == (unsigned)dserver_callnum_mach_msg_overwrite) {
+		Metrics::shared().ringMachMsgDuplexS2cPublished.fetch_add(1, std::memory_order_relaxed);
+		S2CTrace::line("DUPLEX_MUNMAP_PUBLISH parent=%u upcall=%u addr=%llu len=%llu target_tid=%lld",
+			(unsigned)parentId, (unsigned)upcallId, (unsigned long long)address, (unsigned long long)length,
+			(long long)nsid());
+	}
 	ring->wakeGuest();
 	return true;
-};
-
-void DarlingServer::Thread::setRingDuplexParentActive(bool active) {
-	std::unique_lock lock(_rwlock);
-	_ringDuplexParentActive = active;
 };
 
 // perf #18 P8 D5 (dar-1il.3.2.2) boot-scoped proof.
@@ -2535,6 +2045,18 @@ bool DarlingServer::Thread::duplexVmDeallocateCapable() const {
 	}
 	return ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE);
 };
+
+// perf#26 RING-MACH-MSG: may this thread carry a mach_msg_overwrite parent on its lane? True only when
+// the guest advertised the mach-msg duplex cap at attach, i.e. the guest will publish that op to the
+// ring and will pump the duplex mailbox while it waits for the reply.
+bool DarlingServer::Thread::duplexMachMsgCapable() const {
+	auto ring = _ring;
+	if (!ring) {
+		return false;
+	}
+	return ring->duplexCapable(DSERVER_RING_DUPLEX_CAP_MACH_MSG);
+};
+
 #endif // DSERVER_RING_TRANSPORT
 
 uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int protection, int flags, int fd, off_t offset, int& outErrno) {
@@ -2728,14 +2250,14 @@ void DarlingServer::Thread::syncMemory(uintptr_t address, size_t size, int sync_
 void DarlingServer::Thread::waitUntilRunning() {
 	std::shared_lock lock(_rwlock);
 	_runningCondvar.wait(lock, [&]() {
-		return _isRunningLocked();
+		return _execution.isRunning();
 	});
 };
 
 void DarlingServer::Thread::waitUntilNotRunning() {
 	std::shared_lock lock(_rwlock);
 	_runningCondvar.wait(lock, [&]() {
-		return !_isRunningLocked();
+		return !_execution.isRunning();
 	});
 };
 
@@ -2746,7 +2268,7 @@ void DarlingServer::Thread::_deferLocked(bool wait, std::unique_lock<std::shared
 
 	if (wait) {
 		_runningCondvar.wait(lock, [&]() {
-			return !_isRunningLocked();
+			return !_execution.isRunning();
 		});
 	}
 };
@@ -2787,57 +2309,83 @@ void DarlingServer::Thread::logToStream(Log::Stream& stream) const {
 // Consumes _ringReplyPending. _rwlock MUST be held by the caller. The reply Message data is
 // dserver_rpc_reply_<call>_t = {replyhdr{number,code}, body}; we carry the code + body bytes onto the
 // ring (the guest reconstructs the same body).
-bool DarlingServer::Thread::_publishReplyToRingLocked(Message& reply) {
-	if (!_ringReplyPending || !_ring) {
-		return false;
+bool DarlingServer::Thread::_publishReplyToRingContextLocked(const RingCallContext& ctx, Message& reply) {
+	// perf#30 DETACHED COMPLETION: the routing decision lives on the Call now (one implementation, two
+	// callers). A live thread keeps the same fallback it always had -- if the lane cannot take the reply,
+	// the datagram path must still run -- and the detached-Call caller makes the same choice.
+	if (Call::publishReplyToRingContext(ctx, reply)) {
+		return true;
 	}
-	_ringReplyPending = false;
-	const auto& bytes = reply.data();
-	if (bytes.size() < sizeof(dserver_rpc_replyhdr_t)) {
-		return false; // malformed (too short) -> caller UDS-falls-back
+	if (!ctx.ring) {
+		return false; // not a ring call at all: the caller uses the datagram path, no double-send
 	}
-	const dserver_rpc_replyhdr_t* rhdr = reinterpret_cast<const dserver_rpc_replyhdr_t*>(bytes.data());
-	const uint8_t* body = bytes.data() + sizeof(dserver_rpc_replyhdr_t);
-	uint32_t bodyLen = static_cast<uint32_t>(bytes.size() - sizeof(dserver_rpc_replyhdr_t));
-	auto ring = _ring; // keep alive across the publish
-	uint32_t seq = _ringReplySeq;
-	uint32_t callnum = static_cast<uint32_t>(rhdr->number);
-	int32_t code = rhdr->code;
-	// publish under the lock is fine (no suspend, no Server-state mutation); the FUTEX_WAKE is a
-	// bare syscall and likewise can't re-enter our locks.
-#ifdef DSERVER_RING_PHASE_PROF
-	uint64_t _pubT0 = Metrics::rdtscCycles();
-#endif
-	bool published = ring->publishReply(seq, callnum, code, body, bodyLen);
-#ifdef DSERVER_RING_PHASE_PROF
-	_ringPublishCycles = Metrics::rdtscCycles() - _pubT0; // read back by ringServiceThread
-#endif
-	if (!published) {
-		// s2c full: fall back to a UDS reply so the guest still gets its answer.
-		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
-		Server::sharedInstance().sendMessage(std::move(reply));
-	} else {
-		ring->wakeGuest();
-	}
+	// The lane could not take it (malformed reply, or s2c full): answer over UDS so the guest wakes.
+	Server::sharedInstance().sendMessage(std::move(reply));
 	return true;
-}
+};
 #endif
 
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
-	std::shared_ptr<Call> owedEnterReply = nullptr;
-	{
 	std::unique_lock lock(_rwlock);
 
-	// A0-ARCH stage 3: a reply from the interrupted call of an OPEN interrupt frame stashes
-	// on the frame (the guest flushes it at interrupt_exit) -- keyed on the durable frame
-	// fact, not the old transient _interruptedForSignal window, because the cancelled call
-	// now replies through the normal dispatch path AFTER interrupt_enter's processCall has
-	// completed. Computed BEFORE deactivation (which nulls the frame slot).
-	bool stashOnInterruptFrame = expectedCall && !_interrupts.empty()
-		&& _interrupts.top().interruptedCall.get() == expectedCall.get();
+	// perf#26 RING-MACH-MSG: transaction-scoped transport accounting for callnum 38. A reply on the
+	// lane and a reply on UDS are counted separately, so a lane-resident transaction must leave
+	// udsMachMsgReply at 0.
+	if (expectedCall && (unsigned)expectedCall->number() == (unsigned)dserver_callnum_mach_msg_overwrite) {
+		if (const auto* ctx = expectedCall->ringContext()) {
+			Metrics::shared().ringMachMsgFinal.fetch_add(1, std::memory_order_relaxed);
+			S2CTrace::line("RING_MACHMSG_REPLY lane=%llu seq=%u tid=%lld", (unsigned long long)(ctx->ring ? ctx->ring->debugLaneId() : 0), (unsigned)ctx->seq, (long long)nsid());
+		} else {
+			Metrics::shared().udsMachMsgReply.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if (_activeCall && (unsigned)_activeCall->number() == (unsigned)dserver_callnum_mach_msg_overwrite
+	    && _s2cUdsFallbackThisCall) {
+		Metrics::shared().udsMachMsgS2c.fetch_add(1, std::memory_order_relaxed);
+		_s2cUdsFallbackThisCall = false;
+	}
 
 	if (expectedCall) {
 		_deactivateCallLocked(expectedCall);
+	}
+
+	// perf#30 PROCESS-CONTROL PLANE: a reply-suppressed call has no transport waiting for it (its caller
+	// reads the answer from the management page), so nothing may be sent -- and in particular no stray
+	// datagram may reach a socket the caller is using for something else.
+	if (expectedCall && expectedCall->replySuppressed()) {
+		if (reply.data().size() >= sizeof(dserver_rpc_replyhdr_t)) {
+			auto* rh = reinterpret_cast<const dserver_rpc_replyhdr_t*>(reply.data().data());
+			const_cast<Call*>(expectedCall.get())->noteSuppressedReply(rh->code);
+			// perf#30 ATTACH_LANE: keep the BODY too -- the page route reports reject_reason and the
+			// descriptor token from here, since it has no datagram to read them from.
+			{
+				const size_t hdrSize = sizeof(dserver_rpc_replyhdr_t);
+				if (reply.data().size() > hdrSize) {
+					const_cast<Call*>(expectedCall.get())->noteSuppressedReplyBody(
+						reply.data().data() + hdrSize, reply.data().size() - hdrSize);
+				}
+			}
+		}
+		// perf#30 (doc section 227): the plane's answer is written HERE when the Call was dispatched instead of run
+		// inline. The stores mirror the handler's own completion exactly (reply_seq, reply_status, reply_state,
+		// request_state and the futex), including the section-195 rule that the request state's store races the
+		// publisher's RELEASE and the claim therefore accepts DONE as well.
+		if (expectedCall && expectedCall->planeCompletion().armed()) {
+			auto* page = reinterpret_cast<struct dserver_process_control*>(expectedCall->planeCompletion().page);
+			page->reply_seq = expectedCall->planeCompletion().seq;
+			page->reply_status = expectedCall->suppressedReplyCode();
+			__atomic_store_n(&page->reply_state, DSERVER_PROCESS_CONTROL_DONE, __ATOMIC_RELEASE);
+			__atomic_store_n(&page->request_state, DSERVER_PROCESS_CONTROL_DONE, __ATOMIC_RELEASE);
+			__atomic_store_n(&page->futex, expectedCall->planeCompletion().seq, __ATOMIC_RELEASE);
+			__atomic_fetch_add(&page->futex, 1u, __ATOMIC_RELEASE);
+			if (getenv("DARLING_SERVER_COURIER_LOG") != NULL) {
+				static DarlingServer::Log pdLog("process-control-deferred");
+				pdLog.error() << "plane-deferred-completion pid=" << expectedCall->planeCompletion().pid
+					<< " seq=" << expectedCall->planeCompletion().seq
+					<< " status=" << expectedCall->suppressedReplyCode() << pdLog.endLog;
+			}
+		}
+		return;
 	}
 
 	// A0 RPC TRACE: name the disposition of this reply. Four outcomes, keyed by tid/nsid so it lines up
@@ -2846,7 +2394,7 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 	// produces any REPLY-* line, names the stuck call + drop site. (call number from expectedCall.)
 	{
 		unsigned callnum = expectedCall ? (unsigned)expectedCall->number() : 0u;
-		const char* disp = stashOnInterruptFrame ? "STASH-SAVED[interrupt]"
+		const char* disp = _interruptedForSignal ? "STASH-SAVED[interrupt]"
 			: _deferReplyForS2C ? "STASH-DEFERRED[s2c]"
 			: _dead ? "DROP-DEAD"
 			: "SEND";
@@ -2854,58 +2402,50 @@ void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Me
 			id(), (long long)nsid(), callnum, disp);
 	}
 
-	if (stashOnInterruptFrame) {
+	if (_interruptedForSignal) {
 		if (_interrupts.top().savedReply) {
 			throw std::runtime_error("New reply would overwrite existing saved reply");
 		}
 
 		_interrupts.top().savedReply = std::move(reply);
-
-		// the interrupted call's reply is now safely stashed -- if interrupt_enter's reply
-		// was deferred on it, it goes out NOW (outside the lock below): exactly the guest
-		// ordering the old synchronous unwind provided, without borrowing any stack.
-		// enterCall stays IN the frame slot: its sendBasicReply re-enters pushCallReply,
-		// whose _deactivateCallLocked clears it from there.
-		if (_interrupts.top().replyOwed) {
-			_interrupts.top().replyOwed = false;
-			owedEnterReply = _interrupts.top().enterCall;
-		}
 	} else if (_deferReplyForS2C) {
 		// A ring-originated call that performs an S2C upcall defers its reply here; the flush in
 		// _s2cPerform() (NOT this path) republishes it -- and MUST honor _ringReplyPending or a
 		// ring-waiting guest wedges. We deliberately do NOT consume _ringReplyPending here so the
 		// flush still knows the reply belongs to the ring. (perf #18 P5-bulk / dar-1il.1)
 		_deferredReply = std::move(reply);
+		// The deferred reply must remember WHERE it was going: the Call's ring context (if it arrived
+		// over a lane). Without this the flush could only guess, and a ring-waiting guest would wedge.
+		if (expectedCall && expectedCall->ringContext()) {
+			_deferredRingContext = *expectedCall->ringContext();
+		} else {
+			_deferredRingContext = std::nullopt;
+		}
 	} else if (!_dead) {
 #ifdef DSERVER_RING_TRANSPORT
-		if (_publishReplyToRingLocked(reply)) {
-			DarlingServer::__rpctrace("SENT-RING htid=%d nstid=%lld", id(), (long long)nsid());
-			return;
+		// The reply's destination is the CALL's own transport context, not a Thread-global one-shot
+		// sink. That is what makes a blocking call correct: it may suspend inside doWork() and be
+		// replied to long after the dispatch scope ended, and the context travels with the Call.
+		if (expectedCall) {
+			if (const auto* ctx = expectedCall->ringContext()) {
+				if (_publishReplyToRingContextLocked(*ctx, reply)) {
+					DarlingServer::__rpctrace("SENT-RING htid=%d nstid=%lld", id(), (long long)nsid());
+					return;
+				}
+			}
 		}
 #endif
 		DarlingServer::__rpctrace("SENT-UDS htid=%d nstid=%lld", id(), (long long)nsid());
 		Server::sharedInstance().sendMessage(std::move(reply));
 	}
-	} // release _rwlock
-
-	if (owedEnterReply) {
-		try {
-			owedEnterReply->sendBasicReply(0);
-		} catch (const std::exception& ex) {
-			// only reachable under an RPC-stream desync that popped the frame between the
-			// unlock above and the re-lock inside sendBasicReply; survive loudly
-			microthreadLog.error() << _tid << "(" << _nstid
-				<< "): deferred interrupt_enter reply failed: " << ex.what() << microthreadLog.endLog;
-		}
-	}
 };
 
 bool DarlingServer::Thread::isCurrentlySuspended() const {
-	// perf #2b: read the same suspended view doWork()/suspend() maintain. A microthread
-	// that ran to completion inline never parked; one that blocked reads suspended
-	// (until a resume). Shared-lock is enough -- this is a single-field read.
+	// perf #2b: read the same _suspended flag doWork()/suspend() maintain. A microthread
+	// that ran to completion inline never set _suspended; one that blocked has it set
+	// (until a resume clears it). Shared-lock is enough -- this is a single-bool read.
 	std::shared_lock lock(_rwlock);
-	return _isSuspendedLocked();
+	return _suspended;
 };
 
 DarlingServer::Thread::RunState DarlingServer::Thread::getRunState() const {
@@ -2959,30 +2499,22 @@ void DarlingServer::Thread::sendSignal(int signal) const {
 	if (isDead()) {
 		return;
 	}
-	bool markedPending = false;
-	if (signal > 0 && signal < 32 && signal != SIGCHLD) {
-		std::unique_lock lock(_rwlock);
-		if (!_markCoalescedStandardSignalPendingLocked(_pendingStandardSignalMask, signal)) {
-			return;
-		}
-		markedPending = true;
-	}
 	if (_process) {
 		if (syscall(SYS_tgkill, _process->id(), id(), signal) < 0) {
 			int code = errno;
-			if (markedPending) {
-				std::unique_lock lock(_rwlock);
-				_pendingStandardSignalMask &= ~(1ull << signal);
-			}
 			throw std::system_error(code, std::generic_category());
 		}
 	} else {
-		if (markedPending) {
-			std::unique_lock lock(_rwlock);
-			_pendingStandardSignalMask &= ~(1ull << signal);
-		}
 		throw std::system_error(ESRCH, std::generic_category());
 	}
+};
+
+void DarlingServer::Thread::jumpToResume(void* stack, size_t stackSize) {
+#if DSERVER_ASAN
+	__sanitizer_start_switch_fiber(&asanOldFakeStack, stack, stackSize);
+#endif
+	setcontext(&_resumeContext);
+	__builtin_unreachable();
 };
 
 void DarlingServer::Thread::notifyDead() {
@@ -3005,7 +2537,6 @@ void DarlingServer::Thread::notifyDead() {
 
 		threadLog.info() << *this << ": thread dying" << threadLog.endLog;
 		_dead = true;
-		_mstateEventLocked(StateEvent::Note, "notify-dead");
 
 #ifdef DSERVER_RING_TRANSPORT
 		ringMonitorToRelease = std::move(_ringMonitor);
@@ -3019,7 +2550,6 @@ void DarlingServer::Thread::notifyDead() {
 			// so set `_terminating` to make sure that doesn't happen
 			_terminating = true;
 			canRelease = true;
-			_mstateTransitionLocked(MicroState::Terminated, "dead-no-active-call");
 		}
 	}
 
@@ -3044,9 +2574,7 @@ void DarlingServer::Thread::notifyDead() {
 	if (canRelease) {
 		_scheduleRelease();
 	} else {
-		// liveness abort: pop whatever park the dying thread is in, regardless of typed wait
-		// state -- doWork routes a dead thread into its terminating paths
-		wake(WakeKind::Abort, 0);
+		resume();
 	}
 
 	threadRegistry().unregisterEntry(shared_from_this());
@@ -3063,9 +2591,14 @@ void DarlingServer::Thread::attachRing(std::shared_ptr<RingBuffer> ring, std::sh
 	std::shared_ptr<Monitor> oldMonitor = nullptr;
 	{
 		std::unique_lock lock(_rwlock);
-		// a thread attaches at most once in practice, but replace defensively
+		// dyld and libsystem_kernel keep separate guest lane tables. Retire the
+		// previous mapping before replacing it so its image cannot publish to
+		// an unserviced lane when it next regains control.
 		oldRing = std::move(_ring);
 		oldMonitor = std::move(_ringMonitor);
+		if (oldRing) {
+			oldRing->setServerState(DSERVER_RING_SRV_RETIRED);
+		}
 		_ring = ring;
 		_ringMonitor = monitor;
 	}
@@ -3080,14 +2613,6 @@ std::shared_ptr<DarlingServer::RingBuffer> DarlingServer::Thread::ring() const {
 	return _ring;
 };
 
-void DarlingServer::Thread::beginRingReply(uint32_t seq) {
-	std::unique_lock lock(_rwlock);
-	_ringReplyPending = true;
-	_ringReplySeq = seq;
-	// perf #18 D9: latch that this call is ring-originated so the heatmap can attribute its transport
-	// at recordCall time (by then _ringReplyPending has been consumed by the reply publish).
-	_heatmapCallWasRing = true;
-};
 #ifdef DSERVER_RING_PHASE_PROF
 uint64_t DarlingServer::Thread::takeRingPublishCycles() {
 	// no lock: only the main loop touches this, in the same ringServiceThread call chain.
@@ -3129,36 +2654,21 @@ void DarlingServer::Thread::_scheduleRelease() {
 	});
 };
 
-bool DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
-	// A0-ARCH stage 3: interrupt as CANCELLATION. The old flow resumed the interrupted
-	// context synchronously on a borrowed stack (jumpToResume) and detoured its syscall
-	// return back here (_syscallReturnHereDuringInterrupt) -- the #114 stack-lifetime
-	// disease. Now: sigexc_enter finalizes the interrupted wait as THREAD_INTERRUPTED,
-	// which fires a typed Xnu wake; we ARM the frame and simply return. The enter fiber's
-	// doneWorking restores the frame's saved context into the live slots and reparks
-	// ("repark-interrupt-cancel"), and the pending wake dispatches the cancelled call
-	// through the NORMAL path -- its own fiber, its own stack. Our reply is deferred until
-	// that call's reply is stashed on the frame (pushCallReply sends it), which is the
-	// same guest-visible ordering the synchronous unwind provided. A raw-parked (non-TH_WAIT)
-	// interrupted context fires no wake here and just stays parked after the restore; its
-	// GENUINE wake eventually resumes it and the stash sends our reply then -- also exactly
-	// the old timing.
-	//
-	// perf#25a A0 (Part 3f): pin `self` -- sigexc_enter takes thread_lock (a dtape mutex
-	// whose contention raw-suspends this fiber, possibly migrating OS threads), so
-	// currentThreadVar must be re-asserted after it and never re-read.
+void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
+	// perf#25a A0 (Part 3f, replaces the old "FIXME: does not work if suspended waiting for a
+	// lock"): this function's fiber can SUSPEND mid-flight -- dtape_thread_sigexc_enter takes
+	// thread_lock (a dtape mutex whose contention raw-suspends the microthread), and the
+	// interrupted continuation resumed below can block again. When the fiber suspends, the OS
+	// thread's doneWorking clears the thread_local currentThreadVar; when the fiber resumes
+	// (possibly on a DIFFERENT OS thread: the main loop and the worker both run fibers), code
+	// here that re-reads currentThreadVar dereferences an empty shared_ptr (captured SIGSEGV:
+	// null + offsetof(_handlingInterruptedCall), cvstorm2 storm). Pin the thread in a local
+	// `self` at entry, use it throughout, and re-assert the TLS after every potentially
+	// suspending call so downstream TLS readers (dtape hooks) stay correct too.
 	std::shared_ptr<Thread> self = currentThreadVar;
 
 	{
 		std::unique_lock lock(self->_rwlock);
-
-		// A0-ARCH stage 1c: doWork pushes an InterruptContext for every InterruptEnter
-		// dispatch, so an empty stack here means a stray interrupt_exit popped it out from
-		// under us (RPC-stream desync). Bail out gracefully: reply 0, survive loudly.
-		if (self->_interrupts.empty()) {
-			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt_enter with EMPTY interrupt stack (desync); ignoring" << microthreadLog.endLog;
-			return true;
-		}
 
 		if (self->_pendingSavedReply) {
 			if (self->_interrupts.top().savedReply) {
@@ -3171,50 +2681,79 @@ bool DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 			// the interrupt stack and will flush at interrupt_exit (FLUSH-SAVED). Not sent here.
 			DarlingServer::__rpctrace("PENDINGSAVED->INTERRUPTTOP htid=%d nstid=%lld", self->id(), (long long)self->nsid());
 		}
+
+		self->_interruptedForSignal = true;
 	}
 
-	// Abort the interrupted wait (if any). clear_wait_internal -> thread_go -> thread_unblock
-	// writes wait_result = THREAD_INTERRUPTED and fires the typed Xnu wake -- which we KEEP
-	// (it is the dispatch vehicle for the cancellation unwind; the old flow dropped it
-	// because it resumed synchronously). A pending Raw wake likewise survives untouched.
 	dtape_thread_sigexc_enter(self->_dtapeThread);
 	currentThreadVar = self; // may have suspended+migrated inside (thread_lock contention)
 
-	// Push the fresh signal-handling user state. Note the order vs the old flow: this now
-	// runs BEFORE the interrupted call's unwind (which happens after we return) instead of
-	// after it. The unwind paths (wait-abort error paths replying to the guest) do not read
-	// the user-state stack, so the inversion is benign -- and the guest still only observes
-	// enter2's effect after our reply, which is ordered after the stashed unwind reply.
-	dtape_thread_sigexc_enter2(self->_dtapeThread);
+	// Extract the interrupted continuation into a LOCAL (fiber-stack) variable, not the old
+	// thread_local: a fiber that suspends and migrates OS threads keeps its stack but not the
+	// previous OS thread's TLS, and the syscall-return re-entry below must not read/clobber
+	// whatever unrelated value the current OS thread's TLS happens to hold. Locals assigned
+	// before getcontext() are restored consistently by the setcontext() re-entry.
+	std::function<void()> localInterruptedContinuation = nullptr;
+	{
+		std::unique_lock lock(self->_rwlock);
+		localInterruptedContinuation = self->_interruptedContinuation;
+		self->_interruptedContinuation = nullptr;
+	}
+
+	// perf#25a A0 (Part 3b): sigexc_enter's clear_wait_internal -> thread_go -> thread_unblock
+	// fires the dtape thread_resume hook, which mints a _resumePermit for this (currently
+	// _running) thread. The interrupt path resumes the interrupted continuation SYNCHRONOUSLY
+	// below (jumpToResume / interruptedContinuation), so that permit is already satisfied here.
+	// If left set, it goes stale: the thread's NEXT genuine wait (e.g. the guest's retried
+	// fork_wait_for_child) has its suspend() consume the stale permit and return immediately --
+	// a spurious wakeup with wait_result still THREAD_WAITING, which panics
+	// semaphore_convert_wait_result ("semaphore_block") and, in wait paths that tolerate it,
+	// silently corrupts the wait protocol. Any permit present at this point can only refer to
+	// resuming the interrupted context (doWork already consumed pre-existing permits at
+	// dispatch), so consuming it here is exact.
+	{
+		std::unique_lock lock(self->_rwlock);
+		self->_resumePermit = false;
+	}
+
+	self->_didSyscallReturnDuringInterrupt = false;
+	getcontext(&self->_syscallReturnHereDuringInterrupt);
+
+	// re-entered here either directly or via the interrupted call's syscall-return setcontext;
+	// in the latter case the executing OS thread's TLS is already self (the fiber only runs
+	// inside a doWork stint), but re-assert for the direct path after suspensions above.
 	currentThreadVar = self;
+
+	if (!self->_didSyscallReturnDuringInterrupt) {
+		if (localInterruptedContinuation) {
+			localInterruptedContinuation();
+		} else if (self->_interrupts.top().interruptedCall) {
+			self->_handlingInterruptedCall = true;
+			self->_pendingCallOverride = true;
+			self->jumpToResume(self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
+		}
+	} else if (self->_handlingInterruptedCall) {
+#if DSERVER_ASAN
+		const void* dummy;
+		size_t dummy2;
+		__sanitizer_finish_switch_fiber(nullptr, &dummy, &dummy2);
+#endif
+
+		self->_handlingInterruptedCall = false;
+		self->_pendingCallOverride = false;
+	}
 
 	{
 		std::unique_lock lock(self->_rwlock);
 
-		if (self->_interrupts.empty()) {
-			// A0-ARCH stage 1c: a stray interrupt_exit popped our frame while we were
-			// suspended in sigexc_enter (desync); nothing to arm, survive loudly.
-			microthreadLog.error() << self->_tid << "(" << self->_nstid << "): interrupt frame popped mid-interrupt_enter (desync); nothing to cancel" << microthreadLog.endLog;
-			return true;
+		if (self->_interrupts.top().savedStack.isValid()) {
+			stackPool.free(self->_interrupts.top().savedStack);
 		}
 
-		auto& frame = self->_interrupts.top();
-		bool hasSavedContext = frame.savedStack.isValid() || frame.savedContinuation;
-
-		if (frame.interruptedCall || hasSavedContext) {
-			// something is in flight: arm the restore (doneWorking reparks the saved context)
-			frame.cancellationArmed = true;
-			self->_mstateEventLocked(StateEvent::Note, "interrupt-cancel-armed", 0, self->_interrupts.size());
-		}
-
-		if (frame.interruptedCall) {
-			// our reply is owed at the moment the cancelled call's reply is stashed
-			frame.replyOwed = true;
-			frame.enterCall = self->_activeCall;
-			return false;
-		}
+		self->_interruptedForSignal = false;
+		self->_interrupts.top().interruptedCall = nullptr;
 	}
 
-	// nothing in-flight to cancel (fresh interrupt, e.g. the S2C signal path): reply now
-	return true;
+	dtape_thread_sigexc_enter2(self->_dtapeThread);
+	currentThreadVar = self;
 };

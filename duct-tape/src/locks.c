@@ -97,19 +97,11 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 		}
 
 		// lock not acquired; let's wait
-		// A0-ARCH stage 1: arm the raw wake token for THIS queuing before we become visible
-		// to dtape_mutex_unlock; the generation rides in the link so a stale wake (for a
-		// queuing we already abandoned via a signal-abort) is detectably stale.
-		thread->mutex_link.wake_gen = dtape_hooks->thread_arm_wake(thread->context, dtape_wake_kind_raw);
 		thread->mutex_link._dbg_queued = 1;
 		TAILQ_INSERT_TAIL(&mutex->dtape_queue_head, &thread->mutex_link, link);
 
 		// this call drops the lock
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, &mutex->dtape_queue_lock);
-
-		// woken (by the unlock handoff, or spuriously by an abort of an outer wait);
-		// this queuing episode is over either way -- disarm before re-evaluating.
-		dtape_hooks->thread_disarm_wake(thread->context, dtape_wake_kind_raw);
 	}
 };
 
@@ -171,7 +163,7 @@ void dtape_mutex_unlock(dtape_mutex_t* mutex) {
 	TAILQ_REMOVE(&mutex->dtape_queue_head, link, link);
 	link->_dbg_queued = 0;
 	dtape_thread_t* thread = __container_of(link, dtape_thread_t, mutex_link);
-	dtape_hooks->thread_resume(thread->context, dtape_wake_kind_raw, link->wake_gen);
+	dtape_hooks->thread_resume(thread->context);
 
 out:
 	libsimple_lock_unlock(&mutex->dtape_queue_lock);

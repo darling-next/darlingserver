@@ -70,6 +70,7 @@
  *	Exported message traps.  See mach/message.h.
  */
 
+#include <darlingserver/duct-tape/test-diagnostics.h>
 #include <mach/mach_types.h>
 #include <mach/kern_return.h>
 #include <mach/port.h>
@@ -204,6 +205,9 @@ mach_msg_send(
 	mach_msg_return_t mr;
 	mach_msg_size_t msg_and_trailer_size;
 	mach_msg_max_trailer_t  *trailer;
+
+	dtape_test_trace_msgq("send_enter", (unsigned long long)current_thread(), 0,
+		(unsigned long long)msg->msgh_remote_port, (unsigned int)msg->msgh_bits, (int)send_size);
 
 	option |= MACH_SEND_KERNEL;
 
@@ -464,8 +468,11 @@ mach_msg_receive(
 
 	mr = ipc_mqueue_copyin(space, rcv_name, &mqueue, &object);
 	if (mr != MACH_MSG_SUCCESS) {
+		dtape_test_trace_msgq("recv_copyin_fail", (unsigned long long)self, 0, rcv_name, (unsigned int)option, (int)mr);
 		return mr;
 	}
+	dtape_test_trace_msgq("recv_enter", (unsigned long long)self, (unsigned long long)mqueue, rcv_name,
+		(unsigned int)option, (int)rcv_timeout);
 	/* hold ref for object */
 
 	self->ith_msg_addr = CAST_DOWN(mach_vm_address_t, msg);
@@ -489,6 +496,10 @@ mach_msg_receive_continue(void)
 	mach_msg_return_t mr;
 	thread_t self = current_thread();
 
+	// The RESUME half: the only place that proves the parked receive was woken, and it prints the object the wait was
+	// armed on, so "woken and the message arrived" is distinguishable from "woken but restarted".
+	dtape_test_trace_msgq("recv_woken", (unsigned long long)self, (unsigned long long)self->ith_object,
+		(unsigned long long)self->ith_rsize, (unsigned int)self->ith_state, (int)self->ith_msize);
 	ipc_port_thread_group_unblocked();
 	if (self->ith_state == MACH_PEEK_READY) {
 		mr = MACH_PEEK_READY;
@@ -603,11 +614,30 @@ mach_msg_overwrite_trap(
 		self->ith_continuation = thread_syscall_return;
 		self->ith_knote = ITH_KNOTE_NULL;
 
+		// The real receive entry of this trap (the earlier attempt traced `mach_msg_receive`, which this path does not
+		// use -- MEASURED: recv_enter never appeared while recv_woken did, because the continuation here is
+		// thread_syscall_return and the wait is armed directly).
+		// perf#30 (doc section 241): ONE LINE PER ACTUAL PARK, not per receive. MEASURED: the per-event version is a file
+		// write per receive and that was enough to move the race this trace exists to observe (`basic 20` hangs in
+		// three runs of three without it, `basic 2` passes with it). A park happens only when the queue is empty, so
+		// the I/O cost drops to the number of real waits -- and the recorded run stays the measured run.
+		if (mqueue->imq_msgcount == 0) {
+			dtape_test_trace_msgq("trap_recv_park", (unsigned long long)self, (unsigned long long)mqueue, rcv_name,
+				(unsigned int)option, (int)msg_timeout);
+		}
+		// The PORT OBJECT behind the name. MEASURED need: the post path was proven not to lose wakes (every post that
+		// found a waiter woke it), so the remaining way a sender and a receiver can miss each other is that the SAME
+		// name denotes a different object for each of them. That is an identity comparison, and the object pointer is
+		// the only field that can answer it.
+		dtape_test_trace_msgq("trap_recv_object", (unsigned long long)self, (unsigned long long)mqueue,
+			(unsigned long long)object, (unsigned int)option, (int)rcv_name);
 		ipc_mqueue_receive(mqueue, option, rcv_size, msg_timeout, THREAD_ABORTSAFE);
 		if ((option & MACH_RCV_TIMEOUT) && msg_timeout == 0) {
 			thread_poll_yield(self);
 		}
 		mr = mach_msg_receive_results(NULL);
+		dtape_test_trace_msgq("trap_recv_done", (unsigned long long)self, (unsigned long long)mqueue, rcv_name,
+			(unsigned int)option, (int)mr);
 		goto end;
 	}
 

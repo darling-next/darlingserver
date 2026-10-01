@@ -1235,11 +1235,25 @@ task_self_trap(
  *		or other errors.
  */
 
+/*
+ *	Routine:	thread_self_trap_for [internal, R1]
+ *	Purpose:
+ *		Give a NAMED thread send rights for its own thread port, in ITS OWN task's space.
+ *
+ *	The trap below is the current-thread instance of the same semantics, and it is expressed through this
+ *	function so there is exactly ONE implementation. It exists because the process-management plane must be
+ *	able to return the guest thread's self port without running on that thread: the previous datagram-only
+ *	route was the last semantic packet on AF_UNIX (measured: 5 per boot, payload=16), and a plane service
+ *	that simply called the trap form would allocate a port for the SERVER's microthread instead.
+ *	Conditions:
+ *		Nothing locked; `thread` must be a live thread object.
+ *	Returns:
+ *		MACH_PORT_NULL if there are any resource failures.
+ */
 mach_port_name_t
-thread_self_trap(
-	__unused struct thread_self_trap_args *args)
+thread_self_trap_for(
+	thread_t thread)
 {
-	thread_t  thread = current_thread();
 	task_t task = thread->task;
 	ipc_port_t sright;
 	mach_port_name_t name;
@@ -1247,6 +1261,17 @@ thread_self_trap(
 	sright = retrieve_thread_self_fast(thread);
 	name = ipc_port_copyout_send(sright, task->itk_space);
 	return name;
+}
+
+mach_port_name_t
+thread_self_trap(
+	__unused struct thread_self_trap_args *args)
+{
+	thread_t thread = current_thread();
+	if (thread == THREAD_NULL) {
+		return MACH_PORT_NULL;
+	}
+	return thread_self_trap_for(thread);
 }
 
 /*

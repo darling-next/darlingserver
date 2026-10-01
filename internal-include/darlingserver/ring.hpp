@@ -35,10 +35,10 @@ namespace DarlingServer {
 	private:
 		void* _map = nullptr;     // the RW mapping of the guest memfd (size _size)
 		size_t _size = 0;
-		FD _eventfd;              // guest writes this to wake the server; the server reads to drain
 		dserver_ring_shm_t _cb;   // a server-owned COPY of the validated control block (never re-read from the page for layout)
+		uint64_t _debugLaneId = 0; // perf#26 diagnostic; assigned from a monotonic counter at construction
 
-		RingBuffer(void* map, size_t size, FD&& eventfd, const dserver_ring_shm_t& cb);
+		RingBuffer(void* map, size_t size, const dserver_ring_shm_t& cb);
 
 	public:
 		~RingBuffer();
@@ -56,9 +56,6 @@ namespace DarlingServer {
 		 * its own ring_fd (the generated Call dtor closes it as usual).
 		 */
 		static std::shared_ptr<RingBuffer> attach(int ring_fd, uint64_t claimed_size, int32_t scm_nsid, dserver_ring_reject_t* outReject);
-
-		/** The eventfd to register as a Readable Monitor; guest signals it to wake the server. */
-		int eventfd() const;
 
 		/** Accessors into the validated mapping (offsets came from the validated control block). */
 		const dserver_ring_shm_t& controlBlock() const;
@@ -85,9 +82,6 @@ namespace DarlingServer {
 		 * zero syscalls. Returns true if a FUTEX_WAKE was actually issued (for metrics/tests).
 		 */
 		bool wakeGuest();
-
-		/** Drain the wake eventfd (called from the Monitor callback so it stops re-firing). */
-		void drainWake();
 
 		/**
 		 * perf #18 P4: publish the server's current sleep state (DSERVER_RING_SRV_*) into the
@@ -116,6 +110,12 @@ namespace DarlingServer {
 		// A real op may take the duplex S2C path ONLY when this holds for its cap -- part of the
 		// conjunction guard (no duplex to a guest that never agreed to pump).
 		bool duplexCapable(uint32_t capBit) const;
+
+		// perf#26 RING-MACH-MSG: a monotonic, process-local identity for THIS attach. The guest's lane
+		// slot is recycled and its seq restarts, so (tid, seq) cannot name a transaction across a
+		// re-attach; the server-side lane id makes the attach lifecycle explicit in the trace. It is
+		// diagnostic only -- nothing in the protocol depends on it.
+		uint64_t debugLaneId() const { return _debugLaneId; }
 	};
 };
 

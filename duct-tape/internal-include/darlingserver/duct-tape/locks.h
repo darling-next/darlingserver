@@ -12,12 +12,6 @@ typedef struct dtape_mutex_link {
 	// the owning queue's lock. An insert that finds it already 1 is the double-insert (locks.c:151 corruption)
 	// caused by a signal-abort resuming a microthread mid-wait without dequeuing it. TEMPORARY probe.
 	volatile int _dbg_queued;
-	// A0-ARCH stage 1: the wake-token generation armed for THIS queuing of the link
-	// (dtape_hook_thread_arm_wake, kind=raw). Written by the waiter under the owning queue's
-	// lock just before insert; read by the waker at dequeue under the same lock, so a link
-	// abandoned by a signal-abort carries its ORIGINAL generation and the waker's wake for it
-	// is correctly detected as stale instead of popping an unrelated later wait.
-	uint64_t wake_gen;
 } dtape_mutex_link_t;
 
 typedef TAILQ_HEAD(dtape_mutex_head, dtape_mutex_link) dtape_mutex_head_t;
