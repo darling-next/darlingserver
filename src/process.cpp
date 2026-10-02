@@ -271,22 +271,26 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMainThread, bool isFork) {
 	std::unique_lock lock(_rwlock);
 
-	// The exec pipe can reach EOF before its monitor callback is dispatched.
-	// Resolve it before this Checkin decides whether to replace the old task;
-	// otherwise a later pthread Checkin can consume the delayed notification.
+	// Consume completion by listener identity before classifying this checkin.
+	// This preserves native-exec teardown and prevents a delayed callback from
+	// arming a later thread checkin or consuming a newer exec attempt.
 	auto completion = _execCompletion.poll();
 	if (completion == ExecCompletion::Result::Darling) {
-		_setPendingReplacement();
+		_traceExecCompletion();
 	} else if (completion == ExecCompletion::Result::Native) {
 		lock.unlock();
 		notifyDead();
 		return;
 	}
 
-	bool didExec = _pendingReplacement;
+	// Pipe notification order cannot turn a pthread or fork checkin into exec.
+	bool didExec = isMainThread && !isFork && _mainThreadCheckedIn;
+	if (isMainThread) {
+		_mainThreadCheckedIn = true;
+	}
 
 	if (didExec) {
 		// exec case
@@ -337,8 +341,8 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// notifyDead() for exactly this reason; do the same for the dtape work here.
 		//
 		// It is safe to drop the lock for this block: all other threads have been
-		// cleared (only mainThread remains in _threads), _pendingReplacement is still
-		// true, and the dtape handles being swapped (_dtapeTask, mainThread->_dtapeThread,
+		// cleared (only mainThread remains in _threads), and the dtape handles
+		// being swapped (_dtapeTask, mainThread->_dtapeThread,
 		// the semaphores) are not traversed by _rwlock readers -- readers consult
 		// _threads / _listeningKqchannels / _kqchannels / scalar fields, none of which
 		// we mutate while unlocked.
@@ -425,14 +429,17 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		}
 	}
 
-	_pendingReplacement = false;
-
 	lock.unlock();
 
 	if (didExec) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
-	} else {
+	} else if (isFork) {
+		// perf#25a A0 (Part 4): only a FORK checkin announces a child's arrival. Previously
+		// every checkin from the process (including pthread_create THREAD checkins) took this
+		// branch and raised the parent's fork-wait semaphore -- each spurious up is a stored
+		// wakeup that satisfies the parent's NEXT fork_wait_for_child immediately, detaching
+		// the semaphore count from real child arrivals under churn.
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
 			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
@@ -476,7 +483,7 @@ void DarlingServer::Process::notifyExecCompletion(const std::shared_ptr<FD>& lis
 	std::unique_lock lock(_rwlock);
 	auto completion = _execCompletion.poll(listener);
 	if (completion == ExecCompletion::Result::Darling) {
-		_setPendingReplacement();
+		_traceExecCompletion();
 	}
 	lock.unlock();
 
@@ -485,14 +492,12 @@ void DarlingServer::Process::notifyExecCompletion(const std::shared_ptr<FD>& lis
 	}
 };
 
-void DarlingServer::Process::_setPendingReplacement() {
-	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
+void DarlingServer::Process::_traceExecCompletion() {
+	processLog.info() << "Process " << id() << " (" << nsid() << ") completed Darling exec" << processLog.endLog;
 	TestDiagnostics::traceLine(
-		"process.pending_replacement pid=" + std::to_string(id()) +
+		"process.exec_completion pid=" + std::to_string(id()) +
 		" nsid=" + std::to_string(nsid())
 	);
-
-	_pendingReplacement = true;
 };
 
 void DarlingServer::Process::registerKqchan(std::shared_ptr<Kqchan> kqchan) {

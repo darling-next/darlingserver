@@ -5,13 +5,82 @@
 #include <darlingserver/logging.hpp>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <atomic>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <cstdarg>
 
 static DarlingServer::Log kqchanLog("kqchan");
 static DarlingServer::Log kqchanMachPortLog("kqchan:mach_port");
 static DarlingServer::Log kqchanProcLog("kqchan:proc");
 static std::atomic_uint64_t kqchanDebugIDCounter = 0;
+
+// A0 (perf#25a-hang) INSTRUMENTATION -- env-gated (DARLING_SERVER_AUXLOG=1) compact per-connection
+// trace of the SEQPACKET kqchan aux channel: the ONLY SEQPACKET channel between guest and server
+// (kqchan.cpp socketpair), which the per-fd HANG capture localized to (guest fd 14/39 hold a
+// stranded 12-byte notification while every guest thread is parked in a DGRAM RPC recvmsg). Goal:
+// name WHICH kqchan op strands and WHY the notification is never acked/drained under a fork storm.
+// Zero cost when the env is unset (single relaxed-load bool guard). Writes raw to stderr so it is
+// independent of DSERVER_LOG_LEVEL. NOT default-on; reverted before any non-instrumented build.
+static bool __auxlog_enabled() {
+	static std::atomic<int> cached{-1};
+	int v = cached.load(std::memory_order_relaxed);
+	if (v < 0) {
+		const char* e = getenv("DARLING_SERVER_AUXLOG");
+		v = (e && e[0] == '1') ? 1 : 0;
+		cached.store(v, std::memory_order_relaxed);
+	}
+	return v != 0;
+}
+
+// Open the aux-log file once. The server is a daemon (stderr may be detached), so we write to a
+// stable file under the prefix's log dir -- same convention as dserver.log. O_APPEND makes each
+// write() atomic across the server's threads.
+static int __auxlog_fd() {
+	static int fd = []() -> int {
+		if (!__auxlog_enabled()) {
+			return -1;
+		}
+		std::string path = DarlingServer::Server::sharedInstance().prefix() + "/private/var/log/dserver-auxlog.txt";
+		return open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	}();
+	return fd;
+}
+
+__attribute__((format(printf, 1, 2)))
+static void auxlog(const char* fmt, ...) {
+	if (!__auxlog_enabled()) {
+		return;
+	}
+	int fd = __auxlog_fd();
+	if (fd < 0) {
+		return;
+	}
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	char line[512];
+	int n = snprintf(line, sizeof(line), "[AUXLOG %ld.%06ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000);
+	va_list ap;
+	va_start(ap, fmt);
+	if (n >= 0 && (size_t)n < (int)sizeof(line)) {
+		int m = vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+		if (m >= 0) {
+			n += m;
+		}
+	}
+	va_end(ap);
+	if (n < 0 || (size_t)n >= sizeof(line)) {
+		n = sizeof(line) - 1;
+	}
+	line[n++] = '\n';
+	// single O_APPEND write() so lines from concurrent server threads never interleave mid-line
+	(void)!write(fd, line, n);
+}
 
 //
 // base class
@@ -85,6 +154,9 @@ int DarlingServer::Kqchan::setup() {
 		do {
 			self->_canSend = self->_outbox.sendMany(self->_socket->fd());
 		} while (self->_canSend && !self->_outbox.empty());
+		auxlog("outbox.flush(arrival) id=%llu socket_fd=%d canSend=%d outbox_empty=%d",
+			(unsigned long long)self->_debugID, self->_socket->fd(),
+			(int)self->_canSend, (int)self->_outbox.empty());
 	});
 
 	_monitor = std::make_shared<Monitor>(_socket, Monitor::Event::Readable | Monitor::Event::Writable | Monitor::Event::HangUp, true, false, [weakThis](std::shared_ptr<Monitor> monitor, Monitor::Event event) {
@@ -100,6 +172,9 @@ int DarlingServer::Kqchan::setup() {
 			// socket hangup (peer closed their socket)
 
 			kqchanLog.debug() << *self << ": Peer hung up their socket; cleaning up monitor and kqchan" << kqchanLog.endLog;
+
+			auxlog("socket HANGUP id=%llu socket_fd=%d outbox_empty=%d (guest closed the channel)",
+				(unsigned long long)self->_debugID, self->_socket->fd(), (int)self->_outbox.empty());
 
 			// stop monitoring the socket (we're not gonna get any more events out of it)
 			Server::sharedInstance().removeMonitor(monitor);
@@ -119,6 +194,9 @@ int DarlingServer::Kqchan::setup() {
 
 			kqchanLog.debug() << *self << ": socket has pending incoming messages" << kqchanLog.endLog;
 
+			auxlog("socket READABLE id=%llu socket_fd=%d (guest sent us a request; will receiveMany + process)",
+				(unsigned long long)self->_debugID, self->_socket->fd());
+
 			// receive them all
 			while (self->_inbox.receiveMany(self->_socket->fd()));
 
@@ -136,6 +214,9 @@ int DarlingServer::Kqchan::setup() {
 			do {
 				self->_canSend = self->_outbox.sendMany(self->_socket->fd());
 			} while (self->_canSend  && !self->_outbox.empty());
+			auxlog("socket WRITABLE id=%llu socket_fd=%d canSend=%d outbox_empty=%d (backpressure relieved)",
+				(unsigned long long)self->_debugID, self->_socket->fd(),
+				(int)self->_canSend, (int)self->_outbox.empty());
 		}
 	});
 
@@ -153,6 +234,24 @@ void DarlingServer::Kqchan::_sendNotification() {
 		// we've already sent our peer a notification that they haven't acknowledged yet;
 		// let's not send another and needlessly clog up the socket
 		kqchanLog.debug() << *this << ": earlier notification has not yet been acknowledged; not sending another notification" << kqchanLog.endLog;
+		auxlog("sendNotif GATED id=%llu socket_fd=%d (prior notification unacked; suppressed)",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1);
+		return;
+	}
+
+	// perf#25a-hang (A0): if notifications are currently deferred (a _read is in flight and will send
+	// its reply first, to keep channel messages in-order), DON'T consume _canSendNotification and DON'T
+	// stash a Message. Just record that a notification is owed. _sendDeferredNotification will re-drive
+	// _sendNotification once deferral clears, at which point it takes the real send path below. The old
+	// code consumed _canSendNotification here AND stashed into _deferredNotification; if the _read that
+	// was supposed to flush the stash had already run (the two are serialized only by _notificationMutex,
+	// not by program order across the split _mutex/_notificationMutex), the stash was orphaned and the
+	// gate stayed closed forever -> every future notification GATED -> guest never re-notified -> never
+	// acks -> deadlock (the brew fork-storm hang: id=259 stuck at canSendNotif=0 with a growing queue).
+	if (_deferNotification) {
+		_notificationRequestedWhileDeferred = true;
+		auxlog("sendNotif DEFER id=%llu socket_fd=%d (owed; will re-arm when deferral clears)",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1);
 		return;
 	}
 
@@ -168,25 +267,51 @@ void DarlingServer::Kqchan::_sendNotification() {
 	notification->header.pid = 0;
 	notification->header.tid = 0;
 
-	if (_deferNotification) {
-		_deferredNotification = std::move(msg);
-	} else {
-		lock.unlock(); // the outbox has its own lock
-		_outbox.push(std::move(msg));
-	}
+	auxlog("sendNotif PUSH  id=%llu socket_fd=%d count=%llu -> outbox (12B notification)",
+		(unsigned long long)_debugID, _socket ? _socket->fd() : -1,
+		(unsigned long long)_notificationCount);
+	lock.unlock(); // the outbox has its own lock
+	_outbox.push(std::move(msg));
 };
+
+bool DarlingServer::Kqchan::_hasPendingEvents() {
+	// base channels have no server-side event queue to inspect; the mach-port channel drives its own
+	// re-notification through _checkForEventsAsync after each read reply, so returning false here keeps
+	// its behavior unchanged. The proc channel overrides this to report a non-empty _events queue.
+	return false;
+}
 
 void DarlingServer::Kqchan::_sendDeferredNotification() {
 	std::unique_lock lock(_notificationMutex);
 
 	_deferNotification = false;
 
+	// perf#25a-hang (A0): deferral just cleared. Re-arm a notification if one was requested during the
+	// deferral, OR if the channel still has pending events (level-triggered: this recovers a notification
+	// that a defer/gate race would otherwise have dropped). We drop _notificationMutex before calling
+	// _sendNotification (which re-takes it) and before _hasPendingEvents (which takes _mutex) to avoid
+	// self-deadlock / lock-order inversion. A spurious notification is harmless by design: the guest
+	// reads, finds nothing, and drops the event (0xdead).
+	bool owed = _notificationRequestedWhileDeferred;
+	_notificationRequestedWhileDeferred = false;
+
+	// migrate any Message stashed by an older build's path (defensive; the new path never stashes)
 	if (_deferredNotification) {
 		Message notification(std::move(*_deferredNotification));
 		_deferredNotification = std::nullopt;
-
-		lock.unlock(); // the outbox has its own lock
+		auxlog("sendDeferred PUSH id=%llu socket_fd=%d -> outbox (12B legacy deferred notification)",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1);
+		lock.unlock();
 		_outbox.push(std::move(notification));
+		return;
+	}
+
+	lock.unlock();
+
+	if (owed || _hasPendingEvents()) {
+		auxlog("sendDeferred REARM id=%llu socket_fd=%d owed=%d (re-driving _sendNotification)",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1, (int)owed);
+		_sendNotification();
 	}
 };
 
@@ -476,6 +601,13 @@ int DarlingServer::Kqchan::Process::setup() {
 	int fd = Kqchan::setup();
 
 	{
+		auto lp = _process.lock();
+		auxlog("proc.setup id=%llu server_socket_fd=%d guest_gets_fd=%d listener_nsid=%d target_nspid=%d flags=0x%x",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1, fd,
+			lp ? (int)lp->nsid() : -1, (int)_nspid, (unsigned)_flags);
+	}
+
+	{
 		std::unique_lock lock(_mutex);
 		if (!_attached) {
 			targetProcess->registerListeningKqchan(shared_from_this());
@@ -558,6 +690,10 @@ void DarlingServer::Kqchan::Process::_read() {
 		// we can now send a notification again if we receive more data
 		std::unique_lock lock(_notificationMutex);
 		kqchanProcLog.debug() << *this << ": received acknowledgement (implicitly via read) for notification " << _notificationCount++ << "; notifications may now be sent" << kqchanProcLog.endLog;
+		auxlog("proc._read ACK id=%llu socket_fd=%d listener_nsid=%d target_nspid=%d notif#=%llu -> canSendNotif=1 deferNotif=1",
+			(unsigned long long)_debugID, _socket ? _socket->fd() : -1,
+			listeningProcess ? (int)listeningProcess->nsid() : -1, (int)_nspid,
+			(unsigned long long)_notificationCount);
 		_canSendNotification = true;
 
 		// see MachPort::_read() for why we defer notifications
@@ -643,6 +779,14 @@ void DarlingServer::Kqchan::Process::_read() {
 	_sendDeferredNotification();
 };
 
+bool DarlingServer::Kqchan::Process::_hasPendingEvents() {
+	// perf#25a-hang (A0): report whether the server still holds events the guest hasn't read. Takes
+	// _mutex (the event-queue lock). Used by _sendDeferredNotification to re-arm a notification when
+	// deferral clears, so a notification lost to a defer/gate race is always recovered.
+	std::unique_lock lock(_mutex);
+	return !_events.empty();
+}
+
 void DarlingServer::Kqchan::Process::_notify(uint32_t event, int64_t data) {
 	Event newEvent;
 
@@ -689,6 +833,15 @@ void DarlingServer::Kqchan::Process::_notify(uint32_t event, int64_t data) {
 	{
 		std::unique_lock lock(_mutex);
 		_events.push_back(std::move(newEvent));
+		auto lp = _process.lock();
+		auto tp = _targetProcess.lock();
+		auxlog("proc._notify   id=%llu listener_nsid=%d target_nspid=%d event=0x%x data=%lld events_queued=%zu socket_fd=%d canSendNotif=%d",
+			(unsigned long long)_debugID,
+			lp ? (int)lp->nsid() : -1,
+			(int)_nspid,
+			(unsigned)event, (long long)data, _events.size(),
+			_socket ? _socket->fd() : -1,
+			(int)_canSendNotification);
 		if (_socket) {
 			_sendNotification();
 		}

@@ -4,7 +4,8 @@
 #include <cassert>
 
 namespace DarlingServer {
-	// Caller serializes transitions with the thread's lock.
+	// Owns physical execution only; XNU wait state has its own lock and lifetime.
+	// Caller serializes transitions with the thread's C++ lock.
 	class MicrothreadExecution {
 		enum class State {
 			Idle,

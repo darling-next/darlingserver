@@ -26,7 +26,7 @@ def main():
     # The stat socket is in the ABSTRACT namespace (the server runs in a private mount
     # namespace; the net namespace is shared with the host, so an abstract name works
     # where a pathname socket would not). Abstract address = leading NUL + name.
-    name = "darlingserver-stat:" + os.path.abspath(prefix)
+    name = "darlingserver-stat:" + os.path.realpath(prefix)
     addr = "\0" + name
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
