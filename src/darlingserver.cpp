@@ -504,7 +504,15 @@ void spawnLaunchd(
 
 	// putenv("KQUEUE_DEBUG=1");
 
-	auto tmp = (std::string(prefix) + "/.darlingserver.sock");
+	char socketAnchor[64];
+	const char* socketPrefix = prefix;
+	if (DarlingServer::runtimeModeIsRootless(runtimeMode)) {
+		// The parent server owns this anchor; guest exec must not need to retain it.
+		snprintf(socketAnchor, sizeof(socketAnchor), "/proc/%d/fd/%d",
+			getppid(), prefixFD);
+		socketPrefix = socketAnchor;
+	}
+	auto tmp = (std::string(socketPrefix) + "/.darlingserver.sock");
 
 	const char* initPath = getenv("DSERVER_INIT");
 

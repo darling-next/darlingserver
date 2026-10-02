@@ -33,11 +33,6 @@
 #include <darlingserver/monitor.hpp>
 
 namespace DarlingServer {
-	// A0 (perf#25a-hang) per-tid RPC trace sink. Env-gated (DARLING_SERVER_AUXLOG=1), defined in call.cpp,
-	// shared with thread.cpp's reply-disposition sites. No-op when the env is unset. NOT default-on.
-	__attribute__((format(printf, 1, 2)))
-	void __rpctrace(const char* fmt, ...);
-
 	// NOTE: server instances MUST be created with `new` rather than as a normal local/stack variable
 	class Server {
 		friend class Monitor;
@@ -70,27 +65,6 @@ namespace DarlingServer {
 		std::vector<std::shared_ptr<Monitor>> _monitors;
 		std::vector<std::shared_ptr<Monitor>> _monitorsWaitingToDie;
 		std::mutex _monitorsLock;
-
-#ifdef DSERVER_RING_TRANSPORT
-		// perf #18 P4 (dar-dar6x4-perf-5dq.33): threads that own an attached ring. The main-loop
-		// pre-epoll spin phase walks these to drain requests without an eventfd doorbell (the
-		// hot path). weak_ptr so a dead thread's entry self-prunes. Guarded by its own mutex --
-		// register/unregister happen on the main loop (RingAttach) and on thread death.
-		std::vector<std::weak_ptr<Thread>> _ringThreads;
-		std::mutex _ringThreadsLock;
-
-		// Pre-epoll adaptive spin: drain every attached ring, publishing ACTIVE_POLLING while we
-		// do. Returns the total number of requests serviced this pass. Bounded by the caller's
-		// budget; never blocks. Defined in server.cpp.
-		uint32_t _drainRings();
-		// Publish a sleep state (DSERVER_RING_SRV_*) into every attached ring's control block.
-		void _setAllRingStates(uint32_t state);
-
-		// Spin-budget configuration, resolved once from DARLING_SERVER_SPIN_US / DARLING_SERVER_MODE.
-		uint64_t _ringSpinNs = 0;     // how long to busy-poll rings before arming epoll (0 == low-power)
-		bool _ringSpinResolved = false;
-		void _resolveRingSpinBudget();
-#endif
 
 		void _worker(std::shared_ptr<Thread> thread);
 
@@ -125,12 +99,6 @@ namespace DarlingServer {
 
 		void addMonitor(std::shared_ptr<Monitor> monitor);
 		void removeMonitor(std::shared_ptr<Monitor> monitor);
-
-#ifdef DSERVER_RING_TRANSPORT
-		// perf #18 P4: (un)register a ring-owning thread for the main-loop spin phase.
-		void registerRingThread(std::shared_ptr<Thread> thread);
-		void unregisterRingThread(std::shared_ptr<Thread> thread);
-#endif
 
 		void sendMessage(Message&& message);
 	};

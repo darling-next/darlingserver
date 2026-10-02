@@ -29,6 +29,7 @@
 #include <unordered_set>
 
 #include <darlingserver/fork-checkin.hpp>
+#include <darlingserver/exec-completion.hpp>
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/utility.hpp>
 #include <darlingserver/kqchan.hpp>
@@ -96,11 +97,7 @@ namespace DarlingServer {
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
 		bool _pendingReplacement = false;
-	// perf#25a A0 (Part 4): whether this process's MAIN thread has completed a checkin.
-	// A main-thread re-checkin (that is not a fork checkin) is definitionally an exec
-	// replacement; keying didExec off this makes the decision independent of the
-	// exec-listener-pipe event's arrival timing (see notifyCheckin).
-	bool _mainThreadCheckedIn = false;
+		ExecCompletion _execCompletion;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -111,16 +108,6 @@ namespace DarlingServer {
 		bool _dead = false;
 		std::shared_ptr<Process> _selfReference = nullptr;
 		std::vector<uint32_t> _groups;
-
-		// perf #18 D15a (dar-1il.10): ring-attach TIMELINE recon (default-OFF; only WRITTEN when the
-		// attach-census env hatch is armed, but the stores are trivial atomics so there is no hot-path
-		// branch otherwise). The guest attaches its ring LAZILY on its first eligible op, so a process
-		// runs a burst of UDS calls before the ring exists; this measures that pre-attach window so D15
-		// can decide whether to move attach earlier. _udsCallOrdinal counts UDS calls seen for this
-		// process (incremented at callFromMessage); _ringAttachedAtOrdinal latches the ordinal at which
-		// ring_attach SUCCEEDED (0 = not yet attached). A UDS call arriving while ==0 is "pre-attach".
-		std::atomic<uint64_t> _udsCallOrdinal {0};
-		std::atomic<uint64_t> _ringAttachedAtOrdinal {0};
 
 #if DSERVER_EXTENDED_DEBUG
 		std::unordered_map<uint32_t, uintptr_t> _registeredNames;
@@ -148,6 +135,7 @@ namespace DarlingServer {
 		void _dispose();
 
 		void _setEternalID(EternalID eid);
+		void _setPendingReplacement(); // requires _rwlock
 
 	public:
 		using ID = pid_t;
@@ -187,8 +175,9 @@ namespace DarlingServer {
 		bool readMemory(uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode = nullptr) const;
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;
 
-		void notifyCheckin(Architecture architecture, bool isMainThread, bool isFork);
-		void setPendingReplacement();
+		void notifyCheckin(Architecture architecture);
+		void beginExec(std::shared_ptr<FD> listener, bool executingMachO);
+		void notifyExecCompletion(const std::shared_ptr<FD>& listener);
 
 		void registerKqchan(std::shared_ptr<Kqchan> kqchan);
 		void unregisterKqchan(std::shared_ptr<Kqchan> kqchan);
@@ -231,19 +220,6 @@ namespace DarlingServer {
 
 		std::vector<uint32_t> groups() const;
 		void setGroups(const std::vector<uint32_t>& groups);
-
-		// perf #18 D15a (dar-1il.10): ring-attach timeline recon accessors (cheap atomics).
-		// nextUdsCallOrdinal() returns this process's 1-based UDS-call sequence number (post-increment),
-		// used to position pre-attach calls. markRingAttachedAtOrdinal() latches the ordinal at which
-		// ring_attach succeeded (first-writer-wins). ringAttachedYet() is true once attach has latched.
-		uint64_t nextUdsCallOrdinal() { return _udsCallOrdinal.fetch_add(1, std::memory_order_relaxed) + 1; }
-		uint64_t currentUdsCallOrdinal() const { return _udsCallOrdinal.load(std::memory_order_relaxed); }
-		void markRingAttachedAtOrdinal(uint64_t ordinal) {
-			uint64_t expected = 0;
-			_ringAttachedAtOrdinal.compare_exchange_strong(expected, ordinal, std::memory_order_relaxed);
-		}
-		bool ringAttachedYet() const { return _ringAttachedAtOrdinal.load(std::memory_order_relaxed) != 0; }
-		uint64_t ringAttachedAtOrdinal() const { return _ringAttachedAtOrdinal.load(std::memory_order_relaxed); }
 	};
 };
 

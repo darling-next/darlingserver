@@ -632,8 +632,7 @@ semaphore_convert_wait_result(int wait_result)
 		return KERN_TERMINATED;
 
 	default:
-		panic("semaphore_block wr=%d tid=%llu\n", wait_result,
-		    current_thread() ? (unsigned long long)current_thread()->thread_id : 0ULL);
+		panic("semaphore_block\n");
 		return KERN_FAILURE;
 	}
 }

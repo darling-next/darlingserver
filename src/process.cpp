@@ -271,33 +271,22 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMainThread, bool isFork) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	std::unique_lock lock(_rwlock);
 
-	// perf#25a A0 (Part 4): decide exec-vs-fork from WHO is checking in, not from the racy
-	// _pendingReplacement flag alone. The flag is armed by the exec-listener pipe's EOF, an
-	// epoll event whose delivery order against the post-exec checkin RPC is not guaranteed:
-	// under brew's exec churn the pipe event can land AFTER the new image's main checkin was
-	// already processed, leaving the flag armed with no exec in flight. The NEXT checkin from
-	// that process is then a pthread_create THREAD checkin, and treating it as a replacement
-	// runs the thread sweep below -- which kills the very thread that is checking in, so its
-	// checkin reply is dropped (REPLY-DISP disp=DROP-DEAD on the RPC tape) and the guest thread
-	// waits forever in recvmsg: the captured `brew reinstall wget` freeze at the openssl@3
-	// build (ruby cc-shim leaf, no zombies). The timing-independent rule: an exec replacement
-	// is exactly a MAIN-thread re-checkin that is not a fork checkin -- after execve the kernel
-	// killed every other thread and the main thread checks in again from the new image; no
-	// other event has that shape. Thread checkins can never sweep.
-	bool didExec = isMainThread && !isFork && _mainThreadCheckedIn;
-
-	if (isMainThread) {
-		_mainThreadCheckedIn = true;
+	// The exec pipe can reach EOF before its monitor callback is dispatched.
+	// Resolve it before this Checkin decides whether to replace the old task;
+	// otherwise a later pthread Checkin can consume the delayed notification.
+	auto completion = _execCompletion.poll();
+	if (completion == ExecCompletion::Result::Darling) {
+		_setPendingReplacement();
+	} else if (completion == ExecCompletion::Result::Native) {
+		lock.unlock();
+		notifyDead();
+		return;
 	}
 
-	if (_pendingReplacement && !didExec && !isMainThread) {
-		// stale arm from a late pipe event (the matching exec checkin already ran); clear it
-		// below like every checkin does, and note it for the log.
-		processLog.info() << *this << ": clearing stale pending-replacement on a non-main checkin" << processLog.endLog;
-	}
+	bool didExec = _pendingReplacement;
 
 	if (didExec) {
 		// exec case
@@ -443,12 +432,7 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMai
 	if (didExec) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
-	} else if (isFork) {
-		// perf#25a A0 (Part 4): only a FORK checkin announces a child's arrival. Previously
-		// every checkin from the process (including pthread_create THREAD checkins) took this
-		// branch and raised the parent's fork-wait semaphore -- each spurious up is a stored
-		// wakeup that satisfies the parent's NEXT fork_wait_for_child immediately, detaching
-		// the semaphore count from real child arrivals under churn.
+	} else {
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
 			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
@@ -483,9 +467,25 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMai
 	}
 };
 
-void DarlingServer::Process::setPendingReplacement() {
+void DarlingServer::Process::beginExec(std::shared_ptr<FD> listener, bool executingMachO) {
 	std::unique_lock lock(_rwlock);
+	_execCompletion.begin(std::move(listener), executingMachO);
+};
 
+void DarlingServer::Process::notifyExecCompletion(const std::shared_ptr<FD>& listener) {
+	std::unique_lock lock(_rwlock);
+	auto completion = _execCompletion.poll(listener);
+	if (completion == ExecCompletion::Result::Darling) {
+		_setPendingReplacement();
+	}
+	lock.unlock();
+
+	if (completion == ExecCompletion::Result::Native) {
+		notifyDead();
+	}
+};
+
+void DarlingServer::Process::_setPendingReplacement() {
 	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
 	TestDiagnostics::traceLine(
 		"process.pending_replacement pid=" + std::to_string(id()) +
