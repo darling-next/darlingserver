@@ -22,6 +22,7 @@
 #include <darlingserver/rpc-error-reply.hpp>
 #include <darlingserver/push-reply-sync-pipe.hpp>
 #include <darlingserver/server.hpp>
+#include <darlingserver/process-identity.hpp>
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstring>
@@ -33,6 +34,7 @@
 #include <darlingserver/test-diagnostics.hpp>
 #include <sys/fcntl.h>
 #include <sys/syscall.h>
+#include <darlingserver/s2c-trace.hpp>
 #include <darlingserver/kqchan.hpp>
 #include <system_error>
 #include <cerrno>
@@ -133,32 +135,36 @@ bool DarlingServer::Call::ringEligibleCallnum(uint32_t callNumber) {
 #endif
 }
 
-std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Message&& requestMessage) {
-	if (requestMessage.data().size() < sizeof(dserver_rpc_callhdr_t)) {
-		throw std::invalid_argument("Message buffer was too small for call header");
-	}
 
-	dserver_rpc_callhdr_t* header = reinterpret_cast<dserver_rpc_callhdr_t*>(requestMessage.data().data());
-	std::shared_ptr<Call> result = nullptr;
+// perf#30 (doc section 219): THE REGISTRATION AND ARMING BLOCK, reachable WITHOUT building a Call.
+//
+// MEASURED (section 218/219): the management plane must be able to service a checkin when no guest thread can execute
+// anything -- that is the plane's whole purpose -- and a handler that instead built a Call and dispatched its work
+// onto a guest thread held the plane's single slot while waiting for a thread that was itself waiting on the plane.
+// Substituting only `Checkin::processCall`'s tail for `doWork()` was tried and MEASURED WRONG: the failure moved from
+// the dyld-info write to the executable-path write, because the ingest block below does much more than the Call's own
+// body -- it takes the lifetime descriptor out of the message, builds and arms the Process and the Thread, registers
+// the thread with the process, and records the message address. So the block itself is what both routes must share,
+// which is what this function is.
+std::pair<std::shared_ptr<DarlingServer::Process>, std::shared_ptr<DarlingServer::Thread>>
+DarlingServer::Call::registerPeerForMessage(Message& requestMessage, dserver_rpc_callhdr_t* header, bool replyErrors,
+	std::shared_ptr<Process> reuseProcess) {
 	std::shared_ptr<Process> process = nullptr;
 	std::shared_ptr<Thread> thread = nullptr;
 
-	// first, make sure we know this call number
-	switch (header->number) {
-		case dserver_callnum_s2c:
-		case dserver_callnum_push_reply:
-		DSERVER_VALID_CALLNUM_CASES
-			break;
-
-		default:
-			throw std::invalid_argument("Invalid call number");
-	}
-
-	if ((header->number & DSERVER_CALL_UNMANAGED_FLAG) == 0) {
 		const auto namespaceID = Server::sharedInstance().namespaceIDForPeer(requestMessage.pid(), header->pid);
 
 		// Now look up (and possibly create) the process and thread making this call.
-		process = processRegistry().registerIfAbsent(namespaceID, [&]() {
+		// perf#30 PROCESS-CONTROL PLANE: the side-by-side trace, so the RPC checkin and the plane's
+		// synthesized one can be compared action for action.
+		const bool traceCheckin = (getenv("DARLING_SERVER_COURIER_LOG") != NULL);
+
+		// perf#30 (doc section 222): THE PLANE HAS NO PEER SOCKET, so `namespaceIDForPeer` is not its identity -- and MEASURED
+	// the consequence: with it, the plane's registration created a Mach object that `ipc_port_destroy + 0x3c` could not
+	// tear down. A caller that already knows the process (the plane's region belongs to it) passes it here, and then the
+	// process is REUSED rather than reconstructed under a guessed namespace. The datagram path passes nothing and keeps
+	// its own derivation exactly as before.
+	process = reuseProcess ? reuseProcess : processRegistry().registerIfAbsent(namespaceID, [&]() {
 			std::shared_ptr<Process> tmp = nullptr;
 
 			if (TestDiagnostics::consumeFault("ingest.process_register_fail")) {
@@ -166,6 +172,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			}
 
 			int lifetimePipe = -1;
+
 
 			if (header->number == dserver_callnum_checkin) {
 				auto checkinCall = reinterpret_cast<dserver_rpc_call_checkin_t*>(header);
@@ -175,7 +182,27 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 				}
 			}
 
+			if (traceCheckin) {
+				static DarlingServer::Log traceLog("checkin-trace");
+				traceLog.error() << "rpc-register-process pid=" << requestMessage.pid()
+					<< " nsid=" << namespaceID << " lifetime_pipe=" << lifetimePipe
+					<< " header_pid=" << header->pid << traceLog.endLog;
+			}
 			try {
+				/* PROCESS-REGISTRATION RECORD, UNCONDITIONAL. The checkin and lane-attach records showed that the early-hang
+				 * runs never register a THREAD; this record one step earlier says whether the PROCESS itself was ever
+				 * created for that pid -- 'registered, then nothing' and 'never registered' are different failures with
+				 * different owners (guest startup vs server ingress). Plain write(2,...), bounded. */
+				{
+					static unsigned g_srv_proc_records = 0;
+					unsigned n = __atomic_fetch_add(&g_srv_proc_records, 1, __ATOMIC_RELAXED);
+					if (n < 32) {
+						char b[160];
+						int l = snprintf(b, sizeof(b), "[srv-process-register #%u pid=%d callnum=%u nsid=%d]\n",
+							n, (int)requestMessage.pid(), (unsigned)header->number, (int)namespaceID);
+						if (l > 0) { (void)!write(2, b, (size_t)l); }
+					}
+				}
 				tmp = std::make_shared<Process>(requestMessage.pid(), namespaceID, static_cast<Process::Architecture>(header->architecture), lifetimePipe);
 			} catch (std::system_error e) {
 				return tmp;
@@ -202,8 +229,8 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			// Don't drop silently: the guest thread is parked in recvmsg waiting for a
 			// reply, and dropping leaves it hung forever (-> SEGV under a fork/signal
 			// storm). Reply -ESRCH so the guest syscall returns. (dar-gwn.6.2)
-			sendErrorReplyFromHeader(header, requestMessage.address(), -ESRCH);
-			return nullptr;
+			if (replyErrors) { sendErrorReplyFromHeader(header, requestMessage.address(), -ESRCH); }
+			return { nullptr, nullptr };
 		}
 
 		thread = threadRegistry().registerIfAbsent(header->tid, [&]() {
@@ -214,6 +241,12 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			}
 
 			void* stackHint = nullptr;
+
+			if (traceCheckin) {
+				static DarlingServer::Log traceLog("checkin-trace");
+				traceLog.error() << "rpc-register-thread tid=" << header->tid
+					<< " number=" << header->number << traceLog.endLog;
+			}
 
 			if (header->number == dserver_callnum_checkin) {
 				auto checkinCall = reinterpret_cast<dserver_rpc_call_checkin_t*>(header);
@@ -231,14 +264,47 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			return tmp;
 		});
 
+		/* REGISTRATION RECORD, OUTSIDE THE 'if absent' LAMBDA. MEASURED: placed inside it, this never fired --
+
+		 * a thread the loader created for a guest pthread is ALREADY in the registry by the time the checkin
+
+		 * arrives, so the lambda is skipped. The point of the record is the identity link between the guest's own
+
+		 * host tid (what the fault witness prints) and the server's view of that thread, so it belongs where every
+
+		 * checkin passes, and it is filtered to the checkin callnum to stay quiet. */
+
+		if (header->number == dserver_callnum_checkin) {
+
+			static unsigned g_srv_reg_records = 0;
+
+			unsigned n = __atomic_fetch_add(&g_srv_reg_records, 1, __ATOMIC_RELAXED);
+
+			if (n < 64) {
+
+				char b[160];
+
+				int l = snprintf(b, sizeof(b),
+
+					"[srv-checkin pid=%d tid=%d present_before=%d]\n",
+
+					n, (int)requestMessage.pid(), (int)header->tid, (int)(thread != nullptr));
+
+				if (l > 0) { (void)!write(2, b, (size_t)l); }
+
+			}
+
+		}
+
+
 		if (!thread) {
 			callLog.error() << "Received call from non-existent thread (number "
 				<< header->number << "); replying -ESRCH instead of dropping" << callLog.endLog;
 
 			// Same as the non-existent-process case: reply -ESRCH so the parked guest
 			// thread's recvmsg returns instead of hanging forever. (dar-gwn.6.2)
-			sendErrorReplyFromHeader(header, requestMessage.address(), -ESRCH);
-			return nullptr;
+			if (replyErrors) { sendErrorReplyFromHeader(header, requestMessage.address(), -ESRCH); }
+			return { nullptr, nullptr };
 		}
 
 		thread->setAddress(requestMessage.address());
@@ -246,7 +312,40 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		if (process->id() != requestMessage.pid()) {
 			throw std::runtime_error("System-reported message PID != darlingserver-recorded PID");
 		}
+	return { process, thread };
+}
+
+std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Message&& requestMessage) {
+	if (requestMessage.data().size() < sizeof(dserver_rpc_callhdr_t)) {
+		throw std::invalid_argument("Message buffer was too small for call header");
 	}
+
+	dserver_rpc_callhdr_t* header = reinterpret_cast<dserver_rpc_callhdr_t*>(requestMessage.data().data());
+	std::shared_ptr<Call> result = nullptr;
+	std::shared_ptr<Process> process = nullptr;
+	std::shared_ptr<Thread> thread = nullptr;
+
+	// first, make sure we know this call number
+	switch (header->number) {
+		case dserver_callnum_s2c:
+		case dserver_callnum_push_reply:
+		DSERVER_VALID_CALLNUM_CASES
+			break;
+
+		default:
+			throw std::invalid_argument("Invalid call number");
+	}
+
+	if ((header->number & DSERVER_CALL_UNMANAGED_FLAG) == 0) {
+		// perf#30 (doc section 219): the SAME block the plane calls, so the two routes cannot drift apart.
+		auto registered = registerPeerForMessage(requestMessage, header, true, nullptr);
+		process = registered.first;
+		thread = registered.second;
+		if (!process || !thread) {
+			return nullptr;
+		}
+	}
+
 
 	auto pidString = (process) ? (std::to_string(process->id()) + " (" + std::to_string(process->nsid()) + ")") : (std::to_string(header->pid) + " (-1)");
 	auto tidString = (thread) ? (std::to_string(thread->id()) + " (" + std::to_string(thread->nsid()) + ")") : (std::to_string(header->tid) + " (-1)");
@@ -525,6 +624,52 @@ bool DarlingServer::Call::isBSDTrap() const {
 	return false;
 };
 
+bool DarlingServer::Call::publishReplyToRingContext(const RingCallContext& ctx, Message& reply) {
+#ifdef DSERVER_RING_TRANSPORT
+	if (!ctx.ring) {
+		return false;
+	}
+	const auto& bytes = reply.data();
+	if (bytes.size() < sizeof(dserver_rpc_replyhdr_t)) {
+		return false; // malformed (too short) -> caller UDS-falls-back
+	}
+	const dserver_rpc_replyhdr_t* rhdr = reinterpret_cast<const dserver_rpc_replyhdr_t*>(bytes.data());
+	const uint8_t* body = bytes.data() + sizeof(dserver_rpc_replyhdr_t);
+	uint32_t bodyLen = static_cast<uint32_t>(bytes.size() - sizeof(dserver_rpc_replyhdr_t));
+	// The context's OWN reference: the lane incarnation that carried the request outlives the call.
+	auto ring = ctx.ring;
+	if (!ring->publishReply(ctx.seq, static_cast<uint32_t>(rhdr->number), rhdr->code, body, bodyLen)) {
+		// s2c full: fall back to a UDS reply so the guest still gets its answer.
+		Metrics::shared().ringS2cFull.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	ring->wakeGuest();
+	return true;
+#else
+	(void)ctx;
+	(void)reply;
+	return false;
+#endif
+};
+
+uint64_t DarlingServer::Call::sendFdCourierToGuest(pid_t pid, uint32_t kind, int fd) {
+	return Server::sharedInstance().sendFdCourierBundleToGuest(pid, kind, fd);
+}
+
+void DarlingServer::Call::publishFinalReply(Message&& reply) {
+#ifdef DSERVER_RING_TRANSPORT
+	// The Call's own route first: a detached call still owns where its answer goes.
+	if (const auto* ctx = ringContext()) {
+		if (publishReplyToRingContext(*ctx, reply)) {
+			DarlingServer::__rpctrace("SENT-RING-DETACHED call=%u", (unsigned)number());
+			return;
+		}
+	}
+#endif
+	DarlingServer::__rpctrace("SENT-FALLBACK-DETACHED call=%u", (unsigned)number());
+	Server::sharedInstance().sendMessage(std::move(reply));
+};
+
 void DarlingServer::Call::sendReply(Message&& reply) {
 	// A0 RPC TRACE: the non-pushCallReply reply funnel -- thread-expired fallback (generated _sendReply
 	// when _thread.lock() fails), error replies (sendErrorReplyFromHeader), and the push_reply
@@ -585,7 +730,48 @@ void DarlingServer::Call::sendErrorReplyFromHeader(const dserver_rpc_callhdr_t* 
  */
 
 void DarlingServer::Call::Checkin::processCall() {
+	/* UNCONDITIONAL CHECKIN RECORD. MEASURED NEED: the server's own checkin attribution exists but is gated by
+	 * DARLING_SERVER_COURIER_LOG, and this stage measured that a server-side environment variable is not reliably
+	 * present (the gated S2C trace produced nothing where an unconditional write did). The question this answers is
+	 * whether the workload's guest threads check in by this path at all, and with which tid -- the same tid the
+	 * loader's fault witness prints. Plain write(2,...), bounded. */
+	{
+		static unsigned g_srv_checkin_records = 0;
+		unsigned n = __atomic_fetch_add(&g_srv_checkin_records, 1, __ATOMIC_RELAXED);
+		if (n < 64) {
+			void* pcPage = DarlingServer::Server::sharedInstance().processControlPageFor(_header.pid);
+			uint32_t pcReady = 0;
+			if (pcPage != nullptr) {
+				pcReady = __atomic_load_n(&static_cast<dserver_process_control*>(pcPage)->transport_ready, __ATOMIC_ACQUIRE);
+			}
+			char b[176];
+			int l = snprintf(b, sizeof(b), "[srv-checkin #%u pid=%d tid=%d fork=%d page=%d ready=%u]\n",
+				n, (int)_header.pid, (int)_header.tid, (int)(_body.is_fork ? 1 : 0),
+				(int)(pcPage != nullptr ? 1 : 0), (unsigned)pcReady);
+			if (l > 0) { (void)!write(2, b, (size_t)l); }
+		}
+	}
+
 	// the Call instance creation already took care of registering the process and thread.
+
+	// perf#30 ATTRIBUTION: which checkins still arrive on a DATAGRAM, and from whom. MEASURED need: 167 of 332
+	// checkins were still on the datagram after three guest sites were converted, and the site counters tried
+	// for this never incremented. The server sees every datagram checkin regardless of the guest site that
+	// sent it, so this is the instrument that can actually attribute them: it names the pid, the tid, whether
+	// it is a fork child, and whether the caller had a lifetime descriptor.
+	if (getenv("DARLING_SERVER_COURIER_LOG") != NULL) {
+		static DarlingServer::Log ciLog("checkin-attrib");
+		void* pcPage = DarlingServer::Server::sharedInstance().processControlPageFor(_header.pid);
+		uint32_t pcReady = 0;
+		if (pcPage != nullptr) {
+			pcReady = __atomic_load_n(&static_cast<dserver_process_control*>(pcPage)->transport_ready, __ATOMIC_ACQUIRE);
+		}
+		ciLog.error() << "uds-checkin pid=" << _header.pid << " tid=" << _header.tid
+			<< " fork=" << (_body.is_fork ? 1 : 0)
+			<< " lifetime=" << (int)_body.lifetime_listener_pipe
+			<< " page=" << (pcPage != nullptr ? 1 : 0) << " page_ready=" << pcReady
+			<< ciLog.endLog;
+	}
 
 	// perf #0 (dar-dar6x4-perf-5dq.6): count checkins, and fork-checkins specifically.
 	// The fork checkin is the per-fork synchronous round-trip whose latency dominates
@@ -602,12 +788,11 @@ void DarlingServer::Call::Checkin::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			// the process needs to know when the checkin occurs, in case it has a pending replacement
-			// and also to notify its parent about when the fork is complete
-			// perf#25a A0 (Part 4): tell the process WHO is checking in -- only a main-thread
-			// non-fork re-checkin may be treated as an exec replacement (see notifyCheckin).
+			// Main-thread re-checkin classifies exec independently of pipe
+			// notification delivery; fork checkin alone notifies the parent.
 			process->notifyCheckin(static_cast<Process::Architecture>(_header.architecture),
-				thread->nsid() == process->nsid(), _body.is_fork);
+				ProcessIdentity::isMainThread(thread->nsid(), thread->id(), process->nsid(), process->id()),
+				_body.is_fork);
 		} else {
 			code = -ESRCH;
 		}
@@ -630,6 +815,64 @@ void DarlingServer::Call::Checkout::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
+			// perf#30 FD-COURIER: the descriptor half of this call travels on the process-scoped
+			// SCM_RIGHTS courier, so the request itself carries no ancillary data and can ride the lane.
+			// Resolve the token here, before any side effect, so that a request whose descriptor half is
+			// missing cannot silently look like the no-descriptor form of checkout (which means "this
+			// thread is going away" -- a completely different operation).
+			if (_body.exec_listener_pipe < 0 && _body.fd_token != 0) {
+				int courierFd = -1;
+				std::weak_ptr<Thread> weakThread = thread;
+				// Shared with the continuation: the descriptor and the token both have to survive the
+				// suspension, and neither may live on the stack of the frame that parks the call.
+				auto fdBox = std::make_shared<int>(-1);
+				auto result = Server::sharedInstance().resolveFdCourierBundle(process->id(), _body.fd_token,
+					DSERVER_FD_COURIER_KIND_CHECKOUT_FD, &courierFd,
+					[fdBox, weakThread](int arrivedFd) {
+						// The semantic half arrived first. The descriptor's arrival is what completes it,
+						// so wake the thread whose continuation owns the rest of this call -- never inline
+						// on the event loop, and never by re-entering the handler from here.
+						*fdBox = arrivedFd;
+						if (auto strongThread = weakThread.lock()) {
+							strongThread->resume();
+						}
+					});
+
+				switch (result) {
+					case Server::FdCourierResult::Resolved:
+						_body.exec_listener_pipe = courierFd;
+						break;
+					case Server::FdCourierResult::Missing:
+						// No descriptor half yet. Park a continuation and give the event loop back: no
+						// reply is sent, so the guest keeps waiting for the real answer and no success is
+						// faked. The continuation re-enters this handler with the descriptor in place --
+						// safe because nothing has been done yet on this call.
+						thread->suspend([this, fdBox]() {
+							if (*fdBox >= 0) {
+								_body.exec_listener_pipe = *fdBox;
+							}
+							processCall();
+						});
+						// Reaching here means suspend() consumed a resume that arrived before it could
+						// install the continuation, so the completion belongs to this frame.
+						if (*fdBox >= 0) {
+							_body.exec_listener_pipe = *fdBox;
+							processCall();
+						} else {
+							callLog.error() << "checkout: parked without a descriptor and without a resume "
+								<< "(token " << _body.fd_token << ")" << callLog.endLog;
+							code = -EBADF;
+						}
+						return;
+					default:
+						callLog.error() << "checkout: courier descriptor rejected (result "
+							<< static_cast<int>(result) << ", token " << _body.fd_token
+							<< ") -- committed failure, never a UDS retry" << callLog.endLog;
+						code = -EBADF;
+						break;
+				}
+			}
+
 			if (_body.exec_listener_pipe >= 0) {
 				// this is actually an execve;
 				// let's monitor the FD we got
@@ -647,10 +890,10 @@ void DarlingServer::Call::Checkout::processCall() {
 						auto fd = std::make_shared<FD>(_body.exec_listener_pipe);
 						_body.exec_listener_pipe = -1; // the FD instance now owns the descriptor
 
-						auto replacingWithDarlingProcess = _body.executing_macho;
+						process->beginExec(fd, _body.executing_macho);
 
 						std::weak_ptr<Process> weakProcess = process;
-						Server::sharedInstance().addMonitor(std::make_shared<Monitor>(fd, Monitor::Event::HangUp, false, true, [fd, weakProcess, replacingWithDarlingProcess](std::shared_ptr<Monitor> monitor, Monitor::Event events) {
+						Server::sharedInstance().addMonitor(std::make_shared<Monitor>(fd, Monitor::Event::HangUp, false, true, [fd, weakProcess](std::shared_ptr<Monitor> monitor, Monitor::Event events) {
 							Server::sharedInstance().removeMonitor(monitor);
 
 							auto process = weakProcess.lock();
@@ -660,27 +903,7 @@ void DarlingServer::Call::Checkout::processCall() {
 								return;
 							}
 
-							char tmp;
-							int result = read(fd->fd(), &tmp, sizeof(tmp));
-
-							if (result < 0) {
-								// we shouldn't even get EAGAIN
-								throw std::system_error(errno, std::generic_category(), "Failed to read from exec listener pipe");
-							}
-
-							if (result == 0) {
-								// the execve succeeded
-								if (replacingWithDarlingProcess) {
-									process->setPendingReplacement();
-								} else {
-									// the Darling process was replaced with a non-Darling process
-									// treat it like death
-									process->notifyDead();
-								}
-							} else {
-								// the execve failed
-								// do nothing in this case
-							}
+							process->notifyExecCompletion(fd);
 						}));
 					}
 				}
@@ -974,12 +1197,29 @@ void DarlingServer::Call::PthreadCanceled::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		stateKnown = true;
-		if (trace) {
-			dtape_thread_cancel_state_snapshot(thread->_dtapeThread, &before);
+		// perf#30 ATTRIBUTION (doc section 64): this callnum is 87% on the lane and 13% on the datagram, and
+		// the guest's reason histogram is silent for it. The server can answer the question directly: did the
+		// thread HAVE a lane when this datagram arrived? If yes, the guest chose the datagram despite having
+		// one; if no, the datagram is the only transport that existed for that thread.
+		if (getenv("DARLING_SERVER_COURIER_LOG") != NULL) {
+			static DarlingServer::Log pcLog("pthread-canceled-attrib");
+			// The transport, not just the lane's existence: this line logged EVERY invocation when it was
+			// written (193 lines for a run whose heatmap shows far fewer datagrams), which is the
+			// "instrument that cannot answer" class again. A call taken off the lane carries a ring context,
+			// so its presence separates the two transports in the same line.
+			pcLog.error() << "pthread_canceled pid=" << _header.pid << " tid=" << _header.tid
+				<< " has_lane=" << (thread->ring() ? 1 : 0)
+				<< " lane=" << (ringContext() != nullptr ? 1 : 0)
+				<< " action=" << _body.action << pcLog.endLog;
 		}
-		code = -dtape_thread_canceled(thread->_dtapeThread, _body.action);
 		if (trace) {
-			dtape_thread_cancel_state_snapshot(thread->_dtapeThread, &after);
+			thread->cancelStateSnapshot(&before.disabled, &before.pending, &before.canceled);
+		}
+		// The one semantic core, also reached by the management plane (direct servicing):
+		// Thread::pthreadCanceled owns the state transitions and their synchronization.
+		code = thread->pthreadCanceled(_body.action);
+		if (trace) {
+			thread->cancelStateSnapshot(&after.disabled, &after.pending, &after.canceled);
 		}
 	}
 
@@ -1013,11 +1253,11 @@ void DarlingServer::Call::PthreadMarkcancel::processCall() {
 	if (auto targetThread = Thread::threadForPort(_body.thread_port)) {
 		targetKnown = true;
 		if (trace) {
-			dtape_thread_cancel_state_snapshot(targetThread->_dtapeThread, &before);
+			targetThread->cancelStateSnapshot(&before.disabled, &before.pending, &before.canceled);
 		}
-		code = -dtape_thread_markcancel(targetThread->_dtapeThread);
+		code = targetThread->pthreadMarkcancel();
 		if (trace) {
-			dtape_thread_cancel_state_snapshot(targetThread->_dtapeThread, &after);
+			targetThread->cancelStateSnapshot(&after.disabled, &after.pending, &after.canceled);
 		}
 	} else {
 		code = -ESRCH;
@@ -1631,26 +1871,6 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 // already refuses a corrupt c2s tail; here we additionally (a) bound the inline body to the
 // slot, (b) only accept a small allowlist of ring-eligible call numbers (P3 = task_self_trap),
 // dropping anything else so the guest UDS-falls-back, and (c) never deref a guest pointer.
-// perf #18 P6.1 (dar-ohp): escape hatches. Resolved once from the environment. The fast inline
-// path (doWorkInline, no fiber) is ON by default when the ring is enabled, but either knob set to
-// "0" forces the op back through the generic doWork() fiber path -- so the ring transport can be
-// run WITHOUT specialized inline semantics if a bug surfaces.
-//   DARLING_SERVER_FAST_OPS=0            -> disable ALL inline fast paths
-//   DARLING_SERVER_FAST_MACH_REPLY_PORT=0 -> disable just mach_reply_port's inline path
-static bool ringFastOpsEnabled() {
-	static const bool v = []() {
-		const char* e = getenv("DARLING_SERVER_FAST_OPS");
-		return !(e && e[0] == '0' && e[1] == '\0');
-	}();
-	return v;
-}
-static bool ringFastMachReplyPortEnabled() {
-	static const bool v = []() {
-		const char* e = getenv("DARLING_SERVER_FAST_MACH_REPLY_PORT");
-		return !(e && e[0] == '0' && e[1] == '\0');
-	}();
-	return v;
-}
 // perf #18 P8 D3 (dar-1il.3.1.1): the DUPLEX SELFTEST hatch. Default OFF (must be set to "1"). The
 // sentinel parent op (DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) is recognized in the ring service loop ONLY
 // when this is on, so the duplex lane never activates on any real op or on a normal boot -- it is the
@@ -1693,67 +1913,10 @@ static std::atomic<int>& d5VmDeallocProofBudget() {
 static bool d5VmDeallocProofArmed() {
 	return d5VmDeallocProofBudget().load(std::memory_order_relaxed) > 0;
 }
-// Is this callnum eligible for the no-fiber inline fast path? Must be a PROVEN-non-blocking op.
-// task_self_trap + mach_reply_port both just mint/return a port via current_task()'s space and
-// never suspend. Each gated by its hatch (task_self_trap rides the global hatch only).
-//
-// TAXONOMY (perf #18 Phase A, dar-dar6x4-perf-5dq.30.1): this predicate is the "NoFiberFastEligible"
-// concept (Tier 2) in the three-lane vocabulary defined next to DSERVER_RING_OP_CLASS in
-// rpc-supplement.h -- DISTINCT from, and a strict subset of, "SimpleRingC2SEligible" (Tier 1, the
-// DSERVER_RING_C2S_OPCODES allowlist). NoFiberFastEligible => SimpleRingC2SEligible, never the reverse.
-// The classification table tags exactly these two ops NOFIBER_FAST; keep this function in sync with it
-// (the table is documentation/guardrail, this is the live gate -- they must agree).
-//
-// perf #18 P5 (dar-1il): mach_port_mod_refs is DELIBERATELY NOT here. Two reasons, both standing:
-// (1) it is not no-fiber-inline-safe -- running it WITHOUT the microthread fiber (doWorkInline) was
-// MEASURED to corrupt the thread's fiber/stack bookkeeping (a later doWork() frees a garbage _stack:
-// StackPool::free -> munmap EINVAL -> std::terminate). It does a port->task translation + task
-// refcounting that is unsafe off the fiber, unlike the surgical mach_reply_port path (pure mint).
-// (2) perf #18 dar-1il.2: it is no longer in the C2S ring allowlist AT ALL (not even the generic
-// fiber path) -- mach_port_mod_refs(delta<0) dropping the last ref is destroy-capable, and
-// destroying a mapped-region-backed port drives a vm munmap S2C upcall to a caller parked on the
-// ring -> deadlock (the same class that sank mach_port_deallocate). It is UDS-only until a
-// proven-safe subset is gated. The no-fiber inline sub-case is reserved for the trivial pure-mint
-// port traps only; the C2S allowlist (DSERVER_RING_C2S_OPCODES, expanded in ringServiceThread) is
-// the larger Tier-1 set, and mod_refs is in NEITHER.
-static bool ringFastPathEligible(uint32_t callnum) {
-	if (!ringFastOpsEnabled()) {
-		return false;
-	}
-	if (callnum == dserver_callnum_mach_reply_port) {
-		return ringFastMachReplyPortEnabled();
-	}
-	if (callnum == dserver_callnum_task_self_trap) {
-		return true;
-	}
-	// perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap are the remaining members of the
-	// pure-mint self-trap family. Same processCall structure as task_self_trap (dtape_*_self_trap mint
-	// + _sendReply -- no port->task translation, no refcounting, no fiber-sensitive stack state), so
-	// they are no-fiber-inline-safe exactly like it. They ride the global fast-ops hatch only (like
-	// task_self_trap, not the per-op mach_reply_port hatch).
-	if (callnum == dserver_callnum_thread_self_trap || callnum == dserver_callnum_host_self_trap) {
-		return true;
-	}
-	return false;
-}
 
-// perf #18 P6.1 step 2 (dar-ohp): is this slot eligible for the SURGICAL direct dispatch (skip
-// Call/Message entirely, run dtape_mach_reply_port + publish straight onto the ring)? Stricter than
-// ringFastPathEligible: EXACTLY mach_reply_port, the per-op hatch on, and a no-payload/no-arena
-// shape (the trap takes no arguments; any body/descriptors/arena means a malformed or unexpected
-// request -> reject and fall back to the framed path which validates fully). The shape guard is the
-// security boundary for the no-Call path: we never decode an attacker-shaped slot here.
-static bool fastMachReplyPortEligible(uint32_t callnum, uint32_t reqlen, uint32_t arenaLen) {
-#ifndef NO_SHAPE_GUARD
-	if (reqlen != 0 || arenaLen != 0) {
-		return false; // mach_reply_port has an empty request body and no arena
-	}
-#endif
-	if (callnum != dserver_callnum_mach_reply_port) {
-		return false;
-	}
-	return ringFastOpsEnabled() && ringFastMachReplyPortEnabled();
-}
+void DarlingServer::Call::attachRingContext(std::shared_ptr<class RingBuffer> ring, uint32_t seq, uint32_t callnum, bool duplexCapable) {
+	_ringContext = RingCallContext{ std::move(ring), seq, callnum, duplexCapable };
+};
 
 uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::Thread>& thread) {
 	using namespace DarlingServer;
@@ -1780,6 +1943,10 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		if (!req) {
 			break; // empty or corrupt tail
 		}
+		// perf#18 D9: this call was taken off a RING LANE. Tag it here, in the generic service path, so the
+		// heatmap reports ring-served calls as Ring for EVERY eligible op -- not only for the duplex-reply
+		// step that used to be the sole place the tag was set.
+		thread->noteServicedFromRing();
 #ifdef DSERVER_RING_PHASE_PROF
 		uint64_t _phaseT0 = Metrics::rdtscCycles(); // perf#18 P6: drain phase start
 #endif
@@ -1859,18 +2026,19 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			reqMsg.setAddress(thread->address());
 			reqMsg.setPID(process->id());
 			dserver_ring_consumer_advance(c2s); // free the slot before running the op
-			thread->beginRingReply(seq);
-			thread->setRingDuplexParentActive(true);
 			try {
 				auto call = Call::callFromMessage(std::move(reqMsg));
 				if (call) {
+					// duplex parent (mach_port_deallocate): this op may raise a caller-S2C, and this call's own lane
+					// mailbox is the only way a ring-parked caller can service it. The context lives on the
+					// Call, so it survives the dispatch and any suspend/resume -- see RingCallContext.
+					call->attachRingContext(thread->ring(), seq, callnum, true);
 					call->thread()->doWork();
 					++serviced;
 				}
 			} catch (const std::exception& ex) {
 				callLog.error() << "ring duplex deallocate dispatch threw: " << ex.what() << callLog.endLog;
 			}
-			thread->setRingDuplexParentActive(false);
 			continue;
 		}
 
@@ -1926,12 +2094,13 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			reqMsg.setAddress(thread->address());
 			reqMsg.setPID(process->id());
 			dserver_ring_consumer_advance(c2s); // free the slot before running the op
-			thread->beginRingReply(seq);
-			thread->setRingDuplexParentActive(true);
 			thread->setRingDuplexVmdeallocProof(true); // tag so _drainDuplexReply bumps the vmdealloc counters
 			try {
 				auto call = Call::callFromMessage(std::move(reqMsg));
 				if (call) {
+					// duplex parent (mach_vm_deallocate): see the deallocate block above -- the context
+					// rides the Call so a caller-S2C raised later still finds this lane's mailbox.
+					call->attachRingContext(thread->ring(), seq, callnum, true);
 					call->thread()->doWork();
 					Metrics::shared().ringDuplexVmdeallocFinal.fetch_add(1, std::memory_order_relaxed);
 					++serviced;
@@ -1940,7 +2109,6 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 				callLog.error() << "ring duplex vm_deallocate dispatch threw: " << ex.what() << callLog.endLog;
 			}
 			thread->setRingDuplexVmdeallocProof(false);
-			thread->setRingDuplexParentActive(false);
 			// AUTO-DISARM: if this dispatch produced a real caller-S2C (the proof goal), spend one budget
 			// unit; once it hits 0 the proof is disarmed and no further launchd vm_deallocate rides the lane.
 			if (thread->takeRingDuplexVmdeallocS2cFired()) {
@@ -1954,63 +2122,6 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			continue;
 		}
 
-		// perf #18 P6.1 step 2 (dar-ohp): SURGICAL direct dispatch for mach_reply_port. Skip the
-		// Message rebuild + callFromMessage registry re-lookup + Call heap-alloc that step 1 still
-		// pays. The thread is already held (shared_ptr) for this whole slot iteration, so its
-		// lifetime is guaranteed without the registry lookup; doMachReplyPortInline runs the bare
-		// dtape trap on it and publishes the reply itself. Free the request slot FIRST (same as the
-		// generic path), then dispatch. If it declines (busy/dead/etc.), fall through to the generic
-		// step-1 path below, which re-stages the Message and handles every edge case.
-		if (fastMachReplyPortEligible(callnum, reqlen, arenalen)) {
-			dserver_ring_consumer_advance(c2s); // free the slot before running the op
-#ifdef DSERVER_RING_PHASE_PROF
-			uint64_t _fpT0 = Metrics::rdtscCycles();
-#endif
-			if (thread->doMachReplyPortInline(seq)) {
-				++serviced;
-				Metrics::shared().ringFastHit.fetch_add(1, std::memory_order_relaxed);
-#ifdef DSERVER_RING_PHASE_PROF
-				// The fast path collapses drain+dispatch+body into one window; record the whole
-				// thing as "body" (it IS the op) minus the publish cycles the inline op stashed.
-				uint64_t _fpT1 = Metrics::rdtscCycles();
-				auto& m = Metrics::shared();
-				uint64_t pub = thread->takeRingPublishCycles();
-				uint64_t total = _fpT1 - _fpT0;
-				uint64_t body = (total > pub) ? (total - pub) : 0;
-				m.phaseBodyCycles.fetch_add(body, std::memory_order_relaxed);
-				m.phasePublishCycles.fetch_add(pub, std::memory_order_relaxed);
-				m.phaseSamples.fetch_add(1, std::memory_order_relaxed);
-#endif
-				continue;
-			}
-			// declined inline -> rebuild + run via the generic path (the slot is already consumed,
-			// so re-stage the Message from the copied-out header; reqlen==0 means no body to copy).
-			Metrics::shared().ringFastFallback.fetch_add(1, std::memory_order_relaxed);
-			size_t fbSize = sizeof(dserver_rpc_callhdr_t);
-			Message fbMsg(fbSize, 0);
-			fbMsg.data().resize(fbSize);
-			auto* fbHdr = reinterpret_cast<dserver_rpc_callhdr_t*>(fbMsg.data().data());
-			fbHdr->number = static_cast<dserver_callnum_t>(callnum);
-			fbHdr->pid = process->nsid();
-			fbHdr->tid = thread->nsid();
-			fbHdr->architecture = static_cast<dserver_rpc_architecture_t>(process->architecture());
-			fbMsg.setAddress(thread->address());
-			fbMsg.setPID(process->id());
-			thread->beginRingReply(seq);
-			try {
-				auto fbCall = Call::callFromMessage(std::move(fbMsg));
-				if (fbCall) {
-					if (!fbCall->thread()->doWorkInline()) {
-						fbCall->thread()->doWork();
-					}
-					++serviced;
-				}
-			} catch (const std::exception& ex) {
-				callLog.error() << "ring fast-path fallback dispatch threw: " << ex.what() << callLog.endLog;
-				Metrics::shared().ringFastFail.fetch_add(1, std::memory_order_relaxed);
-			}
-			continue;
-		}
 
 		// C2S allowlist: which call numbers may ride the ring. task_self_trap was the first
 		// migration (correctness-first; cached per-process so it doesn't move latency);
@@ -2033,9 +2144,32 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		// (rpc-supplement.h) -- the SAME macro the guest's ring dispatch consumes -- so the guest
 		// "may publish" set and the server "will service" set can never drift (the no-silent-drop
 		// invariant; ring_drift_gate_test.c pins it). To add an op: edit the macro in ONE place.
+		// perf#26 RING-MACH-MSG: mach_msg_overwrite as a DUPLEX PARENT on the lane. It is deliberately
+		// NOT in DSERVER_RING_C2S_OPCODES: it is a blocking, caller-S2C-capable op, and a ring-parked
+		// caller can only service the caller-local munmap it can raise through the duplex mailbox. The
+		// guest routes it here only after advertising CAP_MACH_MSG; we then dispatch it on the same
+		// generic fiber path as every other eligible op, with _ringDuplexParentActive set for the whole
+		// dispatch so the S2C takes the mailbox instead of the UDS send.
+		//
+		// Two declines, both pre-dispatch and therefore pre-mutation: a caller that never advertised the
+		// cap, and an unexpected body shape. Both get an explicit DECLINE reply rather than a silent
+		// drop, because the guest is parked on a ring reply for this slot.
+		bool machMsgDuplex = false;
+		if (callnum == (uint32_t)dserver_callnum_mach_msg_overwrite) {
+			if (!thread->duplexMachMsgCapable() || reqlen != sizeof(dserver_call_mach_msg_overwrite_t)) {
+				dserver_ring_consumer_advance(c2s);
+				thread->ring()->publishReply(seq, callnum, DSERVER_RING_DUPLEX_DECLINE, nullptr, 0);
+				thread->ring()->wakeGuest();
+				Metrics::shared().ringMachMsgDecline.fetch_add(1, std::memory_order_relaxed);
+				++serviced;
+				continue;
+			}
+			machMsgDuplex = true;
+		}
+
 		bool eligible = false;
 #define DSERVER_RING_C2S_ELIGIBLE(op) || (callnum == (uint32_t)dserver_callnum_##op)
-		eligible = (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE));
+		eligible = (false DSERVER_RING_C2S_OPCODES(DSERVER_RING_C2S_ELIGIBLE)) || machMsgDuplex;
 #undef DSERVER_RING_C2S_ELIGIBLE
 		if (!eligible || reqlen > inlineCap) {
 			dserver_ring_consumer_advance(c2s);
@@ -2070,8 +2204,14 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 		// done reading the request slot; free it before running the call
 		dserver_ring_consumer_advance(c2s);
 
-		// Arm the one-shot ring-reply sink, then dispatch through the normal Call path.
-		thread->beginRingReply(seq);
+		if (machMsgDuplex) {
+			Metrics::shared().ringMachMsgParent.fetch_add(1, std::memory_order_relaxed);
+			S2CTrace::line("RING_MACHMSG_CONSUME lane=%llu seq=%u tid=%lld", (unsigned long long)thread->ring()->debugLaneId(), (unsigned)seq, (long long)thread->nsid());
+		}
+
+		// NOTE: there is deliberately no dispatch-scoped reply sink any more. The reply destination (and
+		// the duplex eligibility) is the CALL's RingContext, attached below just before doWork(); see
+		// Call::RingContext for why dispatch-scoped Thread state cannot express either one.
 #ifdef DSERVER_RING_PHASE_PROF
 		uint64_t _phaseT1 = Metrics::rdtscCycles(); // drain end / dispatch start
 #endif
@@ -2081,19 +2221,13 @@ uint32_t DarlingServer::ringServiceThread(const std::shared_ptr<DarlingServer::T
 			uint64_t _phaseT2 = Metrics::rdtscCycles(); // dispatch end / body start
 #endif
 			if (call) {
-				// perf #18 P6.1: for proven-non-blocking allowlisted ops, run WITHOUT the
-				// microthread fiber (doWorkInline) -- the P6 breakdown showed the fiber is ~half
-				// the hot-path cost. doWorkInline returns false if it declined (not the simple
-				// fresh-call case) -> fall back to the generic fiber doWork(). Anything not
-				// fast-eligible (or with the escape hatch off) takes the generic path unchanged
-				// (= perf#2b inline-on-main-loop-via-fiber; self-traps never block).
-				if (ringFastPathEligible(callnum)) {
-					if (!call->thread()->doWorkInline()) {
-						call->thread()->doWork();
-					}
-				} else {
-					call->thread()->doWork();
-				}
+				// Attach the call's ring transport BEFORE dispatching: the context must be there for
+				// the reply (which may happen after a suspend/resume) and for a caller-S2C raised
+				// while this call is parked.
+				call->attachRingContext(thread->ring(), seq, callnum, machMsgDuplex);
+				// Port minting and copyout take duct-tape locks, which can suspend
+				// under contention. Ring transport never removes the fiber requirement.
+				call->thread()->doWork();
 				++serviced;
 #ifdef DSERVER_RING_PHASE_PROF
 				uint64_t _phaseT3 = Metrics::rdtscCycles(); // body end
@@ -2127,7 +2261,61 @@ void DarlingServer::Call::RingAttach::processCall() {
 	int code = 0;
 	int guestWakeFd = -1; // dup of the wake eventfd handed back to the guest (-1 on reject)
 
+	// perf#30 TRACE (temporary): the page route's third attach does not return from doWork(), so the path is
+	// named step by step under the courier log rather than guessed at.
+	auto traceAttach = [](const char* what, long v) {
+		if (getenv("DARLING_SERVER_COURIER_LOG") != NULL) {
+			static DarlingServer::Log tl("attach-trace");
+			tl.error() << what << " " << v << tl.endLog;
+		}
+	};
+	traceAttach("enter ring_fd=", (long)_body.ring_fd);
+	traceAttach("enter fd_token=", (long)_body.fd_token);
 	if (auto thread = _thread.lock()) {
+		// perf#30 FD-COURIER (RA1): the lane's backing descriptor arrives on the process-scoped
+		// SCM_RIGHTS courier and only its token is named here, so this request has no ancillary data at
+		// all. Same two-half pairing the lifecycle ops use: resolve first (draining the courier), park
+		// the continuation if the descriptor is still in flight, and never fall back to the RPC socket
+		// after publication.
+		if (_body.ring_fd < 0 && _body.fd_token != 0) {
+			int courierFd = -1;
+			std::weak_ptr<Thread> weakThread = thread;
+			auto fdBox = std::make_shared<int>(-1);
+			auto result = Server::sharedInstance().resolveFdCourierBundle(thread->process() ? thread->process()->id() : -1,
+				_body.fd_token, DSERVER_FD_COURIER_KIND_LANE_BACKING, &courierFd,
+				[fdBox, weakThread](int arrivedFd) {
+					*fdBox = arrivedFd;
+					if (auto strongThread = weakThread.lock()) {
+						strongThread->resume();
+					}
+				});
+			switch (result) {
+				case Server::FdCourierResult::Resolved:
+					_body.ring_fd = courierFd;
+					break;
+				case Server::FdCourierResult::Missing:
+					thread->suspend([this, fdBox]() {
+						if (*fdBox >= 0) {
+							_body.ring_fd = *fdBox;
+						}
+						processCall();
+					});
+					if (*fdBox >= 0) {
+						_body.ring_fd = *fdBox;
+						processCall();
+					} else {
+						rejectReason = dserver_ring_reject_total_size;
+						code = -EBADF;
+					}
+					return;
+				default:
+					rejectReason = dserver_ring_reject_total_size;
+					code = -EBADF;
+					break;
+			}
+		}
+
+		traceAttach("pre-attach ring_fd=", (long)_body.ring_fd);
 		if (_body.ring_fd < 0) {
 			// no fd arrived -- can't be a valid attach
 			rejectReason = dserver_ring_reject_total_size;
@@ -2140,65 +2328,68 @@ void DarlingServer::Call::RingAttach::processCall() {
 				&reject
 			);
 			rejectReason = static_cast<uint32_t>(reject);
+			traceAttach("post-RingBuffer::attach reject=", (long)reject);
 
 			if (ring) {
 				const auto& cb = ring->controlBlock();
+				/* LANE-ATTACH RECORD, SERVER SIDE, AND THE IDENTITY LINK. The guest logs [dring-attach] per new
+				 * thread; this is the same event as the SERVER sees it, carrying the thread's nsid (the guest's own host
+				 * tid, the value the loader's fault witness prints) and the lane it was given. Plain write(2,...) because
+				 * MEASURED: the server's stderr reaches the run log unconditionally, while the project's gated S2C trace
+				 * does not appear there at all. Bounded. */
+				{
+					static unsigned g_srv_lane_records = 0;
+					unsigned n = __atomic_fetch_add(&g_srv_lane_records, 1, __ATOMIC_RELAXED);
+					if (n < 64) {
+						char b[176];
+						int l = snprintf(b, sizeof(b),
+							"[srv-lane-attach #%u pid=%d tid=%d slots=%u slot_size=%u]\n",
+							n, (int)thread->process()->id(), (int)thread->nsid(),
+							(unsigned)cb.slot_count, (unsigned)cb.slot_size);
+						if (l > 0) { (void)!write(2, b, (size_t)l); }
+					}
+				}
 				callLog.debug() << "ring_attach accepted for TID " << thread->nsid()
 					<< " (" << cb.slot_count << " slots of " << cb.slot_size << "B)"
 					<< callLog.endLog;
+				// perf#26 RING-MACH-MSG: the attach lifecycle, named. Pairs with the guest's
+				// LANE_ATTACH line (which carries the guest lane index + generation) so a re-attach is
+				// visible and a seq restart can never be mistaken for a duplicate request.
+				S2CTrace::line("LANE_ATTACH tid=%lld lane=%llu", (long long)thread->nsid(),
+				               (unsigned long long)ring->debugLaneId());
 
-				// Watch the ring's wake eventfd. The guest writes it to signal "I published a
-				// request"; the callback drains it and services the C2S ring. HangUp tears the
-				// ring down. We pass the Monitor a dup of the eventfd (the RingBuffer owns the
-				// original) so the two lifetimes stay independent.
-				int wakeDup = ::dup(ring->eventfd());
-				// And a SECOND dup to hand back to the guest (Variant 2 wake design): the guest
-				// writes this fd to wake the server. The generated reply machinery takes
-				// ownership of guestWakeFd and closes it after the SCM_RIGHTS send.
-				guestWakeFd = ::dup(ring->eventfd());
-				if (wakeDup < 0 || guestWakeFd < 0) {
-					if (wakeDup >= 0) ::close(wakeDup);
-					if (guestWakeFd >= 0) { ::close(guestWakeFd); guestWakeFd = -1; }
+				// perf#28 (ONE doorbell): the guest gets a dup of the ONE process doorbell, not a
+				// per-lane eventfd. The server registers that eventfd + its Monitor exactly once
+				// (first attach, in Server::ringDoorbellDupForGuest) and every lane of every process
+				// shares it: the wake scan (_drainRings) and the sleep-state publication are already
+				// process-independent, so one channel serves them all. The guest side closes every
+				// dup it receives after the first, which is what makes its wake-fd count O(1).
+				// perf#28c: the doorbell belongs to the guest process INCARNATION (pidfd-anchored), so
+				// every lane of this process -- in both images, across Process-object churn -- receives
+				// a dup of the SAME kernel eventfd object, and no other process can reach it.
+				auto process = thread->process();
+				guestWakeFd = process ? Server::sharedInstance().ringDoorbellDupFor(process->id()) : -1;
+				traceAttach("post-doorbell wake_fd=", (long)guestWakeFd);
+				if (guestWakeFd == -2) {
+					// perf#28d: the ONE delivery already happened for this process incarnation; the
+					// guest resolves the doorbell from its own slot. This is SUCCESS with no descriptor
+					// in the reply, so the ring is still attached and the thread still registered --
+					// treating it as a failure is what sent the whole workload back to UDS.
+					guestWakeFd = -1;
+					Metrics::shared().ringDoorbellSuppressed.fetch_add(1, std::memory_order_relaxed);
+					thread->attachRing(ring, nullptr);
+					Server::sharedInstance().registerRingThread(thread);
+					traceAttach("post-register tid=", (long)thread->nsid());
+				} else if (guestWakeFd < 0) {
 					rejectReason = static_cast<uint32_t>(dserver_ring_reject_total_size);
 				} else {
-					std::weak_ptr<Thread> weakThread = thread;
-					auto monitor = std::make_shared<Monitor>(
-						std::make_shared<FD>(wakeDup),
-						Monitor::Event::Readable | Monitor::Event::HangUp,
-						false, false,
-						[weakThread](std::shared_ptr<Monitor> thisMonitor, Monitor::Event events) {
-							auto t = weakThread.lock();
-							if (auto r = (t ? t->ring() : nullptr)) {
-								r->drainWake();
-							} else {
-								// thread/ring gone -- drain raw so the fd stops firing
-								eventfd_t value;
-								eventfd_read(thisMonitor->fd()->fd(), &value);
-							}
-							if (static_cast<uint64_t>(events & Monitor::Event::HangUp) != 0) {
-								if (t) {
-									Server::sharedInstance().unregisterRingThread(t);
-								}
-								Server::sharedInstance().removeMonitor(thisMonitor);
-								return;
-							}
-							// Service every request the guest published since the last wake. This is
-							// the COLD path: the guest doorbelled because the server was sleeping.
-							if (t) {
-								Metrics::shared().ringDoorbellsReceived.fetch_add(1, std::memory_order_relaxed);
-								uint32_t n = ringServiceThread(t);
-								if (n > 0) {
-									Metrics::shared().ringServicedDoorbell.fetch_add(n, std::memory_order_relaxed);
-								}
-							}
-						}
-					);
-					Server::sharedInstance().addMonitor(monitor);
-					thread->attachRing(ring, monitor);
+					// The doorbell Monitor is server-owned (never per-Thread), so the Thread carries
+					// no Monitor for it: a Thread death must not deregister the shared channel.
+					thread->attachRing(ring, nullptr);
 					// perf #18 P4: register the ring-owning thread with the server so the main
-					// loop's pre-epoll spin phase can drain it directly (the eventfd Monitor is
-					// only the COLD-path wake; on the hot path the guest skips the doorbell and
-					// the spin phase finds the request by polling the c2s ring).
+					// loop's pre-epoll spin phase can drain it directly (the doorbell is only the
+					// COLD-path wake; on the hot path the guest skips it and the spin phase finds
+					// the request by polling the c2s ring).
 					Server::sharedInstance().registerRingThread(thread);
 				}
 			} else {
@@ -2211,7 +2402,9 @@ void DarlingServer::Call::RingAttach::processCall() {
 			// before the ring existed -- the size of the pre-attach window). guestWakeFd>=0 means the
 			// ring was mapped + the thread registered (true success). No-op unless the census is armed.
 			if (Metrics::shared().attachCensusOn.load(std::memory_order_relaxed)) {
-				bool success = (guestWakeFd >= 0);
+				// perf#28d: success is "the ring is attached", which is now true with or without a
+				// descriptor half in the reply; guestWakeFd >= 0 alone under-counted the steady state.
+				bool success = (rejectReason == static_cast<uint32_t>(dserver_ring_ok));
 				uint64_t ordinalAtAttach = 0;
 				if (auto p = thread->process()) {
 					ordinalAtAttach = p->currentUdsCallOrdinal();
@@ -2226,6 +2419,10 @@ void DarlingServer::Call::RingAttach::processCall() {
 		code = -ESRCH;
 	}
 
+	// perf#30: the descriptor half, named for the page route. A page-serviced attach has no datagram to
+	// receive the reply CMSG, so `Server::_serviceProcessControl` sends this on the courier and passes the
+	// token through the page -- which is what lets the ONE doorbell delivery happen without AF_UNIX.
+	noteSuppressedReplyWakeFd(guestWakeFd);
 	_sendReply(code, rejectReason, guestWakeFd);
 #else
 	// feature compiled out: a ring-capable guest gets a clean "unsupported" and falls back

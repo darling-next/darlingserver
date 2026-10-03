@@ -153,8 +153,8 @@ typedef struct dserver_kqchan_reply_proc_read {
 // dserver_ring_shm_validate() at the bottom is the trust-boundary gate; it is compiled
 // identically into the server and into the adversarial unit test.
 //
-// This whole block is gated behind DSERVER_RING_TRANSPORT so a default build is
-// byte-identical (the structs/inline fn are only referenced when the feature is enabled).
+// Live transport structures and operations are feature-gated. The static opcode
+// taxonomy below remains available to heatmap consumers in transport-OFF builds.
 //
 
 #ifdef DSERVER_RING_TRANSPORT
@@ -180,7 +180,13 @@ typedef struct dserver_kqchan_reply_proc_read {
 // dserver_s2c_reply_munmap_t losslessly. v4<->v5 rejects on abi_version at attach (clean all-UDS). The
 // echo selftest still works (it uses duplex_upcall_arg / duplex_reply_arg, unchanged). Lane-1 rings stay
 // byte-identical; the new words live in the mailbox cache lines.
-#define DSERVER_RING_ABI_VERSION 5u
+// v7: the wake plane is ONE process doorbell (perf#28). A lane no longer owns a wake eventfd; the
+// server keeps a single eventfd + Monitor for the whole transport and ships a dup of it on every
+// attach, and the guest's shared loader adopts the first dup and closes the rest. The payload/ring
+// layout is byte-identical to v6, but the wake-fd CONTRACT changed: a v6 guest would hold N wake fds
+// and write only its own, and a v6 server's Monitor would service only the writing thread -- so a
+// mixed pair is rejected at attach (clean all-UDS fallback) rather than half-working.
+#define DSERVER_RING_ABI_VERSION 7u
 
 // perf #18 P8 D1/D2: duplex capability bits, advertised by the guest in cb.duplex_caps and confirmed
 // by the server. The minimal prototype advertises exactly DUPLEX_SELFTEST: it can pump ONE synthetic
@@ -209,6 +215,11 @@ typedef struct dserver_kqchan_reply_proc_read {
 // forward-compatible cap bit needs no ABI bump (the v5 mailbox wire layout is unchanged); an old server
 // that doesn't know 0x4 simply never sets it, so the guest never routes vm_deallocate onto the lane.
 #define DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE 0x4u
+// perf#26 RING-MACH-MSG: the guest routes mach_msg_overwrite onto its lane (as a DUPLEX parent, so a
+// caller-S2C munmap raised inside it rides the mailbox) ONLY after advertising this cap, and the
+// server serves callnum 38 from the ring only for a caller that advertised it. A guest/server skew
+// therefore degrades to UDS instead of stranding a published request with no servicer.
+#define DSERVER_RING_DUPLEX_CAP_MACH_MSG 0x8u
 // Convenience: either cap means "this caller can pump a vm-munmap S2C upcall" (the shape both D4 and D5
 // deliver). The munmap publish guard requires this; the per-op routing decline requires the specific bit.
 #define DSERVER_RING_DUPLEX_CAP_MUNMAP_PUMP (DSERVER_RING_DUPLEX_CAP_DEALLOCATE | DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE)
@@ -229,6 +240,12 @@ typedef struct dserver_kqchan_reply_proc_read {
 // backed port drives; the guest pump runs the SAME munmap(2) the UDS recvmsg S2C path runs, so the side
 // effect is byte-identical to UDS -- only the transport differs.
 #define DSERVER_RING_DUPLEX_UPCALL_MUNMAP 0x2u
+// ABI v6: the ANONYMOUS-mmap S2C upcall. allocatePages() issues an fd-less, offset-0 mmap to give the
+// guest server-allocated pages; it is a caller-local S2C, and a ring-parked caller cannot service it over
+// UDS -- but it carries NO descriptor, so the mailbox can carry it exactly like the munmap shape. The
+// fd-carrying mapFile() shape (offset != 0 or fd >= 0) is NOT in this op and must stay on UDS until the
+// fd courier milestone; the publisher refuses it.
+#define DSERVER_RING_DUPLEX_UPCALL_MMAP 0x3u
 
 // perf #18 P8 D4 (dar-1il.3.2.1): a reserved reply-header `code` the server uses to tell the guest it
 // DECLINED a duplex-routed op BEFORE dispatching it (pre-mutation: no v5 ring / no DEALLOCATE cap /
@@ -246,6 +263,9 @@ typedef struct dserver_kqchan_reply_proc_read {
 #define DSERVER_RING_SRV_SLEEPING_EPOLL 0u // server is (or is about to be) blocked in epoll_wait -> MUST doorbell
 #define DSERVER_RING_SRV_ACTIVE_POLLING 1u // server is draining rings in its spin phase -> doorbell NOT needed
 #define DSERVER_RING_SRV_SLEEP_ARMED    2u // server is between "decided to sleep" and epoll_wait -> doorbell (race window)
+// Another image attached a replacement lane for the same thread. This lane
+// will never be serviced again; guests must fall back before publishing.
+#define DSERVER_RING_SRV_RETIRED        3u
 
 // Bounds the server is willing to accept for a guest-proposed ring, so a malicious or buggy
 // guest can't make the server map an absurd region or compute a huge index. Kept modest;
@@ -367,6 +387,10 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // are P4; P3 only migrates small inline-only ops.
 #define DSERVER_RING_FLAG_REPLY_ERROR 0x1u
 
+#endif // DSERVER_RING_TRANSPORT
+
+// Static classification describes the common source contract even when transport
+// is compiled out; it does not create a ring, attach a lane, or dispatch any RPC.
 // --- C2S ring opcode allowlist: the SINGLE source of truth (perf #18 P5-bulk, dar-1il.1) ------
 //
 // The set of dserver_callnum_* values a guest may publish onto the c2s ring (and that the server
@@ -445,9 +469,8 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // waiting for its reply) is the right home for destroy-capable ops. Until that lane exists they stay
 // UDS; do NOT smuggle them back onto the simple ring via a "clever subset" that still risks an S2C.
 //
-// NOTE this is the TRANSPORT allowlist (Tier 1 = ride the ring via the generic fiber doWork); it is
-// DISTINCT from the no-fiber inline fast path (ringFastPathEligible / Tier 2), a strictly smaller,
-// separately-proven set. Never conflate the two.
+// Transport eligibility never implies non-suspending execution: every listed call
+// uses the generic fiber-backed dispatcher, including self-port minting traps.
 #define DSERVER_RING_C2S_OPCODES(X) \
 	X(task_self_trap) \
 	X(thread_self_trap) \
@@ -462,6 +485,20 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	/* over the ring verbatim via _publishReplyToRingLocked (everything after the reply hdr), so the */ \
 	/* server needs NO per-op code: the generic eligible-op path rebuilds {callhdr,body}, dispatches via */ \
 	/* callFromMessage -> doWork (the same dtape primitive as UDS), and the reply rides the ring. */ \
+	/* perf#30 STAGE 2 (negative result, kept as documentation): checkin and checkout were tried as
+	   SIMPLE_C2S ops and BOTH wedged boot. They are registration/teardown operations -- the first op a
+	   new process issues, and the last one an exiting thread issues -- so they belong to the process
+	   transport bootstrap / lifecycle design, not to the simple request->reply lane. */ \
+	/* perf#30 (negative result): set_dyld_info / set_executable_path were routed over the ring's
+	   publish-only shape and boot broke -- they are NO_REPLY, so a publish gives the loader no completion
+	   signal and it races ahead of the server applying the state. They stay on the datagram path until a
+	   completion-bearing form exists. */ \
+	/* perf#30 RING_ORDERED_NO_REPLY: the loader's bootstrap writes. The PUBLIC operation is NO_REPLY (it
+	   has no reply body and never had one), but over the Ring the transport still waits for the ordinary
+	   slot acknowledgement the generic eligible-op path publishes -- that is what preserves the ordering
+	   the datagram path gave for free. No new public RPC reply is introduced. */ \
+	X(set_dyld_info) \
+	X(set_executable_path) \
 	X(uidgid) \
 	X(set_thread_handles) \
 	X(started_suspended) \
@@ -475,7 +512,306 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	/* the ops are pure reads of server config written into the guest (no destroy) -> all 5 canon */ \
 	/* rules hold. set_executable_path is deliberately NOT here (pre-attach mldr-only + NO_REPLY). */ \
 	X(mldr_path) \
-	X(vchroot_path)
+	X(vchroot_path) \
+	/* perf#30 FD-COURIER (dar-gwn.7.7.5): lifecycle ops are SIMPLE C2S *semantics* plus a SEPARATE */ \
+	/* descriptor half that travels on the process-scoped SCM_RIGHTS courier. The semantic request has */ \
+	/* no ancillary data at all (it carries a nonzero fd_token), so the simple ring carries it fine and */ \
+	/* the reply is an ordinary header-only reply. checkout's fd instance is the execve path (lane */ \
+	/* ACTIVE); checkin's fd instance is the pre-attach bootstrap checkin, which stays on the datagram */ \
+	/* path until the bootstrap header exists -- its THREAD instances (no fd) ride the lane here. */ \
+	X(checkout) \
+	X(checkin) \
+	/* perf#30 (directive sections 4-5, doc section 206): the BLOCKING family. MEASURED: the hard oracle
+	   named `fork_wait_for_child` first and `semaphore_timedwait` before it as the calls that still asked
+	   for a per-thread socket. Every member has a FIXED inline request, a header-only reply, no descriptor,
+	   no destroy and no caller-S2C, and each of them WAITS -- which is why none of them may live on the
+	   single-slot management plane (a blocking request there would occupy the one slot and stall every other
+	   management operation in the process). Their home is the thread's own Ring lane, where a suspension
+	   costs nothing to anyone else. */ \
+	X(semaphore_wait) \
+	X(semaphore_timedwait) \
+	X(semaphore_wait_signal) \
+	X(semaphore_timedwait_signal) \
+	X(fork_wait_for_child)
+
+// perf#30 FD-COURIER envelope kinds. The courier carries ONLY a descriptor: the kind names which
+// descriptor half a token refers to, so a mismatched pairing is a reject rather than a guess. The
+// envelope itself is { generation, token, kind, fd_count } + SCM_RIGHTS, never a callnum or an RPC body.
+#define DSERVER_FD_COURIER_KIND_LANE_BACKING  1u
+#define DSERVER_FD_COURIER_KIND_CHECKOUT_FD   2u
+#define DSERVER_FD_COURIER_KIND_CHECKIN_FD    3u
+// perf#30 PROCESS-CONTROL PLANE: the backing region of the process-shared management page. It travels
+// on the courier like every other descriptor, and it is the ONLY shared region that carries SEMANTIC
+// commands -- the ring lanes stay hot SPSC request/reply, and this page exists for the rare operations
+// that must happen before a lane can be used or after one is gone (checkin, ring_attach, the ordered
+// bootstrap writes, teardown). One outstanding serialized operation at a time is enough for those, so
+// there is no queue and no MPMC machinery.
+#define DSERVER_FD_COURIER_KIND_PROCESS_CONTROL 4u
+
+// perf#30 FD-COURIER (round 49, SERVER->GUEST): a descriptor the SERVER hands to the guest -- the
+// console channel and the process kqchan. It travels on the SAME process-scoped connection, in the
+// reverse direction, and the reply body names it by token. APPENDED.
+#define DSERVER_FD_COURIER_KIND_CONSOLE_FD    5u
+#define DSERVER_FD_COURIER_KIND_KQCHAN_FD     6u
+// The process doorbell, delivered ONCE per process through the courier instead of on every ring_attach
+// reply. APPENDED.
+#define DSERVER_FD_COURIER_KIND_PROCESS_DOORBELL 7u
+
+// perf#30 (directive D1): VERSION 2 adds the THREAD IDENTITY to the transport envelope. It was 1u and checked
+// NOWHERE, so an old guest and a new server would have silently interpreted each other's page. Two rules come
+// with the bump: the server publishes transport_ready ONLY after size and version match, and the guest does not
+// publish a request into a page whose version it does not recognise. A mismatch is "plane unavailable", not a
+// partially interpreted ABI.
+#define DSERVER_PROCESS_CONTROL_VERSION 2u
+
+// request_state / reply_state
+#define DSERVER_PROCESS_CONTROL_IDLE   0u
+#define DSERVER_PROCESS_CONTROL_PENDING 1u
+#define DSERVER_PROCESS_CONTROL_DONE   2u
+// perf#30 ProcessControlTxn: the server publishes CLAIMED the moment it takes OWNERSHIP of a request. It is
+// deliberately distinct from DONE: ownership transfer is not completion, and a guest that treats the two as
+// the same (or that falls back to another transport because it is still waiting) is exactly what made the
+// first two ATTACH_LANE attempts RED. Once CLAIMED, the request belongs to the server-owned transaction and
+// the guest waits for COMPLETION only. APPENDED.
+#define DSERVER_PROCESS_CONTROL_CLAIMED 3u
+
+// perf#30 MAILBOX SLOT OWNERSHIP (doc sections 59/67): the slot belongs to the PUBLISHER until it has READ its
+// own answer. The server must NOT release it on publish -- doing so lets a second thread of the same process
+// claim the slot and publish its sequence before the first thread has read, so the first observes a foreign
+// `reply_seq`, refuses the result, and repeats the same operation on another transport. MEASURED: that is what
+// 27 thread-create checkins did (the per-thread RPC socket is created only on that path). APPENDED.
+#define DSERVER_PROCESS_CONTROL_RELEASE(page) \
+	__atomic_store_n(&(page)->request_state, DSERVER_PROCESS_CONTROL_IDLE, __ATOMIC_RELEASE)
+
+// request_op
+#define DSERVER_PROCESS_CONTROL_OP_PING 1u
+#define DSERVER_PROCESS_CONTROL_OP_CHECKIN 2u
+#define DSERVER_PROCESS_CONTROL_OP_ATTACH_LANE 3u
+#define DSERVER_PROCESS_CONTROL_OP_SET_DYLD_INFO 4u
+#define DSERVER_PROCESS_CONTROL_OP_SET_EXECUTABLE_PATH 5u
+#define DSERVER_PROCESS_CONTROL_OP_CHECKOUT 6u
+#define DSERVER_PROCESS_CONTROL_OP_PTHREAD_CANCELED 7u
+// perf#30 (directive section 14): the loader/early-lifecycle calls that cannot use a lane. VCHROOT is the
+// guest's vchroot setup, issued before the lane exists; the pointer and size travel in the payload exactly as
+// the datagram body would carry them, and the server runs the ORDINARY vchroot Call. APPENDED.
+#define DSERVER_PROCESS_CONTROL_OP_VCHROOT 8u
+// perf#30 (directive section 16): the descriptor-BEARING early calls. The semantic half travels here and the
+// descriptor travels on the process courier under DSERVER_FD_COURIER_KIND_KQCHAN_FD, with the token returned in
+// reply_payload[1] -- the same split the ATTACH_LANE route uses for the doorbell. APPENDED.
+#define DSERVER_PROCESS_CONTROL_OP_KQCHAN_MACH_PORT_OPEN 9u
+// perf#30 (directive section 20): the urgent ops. They ride the urgent pool, not the single management slot.
+#define DSERVER_PROCESS_CONTROL_OP_INTERRUPT_ENTER 10u
+#define DSERVER_PROCESS_CONTROL_OP_INTERRUPT_EXIT  11u
+// perf#30 (directive section 20 / doc section 87): sigprocess runs in a RAW signal handler and needs a
+// completion, so it publishes to the urgent pool and POLLS its own slot (bounded, signal-safe).
+#define DSERVER_PROCESS_CONTROL_OP_SIGPROCESS 12u
+// perf#30 (directive section 2 / doc sections 107/108): mach_port_move_member is reached before the lane can
+// be relied on, so the lane is not its home and neither is the datagram. Its semantics are the ordinary
+// MachPortMoveMember Call; the page carries the three port names and the reply status.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_MOVE_MEMBER 13u
+// perf#30 (directive section 2 / doc section 110): mach_port_construct has four parameters, so it fills all
+// four payload words and takes the architecture byte from the top byte of payload[3] (the convention
+// kqchan_mach_port_open already uses, where a pointer's high byte is zero). It is reached early like
+// move_member, so the plane -- not the lane and not the datagram -- is its home.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_CONSTRUCT 14u
+// perf#30 (directive section 2 / doc section 111): mach_port_destruct also has four parameters (target, name,
+// srdelta, guard), so it fills all four payload words like mach_port_construct. `guard` is an arbitrary
+// 64-bit value -- NOT a pointer -- so it may not share a byte with the architecture, and the architecture is
+// simply not carried for this op.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_DESTRUCT 15u
+// perf#30 (directive section 2 / doc section 112): mach_port_allocate is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortAllocate Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_ALLOCATE 16u
+// perf#30 (directive section 2 / doc section 112): mach_port_extract_member is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortExtractMember Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_EXTRACT_MEMBER 17u
+// perf#30 (directive section 2 / doc section 112): mach_port_guard is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortGuard Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_GUARD 18u
+// perf#30 (directive section 2 / doc section 112): mach_port_insert_member is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortInsertMember Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_INSERT_MEMBER 19u
+// perf#30 (directive section 2 / doc section 112): mach_port_insert_right is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortInsertRight Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_INSERT_RIGHT 20u
+// perf#30 (directive section 2 / doc section 112): mach_port_mod_refs is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortModRefs Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_MOD_REFS 21u
+// perf#30 (directive section 2 / doc section 112): mach_port_type is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortType Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_TYPE 22u
+// perf#30 (directive section 2 / doc section 112): mach_port_unguard is an early Mach port operation, so its
+// home is the process management plane. The parameters travel in the payload words and the server runs
+// the ordinary MachPortUnguard Call, so the semantics exist once.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_UNGUARD 23u
+// perf#30 (directive section 2 / doc section 113): the Mach semaphore signalling operations are early and
+// non-blocking, so the plane is their home. semaphore_wait is deliberately NOT here: it BLOCKS, and the plane
+// is a single serialized slot serviced inside the server's own loop pass -- a blocking call would occupy that
+// slot and stall every other management request in the process.
+#define DSERVER_PROCESS_CONTROL_OP_SEMAPHORE_SIGNAL 24u
+#define DSERVER_PROCESS_CONTROL_OP_SEMAPHORE_SIGNAL_ALL 25u
+// perf#30 (directive sections 2/16/17): console_open is a descriptor-bearing EARLY call -- the guest reaches it
+// from launchd's first console setup -- so its home is the process management plane. Its wrapper
+// (dserver_rpc_console_open) takes the per-thread RPC socket first and returns -EPIPE from
+// dserver_rpc_hooks_get_broken_pipe_status when there is none, and openat.c reads any negative value as an
+// INTERNAL failure and answers with __simple_abort() -- inside open(), with launchd's own stderr already
+// pointed at /dev/null. MEASURED: the server never receives a console_open while launchd dies at that exact
+// line. The semantic half is the ordinary ConsoleOpen Call and the descriptor travels on the process courier
+// with its token in reply_payload[1], exactly as KQCHAN_MACH_PORT_OPEN (9u) does.
+#define DSERVER_PROCESS_CONTROL_OP_CONSOLE_OPEN 26u
+// perf#30 (doc section 202, directive section 12): the vchroot path QUERY, appended last. The plane already
+// carried vchroot (8u), but that op is the SETTER -- it takes a path from the guest. MEASURED: using it for the
+// loader's query returned -EINVAL, because the setter requires a NUL-terminated, NUL-free string, and the loader's
+// zeroed buffer has an embedded NUL at byte 0. The query is its own operation: buffer pointer and size travel in
+// the payload, the server runs the ordinary call (which writes the path through the process's memory interface) and
+// the reply's length is the status.
+#define DSERVER_PROCESS_CONTROL_OP_VCHROOT_PATH 27u
+// perf#30 (directive section 1, doc section 206): mach_port_request_notification is reached EARLY -- the hard
+// oracle (DARLING_DISABLE_THREAD_RPC_UDS=1) named it as the FIRST call that asks for a per-thread socket, from the
+// main thread, before any lane can be relied on. That is the same class as mach_port_type / mach_port_mod_refs /
+// mach_port_unguard / vchroot, whose home is the process MANAGEMENT PLANE with the ordinary Call supplying the
+// semantics. Its four 32-bit request words travel two-per-payload-word and the OUT parameter `previous` travels as
+// the GUEST ADDRESS the ordinary Call writes through writeMemory -- the Call owns that write, so no second copy of
+// the semantics exists here.
+#define DSERVER_PROCESS_CONTROL_OP_MACH_PORT_REQUEST_NOTIFICATION 28u
+// perf#30 (directive sections 16-17, doc section 206): kqchan_proc_open is the same class as
+// KQCHAN_MACH_PORT_OPEN (9u) and CONSOLE_OPEN (26u) -- a DESCRIPTOR-BEARING early call. The semantic half is the
+// ordinary KqchanProcOpen Call (one implementation of the semantics) and the descriptor the call RETURNS travels on
+// the process courier with its token in reply_payload[1]. MEASURED: the hard oracle denied it at the outer generated
+// wrapper, which asked for a per-thread socket before the lane could be attempted; as with console_open, the guest
+// reaches it through libkqueue's own helper, not through a call wrapper whose route the generator controls.
+#define DSERVER_PROCESS_CONTROL_OP_KQCHAN_PROC_OPEN 29u
+
+// perf#30 REMOVAL STEP 2 (measured): pthread_kill is the LAST call in the guest's ordinary syscall surface that
+// forced the per-thread RPC socket into existence -- under DARLING_DISABLE_THREAD_RPC_UDS=1 the hard oracle named it
+// (`[rpc-socket-DENIED] call=pthread_kill`), because `raise()` in a Darling guest IS a pthread_kill to the calling
+// thread. Its home is the MANAGEMENT PLANE, not the Ring: the target may BE the caller, and a thread parked on a
+// ring reply cannot service an S2C upcall (the C2S allowlist's membership rule). No upcall is needed for it --
+// MEASURED: the ordinary PThreadKill Call's whole semantics is `Thread::threadForPort` + `Thread::sendSignal`, and
+// sendSignal is a host tgkill -- so the plane carries it exactly the way it carries pthread_canceled (7u), by direct
+// servicing. The datagram remains only as the not-published fallback. APPENDED.
+#define DSERVER_PROCESS_CONTROL_OP_PTHREAD_KILL 30u
+
+// perf#30 (directive sections 19-21): thread_self_trap is the LAST ordinary call that still forced a datagram.
+// The loader asks for the main thread's self port BEFORE its deferred checkin creates the server-side Thread
+// (mldr.c:480 asks, :502 consumes the name, the checkin runs later), so this op must BOTH register the thread and
+// answer the trap. It cannot use the ordinary Call dispatch: that ingest derives the process from a peer socket the
+// plane does not have (MEASURED, doc section 222: it left a Mach object ipc_port_destroy could not tear down), and
+// running Mach semantics inside the plane pass is unsafe anyway (doc section 223: the pass is not an XNU thread,
+// current_thread() == NULL, and the port destroy faults at +0x3c). So registration happens here through the static
+// Call::registerPeerForMessage with the plane's own process as reuseProcess -- the helper is documented for exactly
+// this route (doc section 219) -- and the trap is answered by dtape_thread_self_trap_for(), which operates in the
+// GUEST process's IPC space and therefore returns a name usable as-is. The name travels in reply_payload[0]; no
+// descriptor transport is involved (pushDescriptor carries file descriptors only). APPENDED.
+#define DSERVER_PROCESS_CONTROL_OP_THREAD_SELF_BOOTSTRAP 31u
+
+// perf#30 (directive sections 19-21): the URGENT channel. interrupt_enter/interrupt_exit are published from
+// SIGNAL CONTEXT, so they may not park, may not wait, and may not touch lazily-initialised state -- and they may
+// not use the thread's own lane either, because the handler can interrupt the thread that holds it. They are
+// therefore fire-and-forget management publications: a bounded pool of slots in the SAME shared mapping, claimed
+// with a CAS, with the caller returning immediately. The server services them in the same pass as the management
+// slot and the reply is informational (the guest does not wait for it: the effect the caller needs is the
+// server's flush of a saved reply onto the thread's LANE, which is serviced when the handler returns).
+// A fixed pool, never an allocator. APPENDED.
+#define DSERVER_PROCESS_CONTROL_URGENT_SLOTS 4u
+#define DSERVER_PROCESS_CONTROL_URGENT_IDLE 0u
+#define DSERVER_PROCESS_CONTROL_URGENT_PENDING 1u
+#define DSERVER_PROCESS_CONTROL_URGENT_DONE 2u
+
+struct dserver_process_control {
+	uint32_t version;
+	uint32_t request_state;
+	uint32_t request_op;
+	uint32_t request_seq;
+	uint64_t request_payload[4];
+	uint32_t reply_state;
+	int32_t  reply_status;
+	uint32_t reply_seq;
+	uint32_t reserved;
+	uint64_t reply_payload[4];
+	// 0 = server did not touch the reply yet; the guest waits on it only while PENDING.
+	uint32_t futex;
+	uint32_t server_seen;
+	// perf#30 PHASE-0 (round 49f): TRANSPORT registration, deliberately separate from semantic
+	// registration. The server sets this the moment it has MAPPED the region -- which it does from the
+	// courier's SO_PEERCRED pid alone, with no Process and no Thread in existence. A guest waiting on it
+	// is therefore waiting for a TRANSPORT acknowledgement, not for a semantic round trip: that is the
+	// difference between this and the synchronous PING of round 48, whose answer depended on the normal
+	// Process state and which was measured RED when issued before the loader's first write. APPENDED.
+	volatile uint32_t transport_ready;
+	uint32_t reserved2;
+	// perf#30: attach-route attribution, written by the guest on the page the moment it is usable. MEASURED
+	// need: the guest-side diagnostic for this route is environment-gated and the earliest window has no
+	// environment yet, so the two bail paths that ARE reachable with a page (not-ready, refused) could not be
+	// counted anywhere. These are counters, not diagnostics: they need no environment and no printing.
+	// APPENDED.
+	volatile uint32_t attach_route_ok;
+	volatile uint32_t attach_route_not_ready;
+	volatile uint32_t attach_route_refused;
+	// perf#30: the server CLAIMED the attach and the guest's wait expired without a completion. This is NOT a
+	// fallback case: falling back is what produced a second attach for the same tid in the two RED attempts.
+	volatile uint32_t attach_route_claimed_no_lane;
+	// perf#30: the guest could not claim the mailbox slot within its bound. One outstanding request per page is
+	// the model, and the claim is a CAS -- MEASURED: without it several threads of one image published over each
+	// other's sequence, the server answered one of them, and the others waited forever.
+	volatile uint32_t attach_route_no_slot;
+	// perf#30: the process that CREATED this page. MEASURED need: a forked child inherits the parent's
+	// `g_process_control_page` (a static in the image), so it published its requests into the PARENT's page
+	// and the server answered there -- the child's caller then waited for a reply that belonged to another
+	// process, which is exactly the third-attach hang. A page belongs to one process incarnation. APPENDED.
+	volatile int32_t owner_pid;
+	// NOTE: six per-site checkin attribution counters were tried here and REMOVED: they were never incremented
+	// and therefore read a constant zero, which is the "counter that always answers the same way" defect this
+	// work has already recorded twice (the dead attach-caller counters and the sampled route counters). The
+	// aggregate heatmap carries the movement they were meant to explain, and a counter that cannot be wrong is
+	// not evidence.
+	// NOTE: no path buffer is needed. The ordinary SetExecutablePath call reads the path out of the
+	// CALLER's memory (`process->readMemory(_body.buffer, ...)`), so the page only has to carry the guest
+	// pointer and the length -- the same two values the datagram body carries. Reusing the call's own
+	// implementation is what keeps the semantics identical; a page-side string copy would be a second
+	// implementation of the same operation.
+	// perf#30 (directive sections 19-21): the URGENT channel, for the signal-context calls. A fixed pool --
+	// never an allocator -- so a handler can publish without waiting and without touching lazily-initialised
+	// state. The publisher claims a slot with a CAS, fills it, publishes with a release store and rings the
+	// process doorbell; it does NOT wait. The server services every pending slot in the same pass as the
+	// management slot and writes the informational reply back into the slot. APPENDED.
+	volatile uint32_t urgent_state[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	volatile uint32_t urgent_op[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	volatile uint32_t urgent_seq[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	volatile uint32_t urgent_pad[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	// WIDENED to eight words (doc section 88): sigprocess carries four int32s, a signal address and two
+	// structure POINTERS the server writes into -- five words -- and the shapes do not pack.
+	volatile uint64_t urgent_payload[DSERVER_PROCESS_CONTROL_URGENT_SLOTS][8];
+	volatile int32_t urgent_reply_status[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	volatile uint32_t urgent_reply_seq[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	// perf#30 (directive D1): THREAD IDENTITY IS PART OF THE TRANSPORT ENVELOPE, not an op-specific payload
+	// word. The page is process-scoped, but several operations are thread-scoped (cancellation, port ops,
+	// interrupts, signals), and the substitute `call->header.tid = pid` is a DIFFERENT NUMBER from the guest's
+	// tid: it silently serviced whichever thread `pid` happened to resolve to, and it could not distinguish two
+	// threads of one process at all. APPENDED, so no existing offset moves.
+	//
+	// `request_tid` is published with the request (before the release store of request_state); `urgent_tid[u]`
+	// is published with urgent slot u, by the same raw-syscall rule the urgent pool already follows, because a
+	// signal-context publisher cannot touch lazily-initialised machinery.
+	volatile int32_t request_tid;
+	uint32_t reserved3;
+	volatile int32_t urgent_tid[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+	volatile uint32_t urgent_reserved[DSERVER_PROCESS_CONTROL_URGENT_SLOTS];
+};
+
+struct dserver_fd_courier_message {
+	uint64_t process_generation;
+	uint64_t token;
+	uint32_t kind;
+	uint32_t fd_count;
+};
 
 // === perf #18 Phase A (dar-dar6x4-perf-5dq.30.1): THREE-LANE hybrid IPC taxonomy + guardrail ======
 //
@@ -484,26 +820,23 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 //   Lane 0  UDS            -- control/fallback: bootstrap, creds, fd-passing, unknown/complex ops,
 //                             and destroy-capable / caller-S2C ops UNTIL a duplex lane proves them.
 //   Lane 1  simple ring    -- CLOSED request->single-reply transactions, NO caller S2C while parked.
-//                             Two sub-tiers (see below): generic-fiber (Tier 1) and no-fiber (Tier 2).
+//                             Calls retain a fiber: IPC locks can suspend even port-minting traps.
 //   Lane 2  duplex ring    -- FUTURE reentrant lane for caller-S2C-capable ops (dar-1il.3). Not built.
 //
 // The lane an op MAY use is a set of orthogonal, independently-proven properties. Encode them as
 // explicit bits so the code stops overloading "fast op" / "allowlist" / "ring op" (plan.md §6):
 //
 //   SimpleRingC2SEligible  -- may ride the Lane-1 simple ring (== membership in DSERVER_RING_C2S_OPCODES)
-//   NoFiberFastEligible    -- may ALSO skip the generic fiber/Call machinery (Tier 2; ringFastPathEligible)
 //   DuplexRingEligible     -- may ride the FUTURE Lane-2 duplex ring (no op qualifies yet)
 //   UdsOnly                -- must stay on UDS for now (no ring lane is safe for it yet)
 //   DestroyCapable         -- may, for SOME args, drop a last ref / tear down / cause a caller S2C
 //   CallerS2CCapable       -- may synchronously upcall the CALLER (mmap/munmap/...) before its reply
 //
 // POLICY (these are the load-bearing relationships; the static guardrail below enforces #2/#3):
-//   1. SimpleRingC2SEligible, NoFiberFastEligible, and DuplexRingEligible are DISTINCT concepts.
-//      SimpleRingC2SEligible does NOT imply NoFiberFastEligible (Tier 2 is a strictly smaller proven
-//      set). A future DuplexRingEligible op is NOT automatically SimpleRingC2SEligible.
+//   1. SimpleRingC2SEligible and DuplexRingEligible are DISTINCT concepts.
+//      A future DuplexRingEligible op is NOT automatically SimpleRingC2SEligible.
 //   2. DestroyCapable  => NOT SimpleRingC2SEligible. (canon rule 2: a teardown can drive a caller S2C.)
 //   3. CallerS2CCapable => NOT SimpleRingC2SEligible. (canon rule 1: a parked caller can't service it.)
-//   4. NoFiberFastEligible => SimpleRingC2SEligible. (Tier 2 is a sub-lane of Tier 1.)
 //
 // CLASSIFICATION TABLE: every Mach op that is RING-RELEVANT (already on a ring lane, or a known
 // future/duplex candidate the canon has ruled on) is listed here with its lane-class bits, so the
@@ -511,31 +844,32 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 // An op that never comes near a ring lane (the vast majority) need NOT be listed -- absence just
 // means "unclassified == treated as UdsOnly by default". X is invoked as X(op, classbits).
 #define DSERVER_RING_CLASS_SIMPLE_C2S   0x01u // SimpleRingC2SEligible: in DSERVER_RING_C2S_OPCODES
-#define DSERVER_RING_CLASS_NOFIBER_FAST 0x02u // NoFiberFastEligible: Tier-2 no-fiber direct dispatch
 #define DSERVER_RING_CLASS_DUPLEX       0x04u // DuplexRingEligible: future Lane-2 (none yet)
 #define DSERVER_RING_CLASS_UDS_ONLY     0x08u // UdsOnly: no ring lane safe yet
 #define DSERVER_RING_CLASS_DESTROY      0x10u // DestroyCapable: can tear down / drop last ref
-#define DSERVER_RING_CLASS_CALLER_S2C   0x20u // CallerS2CCapable: can upcall the caller pre-reply
+#define DSERVER_RING_CLASS_CALLER_S2C   0x20u // CallerS2CCapable: can upcall the parked caller
+// perf#30 (directive section 6, doc section 206): RING_BLOCKING -- a fixed-body call that may SUSPEND the server's
+// fiber (a semaphore wait, a wait for a child) and still has exactly ONE final reply. It rides the Ring for the same
+// reason every other closed request->reply does -- one outstanding request per thread lane, one reply addressed to
+// that lane -- and the server's generic dispatcher is fiber-backed, so the suspension does not stall the event loop.
+// The guest's wait is the ordinary one (spin, advertise as a waiter, FUTEX_WAIT with no transport deadline,
+// re-check): the SEMANTIC timeout lives in the request body and is decided by the server's Call, never invented by
+// the transport (directive section 8). Distinct from SIMPLE_C2S in what it MEANS, not in what it can do: the canon
+// guard below still requires no destroy and no caller-S2C.
+#define DSERVER_RING_CLASS_BLOCKING     0x40u // BlockingRingEligible: may suspend the server fiber, one final replye caller pre-reply
 
 #define DSERVER_RING_OP_CLASS(X) \
-	/* Lane 1 + Tier 2 (no-fiber): pure mint, never blocks, never an S2C. */ \
-	X(task_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	/* perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap join the pure-mint family. They */ \
-	/* have a BYTE-IDENTICAL shape to task_self_trap (empty request, single uint32 port_name reply; */ \
-	/* generate-rpc-wrappers.py:305-315) and the same processCall structure (dtape_*_self_trap mint + */ \
-	/* _sendReply, call.cpp:617-625) -- pure mint via current_task()/current's space, never blocks, */ \
-	/* never an S2C, never destroys. Chosen by the D9 heatmap (dar-1il.4) as the next migration: 100% */ \
-	/* UDS today, caller_s2c=0, ~12% of workload RPC. Tier-2 no-fiber-safe exactly like task_self_trap. */ \
-	X(thread_self_trap,       DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	X(host_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	X(mach_reply_port,        DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_NOFIBER_FAST) \
-	/* Lane 1 Tier 1 (generic fiber): create/ref bookkeeping, no teardown, no caller S2C. */ \
+	/* Port minting/copyout can wait on shared IPC locks; all calls use a fiber. */ \
+	X(task_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(thread_self_trap,       DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(host_self_trap,         DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(mach_reply_port,        DSERVER_RING_CLASS_SIMPLE_C2S) \
+	/* Create/ref bookkeeping, no teardown, no caller S2C. */ \
 	X(mach_port_allocate,     DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(mach_port_insert_right, DSERVER_RING_CLASS_SIMPLE_C2S) \
-	/* perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch -- SIMPLE_C2S ONLY (Tier-1 generic fiber, */ \
-	/* NOT NoFiberFast). These read/mutate process or thread state (creds, pthread handles, suspend/tracer */ \
-	/* flags, 64-bitness) via the generic Call path, NOT pure mint, so they are NOT no-fiber-safe like the */ \
-	/* self-trap family -- they stay Tier 1. None is destroy-capable or caller-S2C, so the canon holds. */ \
+	/* Process/thread state operations also use the generic fiber-backed Call path. */ \
+	X(set_dyld_info,          DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(set_executable_path,    DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(uidgid,                 DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(set_thread_handles,     DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(started_suspended,      DSERVER_RING_CLASS_SIMPLE_C2S) \
@@ -546,7 +880,27 @@ static inline void dserver_ring_consumer_advance(dserver_ring_t* ring) {
 	/* so no arena and no caller-S2C. Pure read of server config -> not destroy-capable. */ \
 	X(mldr_path,              DSERVER_RING_CLASS_SIMPLE_C2S) \
 	X(vchroot_path,           DSERVER_RING_CLASS_SIMPLE_C2S) \
-	/* UDS-only today: destroy-capable -> caller-S2C deadlock on the simple ring. The right home is */ \
+	/* perf#30 FD-COURIER: the lifecycle semantics are an ordinary closed request->reply; their FD half */ \
+	/* rides the process courier instead of the RPC socket, so the semantic request carries no */ \
+	/* ancillary data and no caller-S2C. checkout with a descriptor is the execve path (lane ACTIVE). */ \
+	X(checkout,               DSERVER_RING_CLASS_SIMPLE_C2S) \
+	X(checkin,                DSERVER_RING_CLASS_SIMPLE_C2S) \
+	/* perf#30 (directive section 6, doc section 206): the BLOCKING family -- classified explicitly, not as
+	   SIMPLE, because what distinguishes them is that the server's Call may suspend and there is still exactly
+	   one final reply. The canon guard (no destroy, no caller-S2C) applies to them unchanged. */ \
+	X(semaphore_wait,            DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	X(semaphore_timedwait,       DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	X(semaphore_wait_signal,     DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	X(semaphore_timedwait_signal, DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	X(fork_wait_for_child,       DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	/* perf#30 (doc section 235): the SIGNAL half of the same family, and it belongs on the SAME transport. MEASURED:
+	   with only the four WAITS on the ring, a signal went by the process plane, whose single slot was held by the
+	   parked wait; the plane call could not be published, the datagram fallback was DENIED by the hard hatch, and the
+	   waiter was never woken -- a mutual wait visible in the stall dump as `active=62 semaphore_timedwait` plus
+	   `active=38`. A signal must never queue behind the wait it exists to release. */ \
+	X(semaphore_signal,          DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	X(semaphore_signal_all,      DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) \
+	/* perf#30: the PSYNCH family -- the last ordinary syscall surface that still forced the per-thread RPC socket, 	   and it forced it into a guest kill. MEASURED: sys_psynch_mutexdrop and sys_psynch_mutexwait call 	   dserver_rpc_<op>, whose transport hook (dserver_rpc_hooks_get_socket == mach_driver_get_fd) declines 	   unconditionally now; dserver_ring_op_class() returned 0 for them == unclassified == UdsOnly, so the ring 	   refused them too, dserver_rpc_* returned negative, and the guest answered with __simple_abort(): 	   [rpc-socket-DENIED call=psynch_mutexwait] followed by RING_MACH_TEST_CRASH sig=6 at __simple_abort, reached 	   from pthread_mutex_unlock -> funlockfile -> fflush. Their home is this ring, with the same two classes the 	   semaphore family uses: the four WAITS may suspend the server fibre (BLOCKING), the rest are SIMPLE_C2S. 	   The canon guard is unchanged and these ops satisfy it: no destroy, no caller-S2C. */ 	X(psynch_mutexwait,          DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) 	X(psynch_cvwait,             DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) 	X(psynch_rw_rdlock,          DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) 	X(psynch_rw_wrlock,          DSERVER_RING_CLASS_SIMPLE_C2S | DSERVER_RING_CLASS_BLOCKING) 	X(psynch_mutexdrop,          DSERVER_RING_CLASS_SIMPLE_C2S) 	X(psynch_cvbroad,            DSERVER_RING_CLASS_SIMPLE_C2S) 	X(psynch_cvsignal,           DSERVER_RING_CLASS_SIMPLE_C2S) 	X(psynch_cvclrprepost,       DSERVER_RING_CLASS_SIMPLE_C2S) 	X(psynch_rw_unlock,          DSERVER_RING_CLASS_SIMPLE_C2S) 	/* UDS-only today: destroy-capable -> caller-S2C deadlock on the simple ring. The right home is */ \
 	/* the future duplex lane (dar-1il.3) -- "wrong lane, not bad op". They are DuplexRingEligible */ \
 	/* CANDIDATES but NOT yet proven, so they carry UDS_ONLY until Phase D/E lands. */ \
 	X(mach_port_deallocate,   DSERVER_RING_CLASS_UDS_ONLY | DSERVER_RING_CLASS_DESTROY | DSERVER_RING_CLASS_CALLER_S2C) \
@@ -610,6 +964,8 @@ static_assert(dserver_ring_c2s_set_is_canon_safe(),
 	"above; such ops belong on the future duplex lane (dar-1il.3), not Lane 1.");
 #endif
 #endif // _DARLINGSERVER_API_H_
+
+#ifdef DSERVER_RING_TRANSPORT
 
 // --- C2S opcode-set ABI tie (perf #18 dar-1il.2 item 2) ---------------------------------------
 //
@@ -730,6 +1086,14 @@ typedef struct dserver_ring_shm {
 	uint32_t duplex_reply_arg;                          // the echo result the guest computed (ECHO shape)
 	// perf #18 P8 D4: the errno from a real S2C upcall (MUNMAP). For ECHO this is unused (0).
 	int32_t  duplex_reply_errno;                        // munmap errno_result (0 on success)
+	// --- ABI v6: anonymous-mmap upcall payload ---------------------------------------------------
+	// UPCALL_MMAP carries mmap(2)'s protection + flags; its address/length reuse duplex_upcall_addr/len
+	// and its offset is ALWAYS 0 and its fd ALWAYS -1 (that is what makes it mailbox-carryable), so
+	// neither needs a field. The reply needs a 64-bit value because mmap returns the mapped ADDRESS;
+	// duplex_reply_status still carries 0/-1 so the munmap-shaped readers keep working.
+	uint32_t duplex_upcall_flags;                       // mmap(2) flags (UPCALL_MMAP)
+	uint32_t _duplex_v6_pad;                            // keeps duplex_reply_value 8-byte aligned
+	uint64_t duplex_reply_value;                        // UPCALL_MMAP's return value (the mapped address)
 } dserver_ring_shm_t;
 
 // --- P4 wake-model decision predicates (shared by guest, server, and the host gate) ----------
@@ -792,6 +1156,38 @@ static inline void dserver_ring_duplex_publish_munmap_upcall(
 	cb->duplex_upcall_addr   = address;
 	cb->duplex_upcall_len    = length;
 	__atomic_store_n(&cb->duplex_upcall_ready, 1u, __ATOMIC_RELEASE); // publish (linearization point)
+}
+
+// ABI v6: server publishes an ANONYMOUS-mmap S2C upcall. Same linearization discipline as the munmap
+// publish (body first, ready release-stored LAST). address/length reuse the munmap payload fields;
+// protection/flags ride duplex_upcall_arg/duplex_upcall_flags; offset is 0 and fd is -1 by construction.
+static inline void dserver_ring_duplex_publish_mmap_upcall(
+	dserver_ring_shm_t* cb, uint32_t parent_id, uint32_t upcall_id, uint64_t address, uint64_t length,
+	uint32_t protection, uint32_t flags) {
+	cb->duplex_upcall_op     = DSERVER_RING_DUPLEX_UPCALL_MMAP;
+	cb->duplex_upcall_parent = parent_id;
+	cb->duplex_upcall_id     = upcall_id;
+	cb->duplex_upcall_arg    = protection;
+	cb->duplex_upcall_addr   = address;
+	cb->duplex_upcall_len    = length;
+	cb->duplex_upcall_flags  = flags;
+	__atomic_store_n(&cb->duplex_upcall_ready, 1u, __ATOMIC_RELEASE); // publish (linearization point)
+}
+
+// ABI v6: guest publishes an ANONYMOUS-mmap upcall reply: status is 0 on success / -1 on error (so the
+// munmap-shaped readers stay valid), the errno rides duplex_reply_errno, and the mapped ADDRESS rides the
+// new 64-bit duplex_reply_value.
+static inline void dserver_ring_duplex_publish_mmap_reply(
+	dserver_ring_shm_t* cb, uint32_t parent_id, uint32_t upcall_id, int32_t status, int32_t errno_result,
+	uint64_t value) {
+	cb->duplex_reply_parent = parent_id;
+	cb->duplex_reply_id     = upcall_id;
+	cb->duplex_reply_status = status;
+	cb->duplex_reply_arg    = 0;
+	cb->duplex_reply_errno  = errno_result;
+	cb->duplex_reply_value  = value;
+	__atomic_store_n(&cb->duplex_upcall_ready, 0u, __ATOMIC_RELEASE);
+	__atomic_store_n(&cb->duplex_reply_ready, 1u, __ATOMIC_RELEASE); // publish reply (linearization point)
 }
 
 // Guest pump: is an S2C upcall available? (acquire so the body is visible once ready is seen)
