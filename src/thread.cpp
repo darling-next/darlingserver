@@ -20,6 +20,7 @@
 #include "darlingserver/registry.hpp"
 #include <darlingserver/thread.hpp>
 #include <darlingserver/microthread-resume.hpp>
+#include <darlingserver/interrupt-resume.hpp>
 #include <darlingserver/processcall-guard.hpp>
 #include <darlingserver/process.hpp>
 #include <darlingserver/call.hpp>
@@ -633,6 +634,7 @@ void DarlingServer::Thread::doWork() {
 			__sanitizer_start_switch_fiber(&asanOldFakeStack, _stack.base, _stack.size);
 #endif
 
+			_resumeContextValid = false; // consumed by the setcontext() below
 			setcontext(&_resumeContext);
 		} else {
 			if (!_pendingCall) {
@@ -754,6 +756,7 @@ void DarlingServer::Thread::suspend(std::function<void()> continuationCallback, 
 	unlockMeWhenSuspending = unlockMe;
 
 	getcontext(&_resumeContext);
+	_resumeContextValid = true;
 
 	_rwlock.lock();
 	// Consume a wake that arrived while the resume context was being captured.
@@ -866,6 +869,7 @@ void DarlingServer::Thread::setupKernelThread(std::function<void()> startupCallb
 	_continuationCallback = startupCallback;
 	_suspended = true;
 	getcontext(&_resumeContext);
+	_resumeContextValid = true;
 };
 
 void DarlingServer::Thread::startKernelThread(std::function<void()> startupCallback) {
@@ -2513,6 +2517,7 @@ void DarlingServer::Thread::jumpToResume(void* stack, size_t stackSize) {
 #if DSERVER_ASAN
 	__sanitizer_start_switch_fiber(&asanOldFakeStack, stack, stackSize);
 #endif
+	_resumeContextValid = false; // consumed by the setcontext() below
 	setcontext(&_resumeContext);
 	__builtin_unreachable();
 };
@@ -2725,12 +2730,30 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 	currentThreadVar = self;
 
 	if (!self->_didSyscallReturnDuringInterrupt) {
-		if (localInterruptedContinuation) {
-			localInterruptedContinuation();
-		} else if (self->_interrupts.top().interruptedCall) {
-			self->_handlingInterruptedCall = true;
-			self->_pendingCallOverride = true;
-			self->jumpToResume(self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
+		// WHICH RESUME APPLIES IS A STATE-MACHINE DECISION, NOT A GUESS. MEASURED defect: the old
+		// branch restored `_resumeContext` whenever an interrupted call existed, but a call can be
+		// interrupted without ever having suspended (its Thread then has no captured context), and
+		// glibc's setcontext() faults on such a context (fpregs == NULL). The decision lives in
+		// InterruptResume::classify() so the host contract drives every case; a call that was never
+		// suspended is completed by its own path instead of being forced through the
+		// suspended-context path.
+		InterruptResume::State irqState;
+		irqState.didSyscallReturnDuringInterrupt = false;
+		irqState.haveInterruptedContinuation = (localInterruptedContinuation != nullptr);
+		irqState.haveInterruptedCall = (self->_interrupts.top().interruptedCall != nullptr);
+		irqState.resumeContextCaptured = self->_resumeContextValid;
+
+		switch (InterruptResume::classify(irqState)) {
+			case InterruptResume::Action::RunContinuation:
+				localInterruptedContinuation();
+				break;
+			case InterruptResume::Action::ResumeCapturedContext:
+				self->_handlingInterruptedCall = true;
+				self->_pendingCallOverride = true;
+				self->jumpToResume(self->_interrupts.top().savedStack.base, self->_interrupts.top().savedStack.size);
+				break;
+			case InterruptResume::Action::CompleteInterrupt:
+				break;
 		}
 	} else if (self->_handlingInterruptedCall) {
 #if DSERVER_ASAN

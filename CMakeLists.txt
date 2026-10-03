@@ -128,6 +128,7 @@ add_executable(darlingserver
 	src/process.cpp
 	src/thread.cpp
 	src/utility.cpp
+	src/interrupt-resume.cpp
 	src/kqchan.cpp
 	src/async-writer.cpp
 	src/stack-pool.cpp
@@ -177,6 +178,15 @@ target_compile_options(dserver_exec_completion_tests PRIVATE
 	-std=c++17
 )
 add_test(NAME dserver_exec_completion COMMAND dserver_exec_completion_tests)
+
+add_executable(dserver_interrupt_resume_tests
+	tests/interrupt_resume_test.cpp
+	src/interrupt-resume.cpp
+)
+target_compile_options(dserver_interrupt_resume_tests PRIVATE
+	-std=c++17
+)
+add_test(NAME dserver_interrupt_resume COMMAND dserver_interrupt_resume_tests)
 
 add_dependencies(darlingserver
 	generate_dserver_rpc_wrappers

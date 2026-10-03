@@ -97,6 +97,12 @@ namespace DarlingServer {
 		bool _suspended = false;
 		bool _resumePermit = false;
 		ucontext_t _resumeContext;
+		// Validity of `_resumeContext`: true only between a getcontext() that captured it and a
+		// setcontext() that consumed it. A Thread that never suspended (measured: a thread created
+		// for an already-running post-exec image, and any interrupt stacked on a call that never
+		// reached suspend()) has no captured context, and restoring it would fault inside glibc's
+		// setcontext(). See darlingserver/interrupt-resume.hpp.
+		bool _resumeContextValid = false;
 		dtape_thread_t* _dtapeThread;
 		std::function<void()> _continuationCallback = nullptr;
 		MicrothreadExecution _execution;
