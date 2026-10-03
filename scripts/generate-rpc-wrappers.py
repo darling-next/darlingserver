@@ -16,6 +16,7 @@ XNU_BSD_TRAP_CALL      = XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX |
 UNMANAGED_CALL         = 1 << 6
 ALLOW_INTERRUPTIONS    = 1 << 7
 PUSH_UNKNOWN_REPLIES   = 1 << 8
+NO_REPLY               = 1 << 9
 
 # NOTE: in Python 3.7+, we can rely on dictionaries having their items in insertion order.
 #       unfortunately, we can't expect everyone building Darling to have Python 3.7+ installed.
@@ -92,6 +93,18 @@ calls = [
 	#     call queued for delivery when the signal was received, the client will send interrupt_enter and immediately receive the reply to the interrupted
 	#     call. without handling this gracefully (by saving the reply for later), RPC communication becomes desynchronized and the program crashes.
 	#
+	#   NO_REPLY
+	#     (perf #10, dar-dar6x4-perf-5dq.17) marks a "fire-and-forget" call: the client sends the request and returns
+	#     IMMEDIATELY without waiting for a reply. The profile (perf #9) showed pure setters with an empty reply
+	#     (set_dyld_info, set_executable_path, set_thread_handles) each cost a full synchronous round-trip -- send plus a
+	#     ~200us recvmsg sleep -- only to read a status code the guest discards; that sleep dominates build wall-clock (perf #6).
+	#     For a NO_REPLY call the generated client wrapper skips the entire receive block (returning 0 after a good send), and
+	#     the server-side _sendReply is generated as a NO-OP so the server emits no reply datagram (a stray reply would land in
+	#     the per-thread socket buffer and desync the NEXT synchronous call's reply matching). processCall() still runs the work.
+	#     CONSTRAINTS: NO_REPLY is only valid for calls with NO reply parameters (nothing to return), and only for calls whose
+	#     status code the caller genuinely ignores. Ordering is preserved -- the per-thread socket delivers datagrams in send
+	#     order, so a NO_REPLY setter is always processed before any later synchronous call that depends on its effect.
+	#
 	#     note that this flag should only be used in very special circumstances (interrupt_enter currently being the only such one).
 	#     not only can it mask legitimate RPC communication errors, but it also requires significantly more stack space to handle such calls,
 	#     as the wrapper must create a buffer large enough to store any possible reply (including any potential descriptors).
@@ -105,15 +118,24 @@ calls = [
 	#       we only use our RPC for darlingserver calls.
 	#
 
+	# perf#30 FD-COURIER: the MAIN-THREAD checkin -- the loader's, and a fork child's -- stays on the
+	# datagram path, because it is ordered against checkout in the exec/fork handshake and the lane
+	# cannot promise that ordering against a socket. MEASURED: routing it (with or without its
+	# descriptor) wedges boot. The pthread-create checkin below is a different operation: no descriptor,
+	# no ordering dependency, and it is the one that belongs on the lane.
 	('checkin', [
 		('is_fork', 'bool'),
 		('stack_hint', 'void*', 'uint64_t'),
-		('lifetime_listener_pipe', '@fd')
+		('lifetime_listener_pipe', '@fd'),
+		('fd_token', '@fd_token')
 	], []),
 
 	('checkout', [
 		('exec_listener_pipe', '@fd'),
 		('executing_macho', 'bool'),
+		# perf#30 FD-COURIER: see checkin. checkout's fd instance is the execve path, which runs with an
+		# ACTIVE lane, so its semantic request rides the Ring while the descriptor rides the courier.
+		('fd_token', '@fd_token'),
 	], []),
 
 	('vchroot_path', [
@@ -150,7 +172,8 @@ calls = [
 	], []),
 
 	('vchroot', [
-		('directory_fd', '@fd'),
+		('path', 'const char*', 'uint64_t'),
+		('path_size', 'uint64_t'),
 	], []),
 
 	('mldr_path', [
@@ -188,12 +211,13 @@ calls = [
 
 	('console_open', [], [
 		('console', '@fd'),
+		('fd_token', '@fd_token'),
 	]),
 
 	('set_dyld_info', [
 		('address', 'uint64_t'),
 		('length', 'uint64_t'),
-	], []),
+	], [], NO_REPLY),
 
 	('stop_after_exec', [], []),
 
@@ -229,7 +253,7 @@ calls = [
 	('set_executable_path', [
 		('buffer', 'const char*', 'uint64_t'),
 		('buffer_size', 'uint64_t')
-	], []),
+	], [], NO_REPLY),
 
 	('get_executable_path', [
 		('pid', 'int32_t'),
@@ -259,6 +283,11 @@ calls = [
 		('saved_filter_flags', 'uint64_t'),
 	], [
 		('socket', '@fd'),
+		# perf#30 (doc section 98): the reply must carry the courier token, exactly as kqchan_proc_open and
+		# console_open do. MEASURED: without it the reply-fd courier branch is not generated for this call, the
+		# server's suppressed-reply wake fd stays -1, and the page route publishes a zero token while
+		# completing with status 0 -- the guest then works with a descriptor it never received.
+		('fd_token', '@fd_token'),
 	]),
 
 	('kqchan_proc_open', [
@@ -266,6 +295,7 @@ calls = [
 		('flags', 'uint32_t'),
 	], [
 		('socket', '@fd'),
+		('fd_token', '@fd_token'),
 	]),
 
 	#
@@ -643,6 +673,44 @@ calls = [
 		('message_count', 'uint64_t'),
 		('fd', '@fd'),
 	], UNMANAGED_CALL),
+
+	#
+	# perf #18 (dar-dar6x4-perf-5dq.30): shared-memory ring transport negotiation.
+	#
+	# ring_attach is the per-thread handshake that opts a checked-in thread into the
+	# shared-memory ring fast path. The guest creates a memfd holding a dserver_ring_shm
+	# control block + the two rings + arena, fills the control block, and sends the memfd
+	# here via @fd (the same SCM_RIGHTS mechanism checkin uses for the lifetime pipe). The
+	# server fstats the fd for its REAL size (never trusting mapping_size), mmaps it, copies
+	# the control block out (never validating in place -- the guest can mutate the page
+	# concurrently), and runs dserver_ring_shm_validate(). reject_reason is 0
+	# (dserver_ring_ok) on success or a dserver_ring_reject_t code; on any reject the guest
+	# stays on UDS forever (no error -- the ring is a fast path, never the only path).
+	#
+	# This is additive: it's a brand-new call number at the end of the table, so an old
+	# server simply rejects an unknown call number and the guest falls back to UDS; we do
+	# NOT touch checkin (keeping the dar-l8k / dar-6x4 exec path untouched). The whole
+	# handler is gated behind DSERVER_RING_TRANSPORT server-side; with the feature off the
+	# call is still defined but its processCall() replies "unsupported" so a ring-capable
+	# guest built against a non-ring server also falls back cleanly.
+	#
+	('ring_attach', [
+		('ring_fd', '@fd'),
+		('mapping_size', 'uint64_t'),
+		# perf#30 FD-COURIER (RA1): the lane's backing memfd travels on the PROCESS courier instead of
+		# this thread's RPC socket, so the attach request itself carries no ancillary data. Appended.
+		('fd_token', '@fd_token'),
+	], [
+		('reject_reason', 'uint32_t'),
+		# perf #18 P3 wake design (Variant 2): on accept the SERVER creates the wake eventfd
+		# (it owns it for the RingBuffer's lifetime and registers it in its own epoll), and
+		# hands the guest a dup of it back in the reply. The guest writes this fd to wake the
+		# server when it publishes a c2s request (the only primitive the epoll-bound server can
+		# wait on); the reverse direction (server waking guest) is FUTEX_WAKE on s2c_futex, so
+		# no fd is needed there. -1 on reject (the guest then stays on UDS).
+		('wake_fd', '@fd'),
+		('fd_token', '@fd_token'),
+	]),
 ]
 
 ALLOWED_PRIVATE_TYPES = [
@@ -657,11 +725,145 @@ ALLOWED_PRIVATE_TYPES = [
 	'uint64_t',
 ]
 
+# perf#29 (GENERATED-WRAPPER RING ROUTE): operations whose GENERATED client wrapper may take the
+# shared-memory Ring fast path. This table is the single source of truth for the generated side, and it
+# is checked against the server's DSERVER_RING_C2S_OPCODES allowlist by tests/ring-generated-route-test.sh
+# (a callnum annotated here but missing there would be declined by the server on every call, which the
+# census would show as traffic that never arrives).
+#
+# An op is listed ONLY when all of the following hold in the current source:
+#   * the server already has generic eligible-op dispatch for it (it is in DSERVER_RING_C2S_OPCODES);
+#   * its wire shape is a CLOSED request -> single reply transaction with a FIXED inline body;
+#   * it transfers no Linux fd, takes no caller-side S2C, and is not NO_REPLY;
+#   * an equivalent hand-written Ring helper already exists and is exercised (gr_port_trap/gr_full_trap).
+#
+# The values are the reply's WIRE body length override (0 == use sizeof of the generated reply body).
+# perf#30 FD-COURIER: calls whose descriptor instance must stay on the datagram path but whose
+# descriptor-less instance belongs on the lane.
+FD_CONDITIONAL_RING = set()
+
+# perf#30 FD-COURIER: which descriptor half a call's @fd parameter is, when it is handed to the
+# process-scoped SCM_RIGHTS courier instead of this thread's RPC socket. A call NOT listed here
+# keeps the legacy CMSG transport for its descriptor.
+# perf#30 FD-COURIER (MEASURED, dar-gwn.7.7.5): EMPTY while the execve handshake is finished. The
+# transport itself is PROVEN end-to-end -- the guest connects over the loader-published abstract
+# address, sends the envelope, the server accepts ONE persistent connection per process and receives
+# the descriptor (measured: fd_courier_connections == processes, bundles kind=2 with distinct pids) --
+# but routing the execve descriptor through it hangs the first exec, so the descriptor rides the legacy
+# CMSG until that semantic half has its own pass. Re-adding the entry here is the whole switch.
+FD_COURIER_KINDS = {
+	'checkout': 'DSERVER_FD_COURIER_KIND_CHECKOUT_FD',
+	# perf#30 FD-COURIER (RA1): the lane backing moves to the process courier.
+	'ring_attach': 'DSERVER_FD_COURIER_KIND_LANE_BACKING',
+}
+
+# perf#30 FD-COURIER (round 49, SERVER->GUEST direction): a call whose REPLY carries a descriptor can
+# send that descriptor on the SAME process-scoped courier, in the reverse direction, naming it in the
+# reply body by token. The reply body keeps a wire-only `fd_token` field, so the public API is
+# unchanged and the legacy CMSG reply remains the fallback when the courier cannot take the descriptor.
+# The courier message is descriptor-only in this direction too: generation, token, kind, fd_count and
+# SCM_RIGHTS -- never a semantic body, a callnum or a result code.
+REPLY_FD_COURIER_KINDS = {
+	'console_open': 'DSERVER_FD_COURIER_KIND_CONSOLE_FD',
+	'kqchan_proc_open': 'DSERVER_FD_COURIER_KIND_KQCHAN_FD',
+	# perf#30 (doc section 98): kqchan_mach_port_open RETURNS a descriptor too, and it was missing from this
+	# list -- so the reply-fd courier branch was never generated for it, the server's suppressed-reply wake fd
+	# stayed -1, and the page route published a zero token while completing with status 0. MEASURED as
+	# `[kqchan-plane] status=0 token=0 fd=-1 out=0` against `token=... fd=8 out=8` in runs that reached the
+	# other entry point.
+	'kqchan_mach_port_open': 'DSERVER_FD_COURIER_KIND_KQCHAN_FD',
+	'ring_attach': 'DSERVER_FD_COURIER_KIND_PROCESS_DOORBELL',
+}
+
+# perf#30 FD-COURIER: extra entry points that share another call's wire shape and callnum. The server
+# sees one operation; the guest gets an explicit way to say which instance it is issuing.
+CALLNUM_ALIASES = {}
+
+# perf#30 FD-COURIER: a call that KEEPS the legacy CMSG transport for its descriptor can still ride the
+# lane whenever it carries no descriptor. That is the difference between "this call's descriptor half has
+# moved to the courier" and "this call must not be split across transports". checkin is the second kind:
+# its descriptor instance is the pre-attach bootstrap checkin (the loader's, and a fork child's), where
+# the descriptor IS the process's lifetime pipe and is consumed while the process is being registered --
+# a place no lane exists yet and none should. Its THREAD instances carry no descriptor at all, and those
+# are the ones that belong on the lane.
+
+RING_GENERATED_SIMPLE = {
+	# perf#30 (doc sections 107/108): mach_port_move_member is DELIBERATELY absent. It was added to this
+	# table and MEASURED: the boot still failed at exactly this call (`[rpc-socket-DENIED]
+	# call=mach_port_move_member`) because it is reached before the lane can be relied on -- the same class
+	# and the same outcome as the pthread_canceled entry below. Per directive section 2 the answer for such
+	# a call is not "stays on UDS": its home is the process MANAGEMENT PLANE, like vchroot, sigprocess and
+	# kqchan_mach_port_open, with the ordinary MachPortMoveMember Call supplying the semantics (section 15).
+	'task_self_trap': 0,
+	'thread_self_trap': 0,
+	'host_self_trap': 0,
+	'mach_reply_port': 0,
+	'set_dyld_info': 0,
+	'set_executable_path': 0,
+	# perf#30 FD-COURIER: the lifecycle semantics ride the lane; the descriptor half rides the process
+	# courier, so the request published here has no ancillary data. The wrapper only takes this route when
+	# the courier already owns the descriptor (or the call carries none), never on a split transport.
+	'uidgid': 0,
+	'get_tracer': 0,
+	'task_is_64_bit': 0,
+	'started_suspended': 0,
+	'set_thread_handles': 0,
+	'mldr_path': 0,
+	'vchroot_path': 0,
+	# perf#30 FD-COURIER (MEASURED, third time): checkin on the lane still wedges boot -- but the reason is
+	# now EXACT and is not the reply. The kernel image carries its own copy of the loader's call sites, and
+	# there the lifecycle checkin (main-thread re-checkin / fork child) is issued with fd=-1, so an
+	# fd-based rule cannot separate it from the pthread-create checkin: those instances rode the lane
+	# (checkin ring=2) and the boot stopped right after. What is needed is the CALLER to say which
+	# checkin it is -- a wire-only marker the pthread path sets and the lifecycle paths do not, or the
+	# separate entry point emitted outside the call table -- and then the lifecycle instances can be
+	# moved to the process-management plane instead of being forced through a lane.
+
+	# perf#30 DETACHED COMPLETION: checkout rides the lane now that the reply's destination belongs to
+	# the Call. Its handler deliberately clears its Thread before replying (there is no thread left to
+	# answer through), and the reply must still go back to the lane incarnation the request was
+	# published on -- Call::publishFinalReply does exactly that from the retained RingCallContext.
+	# MEASURED before that existed: checkout uds=0 ring=1 and shellspawn never became ready, because the
+	# reply fell through to the server's socket while the guest waited on the lane.
+	'checkout': 0,
+	# perf#30 FD-COURIER: the pthread-create checkin rides the lane; the main-thread one does not.
+
+	# perf#30 (doc section 73): pthread_canceled is DELIBERATELY absent, and this comment is the reason that
+	# was missing (section 72 found the absence unexplained and tried to fix it by adding the call).
+	# MEASURED RED: routing it on the lane stops the boot -- `HELLO=0`, shellspawn never ready, exactly the
+	# outcome this table already records for the lifecycle checkin. It is therefore not the "ordinary
+	# per-thread operation with no ordering dependency" section 72 assumed: it is reached early enough (the
+	# libpthread cancellation handshake) that the lane cannot be relied on to exist, and its result must be
+	# visible to the thread's other traffic. It stays on the datagram, and the per-thread RPC socket it forces
+	# into existence is the price of that -- not a gap this table can close.
+
+	# perf#30 (directive sections 4-6, doc section 206): the BLOCKING family. They are here because the generated
+	# wrapper must ATTEMPT the lane; the header classifies them RING_BLOCKING rather than SIMPLE, because the
+	# server's Call may suspend (its dispatcher is fiber-backed) and there is still exactly ONE final reply.
+	# MEASURED: the hard oracle named `fork_wait_for_child` -- and `semaphore_timedwait` before it -- as the calls
+	# that still created a per-thread socket. The guest wait is the ordinary one and carries NO transport deadline;
+	# the semantic timeout travels in the request body and is decided by the server's Call, never by the transport.
+	'semaphore_wait': 0,
+	'semaphore_timedwait': 0,
+	'semaphore_wait_signal': 0,
+	'semaphore_timedwait_signal': 0,
+	'fork_wait_for_child': 0,
+	# perf#30 (doc section 235): the SIGNAL half of the blocking family. MEASURED: with the four WAITS on the
+	# ring and the signals not, `semaphore_signal` was routed by the process plane, whose single slot was held
+	# by the parked wait; the plane could not publish, the datagram fallback was DENIED by the hard socket
+	# hatch, and the waiter was never woken. The release of a wait may not queue behind the wait.
+	'semaphore_signal': 0,
+	'semaphore_signal_all': 0,
+}
+
+
 def parse_type(param_tuple, is_public):
 	type_str = param_tuple[1].strip()
 
 	if type_str == '@fd':
 		type_str = 'int' if is_public else 'int32_t'
+	elif type_str == '@fd_token':
+		type_str = 'uint64_t'
 	else:
 		if not is_public and len(param_tuple) > 2:
 			type_str = param_tuple[2].strip()
@@ -690,6 +892,13 @@ def alignment_str_for_type(type):
 
 def is_fd(param_tuple):
 	return param_tuple[1] == '@fd'
+
+# perf#30 FD-COURIER: a descriptor-carrying call names its descriptor's token in the request body. The
+# token is a WIRE FIELD, not a caller argument: the caller still passes the descriptor (or -1), and the
+# wrapper decides whether the descriptor goes to the courier or to the legacy CMSG transport. Keeping it
+# out of the public signature is what lets every existing caller stay unchanged.
+def is_fd_token(param_tuple):
+	return param_tuple[1] == '@fd_token'
 
 if len(sys.argv) < 5:
 	sys.exit("Usage: " + sys.argv[0] + " <public-header-path> <internal-header-path> <library-source-path> <library-import>")
@@ -732,6 +941,15 @@ license_header = """\
 """.format(datetime.now().year)
 
 public_header.write(license_header)
+# perf#29: Ring routing tri-state. It lives in the generated PUBLIC header so every consumer of
+# this one policy table (mldr, dyld, the kernel image) agrees on the values without sharing an
+# include tree: each consumer binds dserver_rpc_hooks_try_ring() in its own rpc-defs header.
+public_header.write("\n")
+public_header.write("#ifndef DSERVER_RING_TRY_NOT_TAKEN\n")
+public_header.write("#define DSERVER_RING_TRY_NOT_TAKEN 0\n")
+public_header.write("#define DSERVER_RING_TRY_COMPLETED 1\n")
+public_header.write("#define DSERVER_RING_TRY_COMMITTED_FAILURE 2\n")
+public_header.write("#endif\n")
 library_source.write(license_header)
 internal_header.write(license_header)
 
@@ -928,6 +1146,12 @@ for call in calls:
 	reply_parameters = call[2]
 	camel_name = to_camel_case(call_name)
 
+	if call_name in CALLNUM_ALIASES:
+		# perf#30 FD-COURIER: an alias is a CLIENT entry point for an existing operation. The server
+		# sees the aliased callnum, so generating a second server class for it would be a second
+		# implementation of one operation -- exactly what must not exist.
+		continue
+
 	internal_header.write("\tCALL_CASE(" + call_name + ", " + camel_name + "); \\\n")
 internal_header.write("\n")
 
@@ -948,6 +1172,10 @@ for call in calls:
 	reply_parameters = call[2]
 	camel_name = to_camel_case(call_name)
 
+	if call_name in CALLNUM_ALIASES:
+		# perf#30 FD-COURIER: a client-only alias has no server class.
+		continue
+
 	internal_header.write("\tclass " + camel_name + "; \\\n")
 internal_header.write("\n")
 
@@ -958,7 +1186,17 @@ for call in calls:
 	reply_parameters = call[2]
 	flags = call[3] if len(call) >= 4 else 0
 	camel_name = to_camel_case(call_name)
+
+	if call_name in CALLNUM_ALIASES:
+		# perf#30 FD-COURIER: a client-only alias has no server class.
+		continue
 	fd_count_in_reply = 0
+	semaphore_trace = call_name in (
+		'semaphore_signal',
+		'semaphore_wait_signal',
+		'semaphore_timedwait',
+		'semaphore_timedwait_signal',
+	)
 
 	internal_header.write(textwrap.indent(textwrap.dedent("""\
 		class Call::{1}: public Call, public std::enable_shared_from_this<Call::{1}> {{ \\
@@ -986,6 +1224,23 @@ for call in calls:
 			continue
 
 		internal_header.write("\t\t\t_body." + param_name + " = requestMessage.extractDescriptorAtIndex(_body." + param_name + "); \\\n")
+	if semaphore_trace:
+		has_signal_name = call_name in ('semaphore_signal', 'semaphore_wait_signal', 'semaphore_timedwait_signal')
+		has_timeout = call_name in ('semaphore_timedwait', 'semaphore_timedwait_signal')
+		wait_name = '0' if call_name == 'semaphore_signal' else '_body.wait_name'
+		signal_name = '_body.signal_name'
+		sec = '_body.sec' if has_timeout else '0'
+		nsec = '_body.nsec' if has_timeout else '0'
+		internal_header.write(
+			"\t\t\tTestDiagnostics::traceSemaphoreCallBegin(\"{0}\", _header.pid, _header.tid, {1}, {2}, {3}, {4}, {5}); \\\n".format(
+				call_name,
+				wait_name,
+				'true' if has_signal_name else 'false',
+				signal_name if has_signal_name else '0',
+				sec,
+				nsec,
+			)
+		)
 	internal_header.write("\t\t}; \\\n")
 
 	internal_header.write("\t\t~" + camel_name + "() { \\\n")
@@ -1012,52 +1267,103 @@ for call in calls:
 	for param in reply_parameters:
 		param_name = param[0]
 
+		if is_fd_token(param):
+			continue
+
 		if is_fd(param):
 			fd_count_in_reply += 1
 
 		internal_header.write(", " + parse_type(param, False) + " " + param_name)
 	internal_header.write(") { \\\n")
 
-	internal_header.write("\t\t\trpcReplyLog.debug() << \"Replying to call #\" << dserver_callnum_" + call_name + " << \" (dserver_callnum_" + call_name + ") from PID \" << _header.pid << \", TID \" << _header.tid << \" with result code \" << resultCode ")
+	if (flags & NO_REPLY) != 0:
+		# perf #10: NO_REPLY calls send no reply datagram -- the client returned right
+		# after sending and is not waiting, and a stray reply would desync the next
+		# synchronous call's reply matching on the per-thread socket. The call's work is
+		# still done in processCall(); _sendReply just swallows the status code.
+		internal_header.write("\t\t\t(void)resultCode; /* NO_REPLY: fire-and-forget, server emits no reply */ \\\n")
+		internal_header.write("\t\t}; \\\n")
+	else:
+		internal_header.write("\t\t\trpcReplyLog.debug() << \"Replying to call #\" << dserver_callnum_" + call_name + " << \" (dserver_callnum_" + call_name + ") from PID \" << _header.pid << \", TID \" << _header.tid << \" with result code \" << resultCode ")
 
-	for param in reply_parameters:
-		param_name = param[0]
+		for param in reply_parameters:
+			param_name = param[0]
 
-		internal_header.write("<< \", " + param_name + "=\" << " + param_name + " ")
+			if is_fd_token(param):
+				continue
 
-	internal_header.write("<< rpcReplyLog.endLog; \\\n")
+			internal_header.write("<< \", " + param_name + "=\" << " + param_name + " ")
 
-	internal_header.write(textwrap.indent(textwrap.dedent("""\
-		Message reply(sizeof(dserver_rpc_reply_{0}_t), 0); \\
-		int fdIndex = 0; \\
-		reply.setAddress(_replyAddress); \\
-		auto replyStruct = reinterpret_cast<dserver_rpc_reply_{0}_t*>(reply.data().data()); \\
-		replyStruct->header.number = dserver_callnum_{0}; \\
-		replyStruct->header.code = resultCode; \\
-		"""), '\t\t\t').format(call_name))
+		internal_header.write("<< rpcReplyLog.endLog; \\\n")
 
-	fd_index = 0
-	for param in reply_parameters:
-		param_name = param[0]
-		val = param_name
+		internal_header.write(textwrap.indent(textwrap.dedent("""\
+			Message reply(sizeof(dserver_rpc_reply_{0}_t), 0); \\
+			int fdIndex = 0; \\
+			reply.setAddress(_replyAddress); \\
+			auto replyStruct = reinterpret_cast<dserver_rpc_reply_{0}_t*>(reply.data().data()); \\
+			replyStruct->header.number = dserver_callnum_{0}; \\
+			replyStruct->header.code = resultCode; \\
+			"""), '\t\t\t').format(call_name))
 
-		if is_fd(param):
-			val = "((" + param_name + " >= 0) ? (fdIndex++) : (-1))"
-			internal_header.write("\t\t\tif (" + param_name + " >= 0) { \\\n")
-			internal_header.write("\t\t\t\treply.pushDescriptor(" + param_name + "); \\\n")
-			internal_header.write("\t\t\t} \\\n")
+		fd_index = 0
+		reply_kind = REPLY_FD_COURIER_KINDS.get(call_name)
+		for param in reply_parameters:
+			param_name = param[0]
+			val = param_name
 
-		internal_header.write("\t\t\treplyStruct->body." + param_name + " = " + val + "; \\\n")
-	internal_header.write("\t\t\tif (auto thread = _thread.lock()) { \\\n")
-	internal_header.write("\t\t\t\tthread->pushCallReply(shared_from_this(), std::move(reply)); \\\n")
-	internal_header.write("\t\t\t} else { \\\n")
-	internal_header.write("\t\t\t\tCall::sendReply(std::move(reply)); \\\n")
-	internal_header.write("\t\t\t} \\\n")
-	internal_header.write("\t\t}; \\\n")
+			if is_fd_token(param):
+				continue
+
+			if is_fd(param) and reply_kind is not None:
+				# perf#30 FD-COURIER (server->guest): the descriptor goes on the process-scoped courier
+				# and the reply body names it. The CMSG push stays the FALLBACK for a process with no
+				# live courier connection, so a caller never sees a reply whose token resolves to
+				# nothing. The call's ownership of the descriptor transfers in both branches.
+				internal_header.write("\t\t\tif (" + param_name + " >= 0) { \\\n")
+				internal_header.write("\t\t\t\tuint64_t __fd_courier_token = sendFdCourierToGuest(_header.pid, " + reply_kind + ", " + param_name + "); \\\n")
+				internal_header.write("\t\t\t\tif (__fd_courier_token != 0) { \\\n")
+				internal_header.write("\t\t\t\t\treplyStruct->body." + param_name + " = -1; \\\n")
+				internal_header.write("\t\t\t\t\treplyStruct->body.fd_token = __fd_courier_token;  if (getenv(\"DARLING_SERVER_COURIER_LOG\") != NULL) { static DarlingServer::Log __cl(\"fd-courier\"); __cl.error() << \"reply-token pid=\" << _header.pid << \" token=\" << __fd_courier_token << \" bodylen=\" << reply.data().size() << __cl.endLog; } \\\n")
+				internal_header.write("\t\t\t\t} else { \\\n")
+				internal_header.write("\t\t\t\t\treply.pushDescriptor(" + param_name + "); \\\n")
+				internal_header.write("\t\t\t\t\treplyStruct->body." + param_name + " = (fdIndex++); \\\n")
+				internal_header.write("\t\t\t\t\treplyStruct->body.fd_token = 0; \\\n")
+				internal_header.write("\t\t\t\t} \\\n")
+				internal_header.write("\t\t\t} else { \\\n")
+				internal_header.write("\t\t\t\treplyStruct->body." + param_name + " = -1; \\\n")
+				internal_header.write("\t\t\t\treplyStruct->body.fd_token = 0; \\\n")
+				internal_header.write("\t\t\t} \\\n")
+				continue
+
+			if is_fd(param):
+				val = "((" + param_name + " >= 0) ? (fdIndex++) : (-1))"
+				internal_header.write("\t\t\tif (" + param_name + " >= 0) { \\\n")
+				internal_header.write("\t\t\t\treply.pushDescriptor(" + param_name + "); \\\n")
+				internal_header.write("\t\t\t} \\\n")
+
+			internal_header.write("\t\t\treplyStruct->body." + param_name + " = " + val + "; \\\n")
+		internal_header.write("\t\t\tif (auto thread = _thread.lock()) { \\\n")
+		internal_header.write("\t\t\t\tthread->pushCallReply(shared_from_this(), std::move(reply)); \\\n")
+		internal_header.write("\t\t\t} else { \\\n")
+		internal_header.write("\t\t\t\tpublishFinalReply(std::move(reply)); \\\n")
+		internal_header.write("\t\t\t} \\\n")
+		internal_header.write("\t\t}; \\\n")
 
 	if len(reply_parameters) == 0:
 		internal_header.write("\tpublic: \\\n")
 		internal_header.write("\t\tvoid sendBasicReply(int resultCode) override { \\\n")
+		if semaphore_trace:
+			has_signal_name = call_name in ('semaphore_signal', 'semaphore_wait_signal', 'semaphore_timedwait_signal')
+			wait_name = '0' if call_name == 'semaphore_signal' else '_body.wait_name'
+			signal_name = '_body.signal_name'
+			internal_header.write(
+				"\t\t\tTestDiagnostics::traceSemaphoreCallReply(\"{0}\", _header.pid, _header.tid, {1}, {2}, {3}, resultCode); \\\n".format(
+					call_name,
+					wait_name,
+					'true' if has_signal_name else 'false',
+					signal_name if has_signal_name else '0',
+				)
+			)
 		internal_header.write("\t\t\t_sendReply(resultCode); \\\n")
 		internal_header.write("\t\t}; \\\n")
 
@@ -1292,11 +1598,18 @@ for call in calls:
 		public_header.write("\tdserver_reply_" + call_name + "_t body;\n")
 	public_header.write("};\n")
 
+	wire_name = CALLNUM_ALIASES.get(call_name, call_name)
 	tmp = "int dserver_rpc_explicit_" + call_name + "(int server_socket"
 	public_header.write(tmp)
 	library_source.write(tmp)
 	for param in call_parameters:
 		param_name = param[0]
+
+		if is_fd_token(param):
+			# perf#30 FD-COURIER: the token is a WIRE field, not an argument. Every existing caller
+			# keeps passing exactly the descriptor (or -1) it always did; the wrapper decides which
+			# transport carries it and stamps the token into the request body itself.
+			continue
 
 		tmp = ", "
 		tmp += parse_type(param, True) + " " + param_name
@@ -1305,6 +1618,9 @@ for call in calls:
 
 	for param in reply_parameters:
 		param_name = param[0]
+
+		if is_fd_token(param):
+			continue
 
 		tmp = ", "
 		tmp += parse_type(param, True) + "* out_" + param_name
@@ -1315,14 +1631,14 @@ for call in calls:
 
 	# define the RPC call wrapper function
 	library_source.write(textwrap.indent(textwrap.dedent("""\
-		dserver_rpc_call_{0}_t call = {{
+		dserver_rpc_call_{1}_t call = {{
 			.header = {{
 				.architecture = dserver_rpc_hooks_get_architecture(),
 				.pid = dserver_rpc_hooks_get_pid(),
 				.tid = dserver_rpc_hooks_get_tid(),
-				.number = dserver_callnum_{0},
+				.number = dserver_callnum_{1},
 			}},
-		"""), '\t').format(call_name))
+		"""), '\t').format(call_name, wire_name, wire_name))
 
 	if len(call_parameters) > 0:
 		library_source.write("\t\t.body = {\n")
@@ -1330,6 +1646,12 @@ for call in calls:
 		for param in call_parameters:
 			param_name = param[0]
 			val = param_name
+
+			if is_fd_token(param):
+				# The wrapper fills this in only when the courier takes the descriptor; zero means
+				# "this request carries no descriptor half" and keeps the legacy shape byte-identical.
+				library_source.write("\t\t\t." + param_name + " = 0,\n")
+				continue
 
 			if is_fd(param):
 				val = "(" + param_name + " < 0) ? -1 : " + str(fd_index)
@@ -1361,9 +1683,49 @@ for call in calls:
 	library_source.write("\t} reply_msg;\n")
 
 	# we always allocate space for at least one FD, since S2C calls might send a descriptor
+	# perf#28d DEFECT FIX: a reply index is only meaningful when its descriptor actually arrived. With the
+	# one-time doorbell rule the server legitimately sends NO descriptor, so `valid_fd_count` is 0, but the
+	# reply body still carries an index (0) and the client dereferenced the UNINITIALISED slot -- the caller
+	# then used a garbage wake fd instead of the -1 every fallback path is written against. MEASURED as 16
+	# failed attaches with the guest's own no-wake-fd diagnostic never firing, because the value was >= 0.
+	# Pre-filling with -1 makes "no descriptor arrived" indistinguishable from "the server sent -1", which
+	# is what every consumer already handles.
 	library_source.write("\tint fds[" + str(max(1, fd_count_in_call, fd_count_in_reply, max_reply_fd_count if (flags & PUSH_UNKNOWN_REPLIES) != 0 else 0)) + "];\n")
+	library_source.write("\tfor (unsigned __fi = 0; __fi < sizeof(fds) / sizeof(fds[0]); ++__fi) { fds[__fi] = -1; }\n")
 	library_source.write("\tint valid_fd_count;\n")
 	library_source.write("\tchar controlbuf[DSERVER_RPC_HOOKS_CMSG_SPACE(sizeof(fds))];\n")
+
+	# perf#30 FD-COURIER: when a call's descriptor half belongs to the process-scoped courier, try the
+	# courier FIRST -- before any socket-side effect -- so the semantic request can be published with no
+	# ancillary data at all. If the courier cannot take the descriptor the WHOLE call stays on the
+	# datagram path: a semantic request on the Ring plus its descriptor on the socket (or a token the
+	# server will never see) are both corruption, so the two halves are never split across transports.
+	courier_kind = FD_COURIER_KINDS.get(call_name)
+	conditional_ring = (call_name in FD_CONDITIONAL_RING)
+	courier_fd_param = None
+	if courier_kind is not None or conditional_ring:
+		for param in call_parameters:
+			if is_fd(param):
+				courier_fd_param = param[0]
+				break
+		if courier_fd_param is None:
+			raise ValueError(call_name + " needs an @fd parameter to gate its lane route")
+	if courier_kind is not None:
+		library_source.write("\tuint64_t __fd_courier_token = 0;\n")
+		library_source.write("\tif (" + courier_fd_param + " >= 0) {\n")
+		library_source.write(textwrap.indent(textwrap.dedent("""\
+			/* perf#30 FD-COURIER: the descriptor travels on the PROCESS-scoped SCM_RIGHTS courier -- ONE
+			   connection per Linux process, reused for every transfer -- and the semantic request that
+			   follows names only its token, so the request carries no ancillary data and can ride the
+			   lane. Ordering is load-bearing: the descriptor is enqueued BEFORE the request is
+			   published, so a server resolving the token always finds it already there. */
+			__fd_courier_token = dserver_rpc_hooks_fd_courier_send(""" + courier_fd_param + """, """ + courier_kind + """);
+			if (__fd_courier_token != 0) {
+				call.body.fd_token = __fd_courier_token;
+				call.body.""" + courier_fd_param + """ = -1;
+			}
+			"""), '\t\t'))
+		library_source.write("\t}\n")
 
 	if fd_count_in_call > 0:
 		library_source.write("\tvalid_fd_count = 0;\n")
@@ -1373,7 +1735,11 @@ for call in calls:
 			if not is_fd(param):
 				continue
 
-			library_source.write("\tif (" + param_name + " >= 0) {\n")
+			if courier_kind is None:
+				guard = param_name + " >= 0"
+			else:
+				guard = "__fd_courier_token == 0 && " + param_name + " >= 0"
+			library_source.write("\tif (" + guard + ") {\n")
 			library_source.write("\t\tfds[valid_fd_count++] = " + param_name + ";\n")
 			library_source.write("\t}\n")
 
@@ -1431,14 +1797,97 @@ for call in calls:
 
 	library_source.write("\tlong int long_status;\n\n")
 
+	# NOTE: computed here, before the reply-bearing branch below defines `no_reply`.
+	# RING_ORDERED_NO_REPLY: an annotated NO_REPLY op is still PUBLISHED on the lane and still waits for
+	# the transport acknowledgement -- that wait is what preserves the ordering the datagram path gave
+	# for free. Its public shape is unchanged: no reply body, no result code, return 0 on success.
+	ring_route = (call_name in RING_GENERATED_SIMPLE)
+	courier_gated_ring = ring_route and (courier_kind is not None)
+	if ring_route:
+		req_expr = "(const void*)&call.body" if len(call_parameters) > 0 else "(const void*)0"
+		req_len = "sizeof(call.body)" if len(call_parameters) > 0 else "0u"
+		rep_expr = "(void*)&reply_msg.reply.body" if len(reply_parameters) > 0 else "(void*)0"
+		rep_len = "sizeof(reply_msg.reply.body)" if len(reply_parameters) > 0 else "0u"
+		if flags & NO_REPLY:
+			# RING_ORDERED_NO_REPLY: the same reply-bearing transport route, but the PUBLIC shape stays
+			# fire-and-forget -- no reply body, no result code, and 0 on success exactly as the datagram
+			# path returned. The wait is a transport acknowledgement, which is what preserves the ordering
+			# the datagram path provided for free.
+			library_source.write(textwrap.indent(textwrap.dedent("""\
+			/* perf#30 RING_ORDERED_NO_REPLY: publish on the lane and wait for the transport
+			   acknowledgement. On COMPLETED the public fire-and-forget contract is satisfied (0); on
+			   COMMITTED_FAILURE the request was published exactly once and must NOT be retried. */
+			{{
+				int32_t __ring_nr_code = 0;
+				int __ring_nr = dserver_rpc_hooks_try_ring(
+					(uint32_t)dserver_callnum_{0}, "{0}",
+					{1}, (uint32_t)({2}),
+					(void*)0, 0u,
+					&__ring_nr_code);
+				if (__ring_nr == DSERVER_RING_TRY_COMPLETED) {{
+					dserver_rpc_hooks_atomic_end(&atomic_save);
+					return 0;
+				}}
+				if (__ring_nr == DSERVER_RING_TRY_COMMITTED_FAILURE) {{
+					dserver_rpc_hooks_atomic_end(&atomic_save);
+					return dserver_rpc_hooks_get_communication_error_status();
+				}}
+			}}
+			""").format(call_name, req_expr, req_len, wire_name), '\t'))
+		if courier_gated_ring:
+			# ONLY the courier-carried instance (the EXECVE checkout) rides the lane. The descriptor-less
+			# instance is a TEARDOWN call whose lane lifetime it does not control: it runs while the
+			# thread is already going away, and MEASURED (with the detached reply endpoint in place, so
+			# the reply is no longer the reason) it still wedges the first exec. That instance belongs to
+			# the process-management plane, not to the hot lane -- routing it is deferred there rather
+			# than forced through a lane whose incarnation the caller is about to release (§ "terminal
+			# lane lifetime"). The lane route keys on the descriptor half having MOVED.
+			library_source.write("\tif (__fd_courier_token != 0) {\n")
+		elif ring_route and call_name in FD_CONDITIONAL_RING:
+			# No descriptor on this request (its descriptor instance stays on the datagram path), so the
+			# request has no ancillary data and the lane can carry it.
+			library_source.write("\tif (" + courier_fd_param + " < 0) {\n")
+		if not (flags & NO_REPLY):
+			library_source.write(textwrap.indent(textwrap.dedent("""\
+				/* perf#29: Ring fast path. Runs BEFORE any socket-side effect. NOT_TAKEN (0) falls
+				   through to the datagram path; COMPLETED (1) has staged the reply; COMMITTED_FAILURE
+				   (2) means the request WAS published -- the datagram path must NOT run, because that
+				   would run a state-mutating RPC a second time. */
+				{{
+					int32_t __ring_code = 0;
+					int __ring_try = dserver_rpc_hooks_try_ring(
+						(uint32_t)dserver_callnum_{0}, "{0}",
+						{1}, (uint32_t)({2}),
+						{3}, (uint32_t)({4}),
+						&__ring_code);
+					if (__ring_try == DSERVER_RING_TRY_COMPLETED) {{
+						reply_msg.reply.header.code = __ring_code;
+						goto ring_reply_ready;
+					}}
+					if (__ring_try == DSERVER_RING_TRY_COMMITTED_FAILURE) {{
+						return dserver_rpc_hooks_get_communication_error_status();
+					}}
+				}}
+				""").format(call_name, req_expr, req_len, rep_expr, rep_len, wire_name), '\t'))
+			if courier_gated_ring or (ring_route and call_name in FD_CONDITIONAL_RING):
+				library_source.write("\t}\n")
+
+
+	if ring_route:
+		# perf#30 (directive section 3): the lazy half of the same rule. Reached only when the lane was NOT taken
+		# (or when the caller has no socket), so a ring-routed call asks for a datagram descriptor exactly where it
+		# actually needs one -- and a caller that already has one (the loader passes its own descriptor to the
+		# checkin entry point) keeps it.
+		library_source.write("\tif (server_socket < 0) {\n")
+		library_source.write("\t\tserver_socket = dserver_rpc_hooks_get_socket();\n")
+		library_source.write("\t\tif (server_socket < 0) {\n")
+		library_source.write("\t\t\treturn dserver_rpc_hooks_get_broken_pipe_status();\n")
+		library_source.write("\t\t}\n")
+		library_source.write("\t}\n")
 	library_source.write("retry_send:\n")
 	library_source.write("\tlong_status = dserver_rpc_hooks_send_message(server_socket, &callmsg);\n\n")
 
 	library_source.write("\tif (long_status == dserver_rpc_hooks_get_interrupt_status()) {\n")
-	if (flags & ALLOW_INTERRUPTIONS) == 0:
-		library_source.write("\t\tgoto retry_send;\n")
-	else:
-		library_source.write("\t\treturn (int)long_status;\n")
 	library_source.write("\t}\n\n")
 
 	library_source.write("\tif (long_status < 0) {\n")
@@ -1455,87 +1904,154 @@ for call in calls:
 	library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
 	library_source.write("\t}\n\n")
 
-	library_source.write("retry_receive:\n")
-	library_source.write("\tlong_status = dserver_rpc_hooks_receive_message(server_socket, &replymsg);\n\n")
+	# perf #10 (dar-dar6x4-perf-5dq.17): fire-and-forget. The send succeeded; for a
+	# NO_REPLY call the server processes the request but sends NO reply, so we must NOT
+	# block in receive_message (skipping that ~200us reply-wait sleep is the whole win).
+	# Close the atomic region (matching the begin above) and return success now; the
+	# entire receive/decode block below is emitted only for normal (reply-bearing) calls.
+	# perf #10: NO_REPLY ("fire-and-forget") calls return right after a successful send
+	# -- the server emits no reply, so the entire receive/decode block is skipped (that
+	# skipped ~200us recvmsg sleep is the win). The thin forwarder + prototype tail below
+	# is still emitted for them (NO_REPLY calls have no reply params, so it's identical).
+	no_reply = (flags & NO_REPLY) != 0
 
-	library_source.write("\tif (long_status == dserver_rpc_hooks_get_interrupt_status()) {\n")
-	library_source.write("\t\tgoto retry_receive;\n")
-	library_source.write("\t}\n\n")
-	
-	library_source.write("\tif (long_status < 0) {\n")
-	if (flags & ALLOW_INTERRUPTIONS) == 0:
-		library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
-	library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE STATUS: %ld ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, long_status);\n")
-	library_source.write("\t\treturn (int)long_status;\n")
-	library_source.write("\t}\n\n")
+	if no_reply:
+		if (flags & ALLOW_INTERRUPTIONS) == 0:
+			library_source.write("\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
+		library_source.write("\treturn 0;\n")
+		library_source.write("};\n\n")
 
-	library_source.write("\tif (long_status < sizeof(dserver_rpc_replyhdr_t)) {\n")
-	if (flags & ALLOW_INTERRUPTIONS) == 0:
-		library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
-	library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, long_status, sizeof(reply_msg.reply));\n")
-	library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
-	library_source.write("\t}\n\n")
+	if not no_reply:
+		# perf #9-decompose (dar-dar6x4-perf-5dq): GUEST-SIDE per-callnum recvmsg-sleep
+		# accounting. perf #6 showed ~57% of build wall-clock is the guest asleep in
+		# recvmsg waiting for the reply; perf #9 measured only the (tiny) SERVER service
+		# time, so we still don't know WHICH calls the guest sleeps on longest. The call
+		# number is a compile-time constant ONLY here at the wrapper's receive site
+		# (dserver_callnum_<name>) -- NOT inside the shared receive_message hook -- so the
+		# timing must be emitted by the generator around the receive. It is wrapped in
+		# #ifdef DARLING_RPC_SLEEP_ACCOUNT so a normal build emits byte-identical wrappers
+		# (zero cost); only an instrumented diagnostic build defines the macro. begin/end
+		# bracket the ENTIRE receive (including the retry_receive loop on EINTR / unknown
+		# replies), so the attributed time is the full reply-wait this call paid.
+		library_source.write("#ifdef DARLING_RPC_SLEEP_ACCOUNT\n")
+		library_source.write("\tunsigned long __sleep_acct_start = __darling_rpc_sleep_account_begin();\n")
+		library_source.write("#endif\n")
+		library_source.write("retry_receive:\n")
+		library_source.write("\tlong_status = dserver_rpc_hooks_receive_message(server_socket, &replymsg);\n\n")
 
-	library_source.write("\tif (reply_msg.reply.header.number != dserver_callnum_" + call_name + ") {\n")
-	if (flags & PUSH_UNKNOWN_REPLIES) != 0:
-		library_source.write("\t\tdserver_rpc_hooks_push_reply(server_socket, &replymsg, long_status);\n")
+		library_source.write("\tif (long_status == dserver_rpc_hooks_get_interrupt_status()) {\n")
 		library_source.write("\t\tgoto retry_receive;\n")
-	else:
+		library_source.write("\t}\n\n")
+
+		# perf #9-decompose: the reply-wait is over (terminal status, not an EINTR retry).
+		# Attribute the elapsed wait to THIS call number. End is reached for every terminal
+		# outcome (success or error), so the accounting is complete regardless of result.
+		library_source.write("#ifdef DARLING_RPC_SLEEP_ACCOUNT\n")
+		library_source.write("\t__darling_rpc_sleep_account_end(__sleep_acct_start, dserver_callnum_" + call_name + ");\n")
+		library_source.write("#endif\n")
+
+		library_source.write("\tif (long_status < 0) {\n")
+		if (flags & ALLOW_INTERRUPTIONS) == 0:
+			library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
+		library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE STATUS: %ld ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, long_status);\n")
+		library_source.write("\t\treturn (int)long_status;\n")
+		library_source.write("\t}\n\n")
+
+		library_source.write("\tif (long_status < sizeof(dserver_rpc_replyhdr_t)) {\n")
+		if (flags & ALLOW_INTERRUPTIONS) == 0:
+			library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
+		library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, long_status, sizeof(reply_msg.reply));\n")
+		library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
+		library_source.write("\t}\n\n")
+
+		library_source.write("\tif (reply_msg.reply.header.number != dserver_callnum_" + call_name + ") {\n")
+		if (flags & PUSH_UNKNOWN_REPLIES) != 0:
+			library_source.write("\t\tdserver_rpc_hooks_push_reply(server_socket, &replymsg, long_status);\n")
+			library_source.write("\t\tgoto retry_receive;\n")
+		else:
+			if (flags & ALLOW_INTERRUPTIONS) == 0:
+				library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
+			library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: number=%d (expected %d), code=%d, length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, reply_msg.reply.header.number, dserver_callnum_" + call_name + ", reply_msg.reply.header.code, long_status, sizeof(reply_msg.reply));\n")
+			library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
+		library_source.write("\t}\n\n")
+
+		library_source.write("\tif (long_status != sizeof(reply_msg.reply)) {\n")
 		if (flags & ALLOW_INTERRUPTIONS) == 0:
 			library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
 		library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: number=%d (expected %d), code=%d, length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, reply_msg.reply.header.number, dserver_callnum_" + call_name + ", reply_msg.reply.header.code, long_status, sizeof(reply_msg.reply));\n")
 		library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
-	library_source.write("\t}\n\n")
+		library_source.write("\t}\n\n")
 
-	library_source.write("\tif (long_status != sizeof(reply_msg.reply)) {\n")
-	if (flags & ALLOW_INTERRUPTIONS) == 0:
-		library_source.write("\t\tdserver_rpc_hooks_atomic_end(&atomic_save);\n")
-	library_source.write("\t\tdserver_rpc_hooks_printf(\"*** %d:%d: %s: BAD RECEIVE MESSAGE: number=%d (expected %d), code=%d, length=%ld (expected %zu) ***\\n\", dserver_rpc_hooks_get_pid(), dserver_rpc_hooks_get_tid(), __func__, reply_msg.reply.header.number, dserver_callnum_" + call_name + ", reply_msg.reply.header.code, long_status, sizeof(reply_msg.reply));\n")
-	library_source.write("\t\treturn dserver_rpc_hooks_get_communication_error_status();\n")
-	library_source.write("\t}\n\n")
+		if (flags & ALLOW_INTERRUPTIONS) == 0:
+			library_source.write("\tdserver_rpc_hooks_atomic_end(&atomic_save);\n\n")
 
-	if (flags & ALLOW_INTERRUPTIONS) == 0:
-		library_source.write("\tdserver_rpc_hooks_atomic_end(&atomic_save);\n\n")
+		if ring_route:
+			# the Ring path never entered the atomic region, so it can land straight here.
+			library_source.write("ring_reply_ready:;\n\n")
 
-	if fd_count_in_reply != 0:
-		library_source.write("\tvalid_fd_count = 0;\n")
+		if fd_count_in_reply != 0:
+			library_source.write("\tvalid_fd_count = 0;\n")
+			for param in reply_parameters:
+				param_name = param[0]
+
+				if not is_fd(param):
+					continue
+
+				library_source.write("\tif (reply_msg.reply.body." + param_name + " >= 0) {\n")
+				library_source.write("\t\t++valid_fd_count;\n")
+				library_source.write("\t}\n")
+
+			library_source.write(textwrap.indent(textwrap.dedent("""\
+				if (valid_fd_count > 0) {
+					dserver_rpc_hooks_cmsghdr_t* reply_cmsg = DSERVER_RPC_HOOKS_CMSG_FIRSTHDR(&replymsg);
+					if (!reply_cmsg || reply_cmsg->cmsg_level != DSERVER_RPC_HOOKS_SOL_SOCKET || reply_cmsg->cmsg_type != DSERVER_RPC_HOOKS_SCM_RIGHTS || reply_cmsg->cmsg_len != DSERVER_RPC_HOOKS_CMSG_LEN(sizeof(int) * valid_fd_count)) {
+						return dserver_rpc_hooks_get_bad_message_status();
+					}
+					dserver_rpc_hooks_memcpy(fds, DSERVER_RPC_HOOKS_CMSG_DATA(reply_cmsg), sizeof(int) * valid_fd_count);
+				}
+				"""), '\t'))
+
+		reply_kind = REPLY_FD_COURIER_KINDS.get(call_name)
 		for param in reply_parameters:
 			param_name = param[0]
 
-			if not is_fd(param):
+			if is_fd(param) and reply_kind is not None:
+				# perf#30 FD-COURIER (server->guest): the reply names the descriptor by token and the
+				# descriptor itself arrives on the process-scoped courier. The CMSG path stays the
+				# fallback for a server that could not hand it to the courier. A token that resolves to
+				# nothing is a committed failure, never a silent -1: the operation succeeded, so the
+				# descriptor must exist.
+				library_source.write("\t{\n")
+				library_source.write("\t\tint __reply_fd = (reply_msg.reply.body.fd_token != 0)\n")
+				library_source.write("\t\t\t? dserver_rpc_hooks_fd_courier_receive(reply_msg.reply.body.fd_token)\n")
+				library_source.write("\t\t\t: ((reply_msg.reply.body." + param_name + " >= 0) ? fds[reply_msg.reply.body." + param_name + "] : -1);\n")
+				library_source.write("\t\tif (out_" + param_name + ") {\n")
+				library_source.write("\t\t\t*out_" + param_name + " = __reply_fd;\n")
+				library_source.write("\t\t} else if (__reply_fd >= 0) {\n")
+				library_source.write("\t\t\tdserver_rpc_hooks_close_fd(__reply_fd);\n")
+				library_source.write("\t\t}\n")
+				library_source.write("\t}\n")
 				continue
 
-			library_source.write("\tif (reply_msg.reply.body." + param_name + " >= 0) {\n")
-			library_source.write("\t\t++valid_fd_count;\n")
-			library_source.write("\t}\n")
+			if is_fd_token(param):
+				# A wire-only token has no caller-visible output: the descriptor it names was already
+				# resolved above, and the token itself is transport state, not a result.
+				continue
 
-		library_source.write(textwrap.indent(textwrap.dedent("""\
-			if (valid_fd_count > 0) {
-				dserver_rpc_hooks_cmsghdr_t* reply_cmsg = DSERVER_RPC_HOOKS_CMSG_FIRSTHDR(&replymsg);
-				if (!reply_cmsg || reply_cmsg->cmsg_level != DSERVER_RPC_HOOKS_SOL_SOCKET || reply_cmsg->cmsg_type != DSERVER_RPC_HOOKS_SCM_RIGHTS || reply_cmsg->cmsg_len != DSERVER_RPC_HOOKS_CMSG_LEN(sizeof(int) * valid_fd_count)) {
-					return dserver_rpc_hooks_get_bad_message_status();
-				}
-				dserver_rpc_hooks_memcpy(fds, DSERVER_RPC_HOOKS_CMSG_DATA(reply_cmsg), sizeof(int) * valid_fd_count);
-			}
-			"""), '\t'))
+			if is_fd(param):
+				library_source.write("\tif (out_" + param_name + ") {\n")
+				library_source.write("\t\t*out_" + param_name + " = (reply_msg.reply.body." + param_name + " >= 0) ? fds[reply_msg.reply.body." + param_name + "] : -1;\n")
+				library_source.write("\t} else if (reply_msg.reply.body." + param_name + " >= 0) {\n")
+				library_source.write("\t\tdserver_rpc_hooks_close_fd(fds[reply_msg.reply.body." + param_name + "]);\n")
+				library_source.write("\t}\n")
+			else:
+				library_source.write("\tif (out_" + param_name + ") {\n")
+				library_source.write("\t\t*out_" + param_name + " = reply_msg.reply.body." + param_name + ";\n")
+				library_source.write("\t}\n")
 
-	for param in reply_parameters:
-		param_name = param[0]
+		library_source.write("\treturn reply_msg.reply.header.code;\n")
 
-		if is_fd(param):
-			library_source.write("\tif (out_" + param_name + ") {\n")
-			library_source.write("\t\t*out_" + param_name + " = (reply_msg.reply.body." + param_name + " >= 0) ? fds[reply_msg.reply.body." + param_name + "] : -1;\n")
-			library_source.write("\t} else if (reply_msg.reply.body." + param_name + " >= 0) {\n")
-			library_source.write("\t\tdserver_rpc_hooks_close_fd(fds[reply_msg.reply.body." + param_name + "]);\n")
-			library_source.write("\t}\n")
-		else:
-			library_source.write("\tif (out_" + param_name + ") {\n")
-			library_source.write("\t\t*out_" + param_name + " = reply_msg.reply.body." + param_name + ";\n")
-			library_source.write("\t}\n")
-
-	library_source.write("\treturn reply_msg.reply.header.code;\n")
-
-	library_source.write("};\n\n")
+		library_source.write("};\n\n")
 
 	# declare the RPC call wrapper function
 	# (and output the prototype part of the function definition)
@@ -1545,6 +2061,10 @@ for call in calls:
 	is_first = True
 	for param in call_parameters:
 		param_name = param[0]
+
+		if is_fd_token(param):
+			# perf#30 FD-COURIER: a wire-only field never appears in a caller's argument list.
+			continue
 
 		if is_first:
 			is_first = False
@@ -1558,6 +2078,9 @@ for call in calls:
 	for param in reply_parameters:
 		param_name = param[0]
 
+		if is_fd_token(param):
+			continue
+
 		if is_first:
 			is_first = False
 			tmp = ""
@@ -1569,15 +2092,29 @@ for call in calls:
 	public_header.write(");\n\n")
 	library_source.write(") {\n")
 
-	library_source.write("\tint server_socket = dserver_rpc_hooks_get_socket();\n")
-	library_source.write("\tif (server_socket < 0) {\n")
-	library_source.write("\t\treturn dserver_rpc_hooks_get_broken_pipe_status();\n")
-	library_source.write("\t}\n\n")
+	library_source.write("\tdserver_rpc_hooks_note_call(\"" + call_name + "\");\n")
+	if ring_route:
+		# perf#30 (directive section 3, doc section 206): a ring-routed call must NOT ask for the socket up front.
+		# MEASURED: the hard oracle's denial resolved to `_dserver_rpc_fork_wait_for_child + 0x19`, i.e. THIS line --
+		# the outer wrapper requested the socket before the explicit wrapper could attempt the lane, so the lane
+		# attempt could never prevent the request. The explicit wrapper takes the socket itself, lazily, ONLY on the
+		# path where the lane was not taken; the sentinel says exactly that.
+		library_source.write("\tint server_socket = -1;  /* obtained LAZILY on the datagram fallback */\n\n")
+	else:
+		library_source.write("\tint server_socket = dserver_rpc_hooks_get_socket();\n")
+		library_source.write("\tif (server_socket < 0) {\n")
+		library_source.write("\t\treturn dserver_rpc_hooks_get_broken_pipe_status();\n")
+		library_source.write("\t}\n\n")
 
 	library_source.write("\treturn dserver_rpc_explicit_" + call_name + "(server_socket")
 
 	for param in call_parameters:
 		param_name = param[0]
+
+		if is_fd_token(param):
+			# perf#30 FD-COURIER: the explicit wrapper stamps the token from the courier result, so
+			# there is nothing to forward and no caller-visible argument.
+			continue
 
 		tmp = ", "
 		tmp += param_name
@@ -1585,6 +2122,9 @@ for call in calls:
 
 	for param in reply_parameters:
 		param_name = param[0]
+
+		if is_fd_token(param):
+			continue
 
 		tmp = ", "
 		tmp += "out_" + param_name

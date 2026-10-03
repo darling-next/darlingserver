@@ -297,6 +297,26 @@ namespace DarlingServer {
 			std::shared_lock lock(_rwlock);
 			return _map.size();
 		};
+
+		// perf#30 (doc section 234): a read-only traversal. Nothing in the server could enumerate what exists, so a
+		// stall dump ("who is waiting on whom") was impossible to write without inventing a second registry. The
+		// entries are copied out under the lock and the caller visits them WITHOUT it, so a visitor may safely call
+		// accessors that take their own locks.
+		template<class F>
+		void forEachEntry(F&& visitor) const {
+			std::vector<std::shared_ptr<Entry>> snapshot;
+			{
+				std::shared_lock lock(_rwlock);
+				snapshot.reserve(_map.size());
+				for (auto& [id, entry] : _map) {
+					(void)id;
+					snapshot.push_back(entry);
+				}
+			}
+			for (auto& entry : snapshot) {
+				visitor(entry);
+			}
+		};
 	};
 };
 

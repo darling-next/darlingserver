@@ -5,6 +5,7 @@
 #include <darlingserver/duct-tape/locks.h>
 #include <darlingserver/duct-tape/task.h>
 #include <darlingserver/duct-tape/condvar.h>
+#include <darlingserver/duct-tape/thread-cancel.h>
 
 #include <sys/event.h>
 
@@ -36,6 +37,27 @@ struct dtape_thread {
 	dtape_thread_user_state_head_t user_states;
 	dtape_thread_user_state_t default_state;
 	bool processing_signal;
+
+	// Set while this microthread is synchronously delivering a *fatal* Mach
+	// exception (EXC_BAD_ACCESS and friends) to a user EXCEPTION_DEFAULT handler
+	// via mach_exception_raise. macOS lets the faulting thread block for the
+	// handler's reply indefinitely because, if the handler never resumes the
+	// thread (e.g. it just calls exit(), as gnulib's printf-OOM nocrash_init
+	// handler does), task termination tears the whole task down and frees any
+	// locks the faulting thread held. darlingserver has no such teardown
+	// (task_terminate is a stub), so an unreplied fatal exception wedges the
+	// faulting microthread forever -- and any thread that needs a lock the
+	// faulting thread is holding deadlocks behind it. When this flag is set we
+	// bound the reply receive; on timeout the delivery fails so exception_triage
+	// falls through to the host-level ux_handler, which raises the default fatal
+	// signal (SIGSEGV) and terminates the guest process -- matching the macOS
+	// "handler didn't handle it -> default action" outcome. See dar-gwn.1.10.
+	bool fatal_exception_delivery;
+
+	// The old server stubs returned -ENOSYS for every pthread cancellation
+	// operation, which broke the guest cancellation handshake and made cancelable
+	// syscalls spin re-issuing pthread_canceled forever. See dar-gwn.6.3.
+	dtape_thread_cancel_state_t cancel;
 
 	bool waiting_suspended;
 	dtape_mutex_t suspension_mutex;
@@ -71,3 +93,7 @@ static dtape_task_t* dtape_task_for_thread(dtape_thread_t* thread) {
 };
 
 #endif // _DARLINGSERVER_DUCT_TAPE_THREAD_H_
+
+/* perf#30 R1: the thread-targeted form of the thread_self_trap semantics (see ipc_tt.c). Declared here because the
+ * wrapper below needs it and this header already carries the duct-tape's kernel-side view. */
+extern mach_port_name_t thread_self_trap_for(thread_t thread);

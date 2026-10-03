@@ -28,7 +28,43 @@ extern void psynch_zoneinit(void);
 extern void _pth_proc_hashinit(proc_t p);
 extern void _pth_proc_hashdelete(proc_t p);
 
+extern char* getenv(const char* name);
+extern int snprintf(char* str, unsigned long size, const char* format, ...);
+extern int open(const char* pathname, int flags, ...);
+extern long write(int fd, const void* buf, unsigned long count);
+extern int close(int fd);
+
+#define DSERVER_TRACE_O_WRONLY 01
+#define DSERVER_TRACE_O_CREAT 0100
+#define DSERVER_TRACE_O_APPEND 02000
+
+static unsigned long trace_strlen(const char* string) {
+	unsigned long length = 0;
+	while (string[length])
+		++length;
+	return length;
+}
+
+static void trace_psynch_rpc_args(const char* line) {
+	const char* path = getenv("DSERVER_PSYNCH_TRACE_FILE");
+	if (!path || !*path)
+		return;
+
+	int fd = open(path, DSERVER_TRACE_O_WRONLY | DSERVER_TRACE_O_CREAT | DSERVER_TRACE_O_APPEND, 0666);
+	if (fd < 0)
+		return;
+
+	write(fd, line, trace_strlen(line));
+	write(fd, "\n", 1);
+	close(fd);
+}
+
 int dtape_psynch_cvbroad(uint64_t cv, uint64_t cvlsgen, uint64_t cvudgen, uint32_t flags, uint64_t mutex, uint64_t mugen, uint64_t tid, uint32_t* retval) {
+	char trace_line[256];
+	snprintf(trace_line, sizeof(trace_line), "psynch_cvbroad cv=0x%llx cvlsgen=0x%llx cvudgen=0x%llx flags=0x%x mutex=0x%llx mugen=0x%llx tid=0x%llx",
+			(unsigned long long)cv, (unsigned long long)cvlsgen, (unsigned long long)cvudgen, flags,
+			(unsigned long long)mutex, (unsigned long long)mugen, (unsigned long long)tid);
+	trace_psynch_rpc_args(trace_line);
 	return _psynch_cvbroad(current_proc(), cv, cvlsgen, cvudgen, flags, mutex, mugen, tid, retval);
 };
 
@@ -37,6 +73,11 @@ int dtape_psynch_cvclrprepost(uint64_t cv, uint32_t cvgen, uint32_t cvugen, uint
 };
 
 int dtape_psynch_cvsignal(uint64_t cv, uint64_t cvlsgen, uint32_t cvugen, int32_t threadport, uint64_t mutex, uint64_t mugen, uint64_t tid, uint32_t flags, uint32_t* retval) {
+	char trace_line[256];
+	snprintf(trace_line, sizeof(trace_line), "psynch_cvsignal cv=0x%llx cvlsgen=0x%llx cvugen=0x%x threadport=%d mutex=0x%llx mugen=0x%llx tid=0x%llx flags=0x%x",
+			(unsigned long long)cv, (unsigned long long)cvlsgen, cvugen, threadport,
+			(unsigned long long)mutex, (unsigned long long)mugen, (unsigned long long)tid, flags);
+	trace_psynch_rpc_args(trace_line);
 	return _psynch_cvsignal(current_proc(), cv, cvlsgen, cvugen, threadport, mutex, mugen, tid, flags, retval);
 };
 

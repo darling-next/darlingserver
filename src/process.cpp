@@ -17,13 +17,18 @@
  * along with Darling.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <darlingserver/server.hpp>
 #include <darlingserver/process.hpp>
+#include <darlingserver/fork-checkin.hpp>
+#include <darlingserver/process-identity.hpp>
 #include <darlingserver/registry.hpp>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <darlingserver/logging.hpp>
+#include <darlingserver/test-diagnostics.hpp>
 
+#include <cstdlib>
 #include <fstream>
 #include <regex>
 
@@ -75,7 +80,6 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 		std::shared_lock parentLock(parentProcess->_rwlock);
 
 		// inherit vchroot from parent process
-		_vchrootDescriptor = parentProcess->_vchrootDescriptor;
 		_cachedVchrootPath = parentProcess->_cachedVchrootPath;
 
 		// inherit groups from parent process
@@ -86,7 +90,11 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 	_dtapeTask = dtape_task_create(parentProcess ? parentProcess->_dtapeTask : nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
 	_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
 
-	processLog.info() << "New process created with ID " << _pid << " and NSID " << _nspid;
+	if (parentProcess) {
+		processLog.info() << *this << ": process created with parent " << *parentProcess << processLog.endLog;
+	} else {
+		processLog.info() << *this << ": process created without registered parent" << processLog.endLog;
+	}
 };
 
 DarlingServer::Process::Process(KernelProcessConstructorTag tag):
@@ -145,23 +153,9 @@ std::string DarlingServer::Process::vchrootPath() const {
 	return _cachedVchrootPath;
 };
 
-void DarlingServer::Process::setVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
+void DarlingServer::Process::setVchrootPath(std::string path) {
 	std::unique_lock lock(_rwlock);
-	_vchrootDescriptor = directoryDescriptor;
-
-	char* tmp = new char[4096];
-
-	auto fdPath = "/proc/self/fd/" + std::to_string(_vchrootDescriptor->fd());
-	auto len = readlink(fdPath.c_str(), tmp, 4095);
-
-	if (len < 0) {
-		throw std::system_error(errno, std::generic_category(), "readlink");
-	}
-
-	tmp[len] = '\0';
-
-	_cachedVchrootPath = std::string(tmp);
-	delete[] tmp;
+	_cachedVchrootPath = path;
 };
 
 std::shared_ptr<DarlingServer::Process> DarlingServer::Process::currentProcess() {
@@ -278,15 +272,36 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isMainThread, bool isFork) {
 	std::unique_lock lock(_rwlock);
 
-	bool didExec = _pendingReplacement;
+	// Consume completion by listener identity before classifying this checkin.
+	// This preserves native-exec teardown and prevents a delayed callback from
+	// arming a later thread checkin or consuming a newer exec attempt.
+	auto completion = _execCompletion.poll();
+	if (completion == ExecCompletion::Result::Darling) {
+		_traceExecCompletion();
+	} else if (completion == ExecCompletion::Result::Native) {
+		lock.unlock();
+		notifyDead();
+		return;
+	}
+
+	// Pipe notification order cannot turn a pthread or fork checkin into exec.
+	bool didExec = isMainThread && !isFork && _mainThreadCheckedIn;
+	if (isMainThread) {
+		_mainThreadCheckedIn = true;
+	}
 
 	if (didExec) {
 		// exec case
 
 		processLog.info() << *this << ": replacing process with a new task (with architecture \"" << architectureToString(architecture) << "\")" << processLog.endLog;
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_begin pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid()) +
+			" arch=" + std::to_string(static_cast<int>(architecture))
+		);
 
 		// clear all threads except the main thread
 		std::shared_ptr<Thread> mainThread = nullptr;
@@ -295,7 +310,7 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 			auto thread = it->second.lock();
 			lock.unlock();
 			if (thread) {
-				if (thread->_nstid == _nspid) {
+				if (ProcessIdentity::isMainThread(thread->_nstid, thread->_tid, _nspid, _pid)) {
 					mainThread = thread;
 				} else {
 					thread->_process = nullptr;
@@ -313,44 +328,100 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// update the process architecture
 		_architecture = architecture;
 
+		// dar-6x4: the dtape_task_create / dtape_thread_create / dtape_semaphore_*
+		// calls below can SUSPEND the microthread (they enter duct-taped XNU code that
+		// may block on a waitq/lock). We MUST NOT hold _rwlock across a suspension:
+		// _rwlock is a std::shared_mutex (a real per-OS-thread rwlock), but a suspended
+		// microthread resumes on a DIFFERENT OS thread (perf #2b runs cheap RPCs inline
+		// on the MAIN thread, while resumes happen on the WORKER). Holding the write
+		// lock across the suspend strands it owned by the suspending OS thread; a
+		// sibling's fork-checkin then blocks forever in _notifyListeningKqchannels()
+		// taking this same lock for read on the worker, wedging the whole server
+		// (confirmed live: gdb __cur_writer == main tid, worker stuck in rdlock). The
+		// thread-clear loop above already drops the lock around the blocking
+		// notifyDead() for exactly this reason; do the same for the dtape work here.
+		//
+		// It is safe to drop the lock for this block: all other threads have been
+		// cleared (only mainThread remains in _threads), and the dtape handles
+		// being swapped (_dtapeTask, mainThread->_dtapeThread,
+		// the semaphores) are not traversed by _rwlock readers -- readers consult
+		// _threads / _listeningKqchannels / _kqchannels / scalar fields, none of which
+		// we mutate while unlocked.
+		lock.unlock();
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_dtape_create_unlocked pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
+
 		// replace the old task with a new task that inherits from it
 		auto oldTask = _dtapeTask;
 		auto newTask = dtape_task_create(oldTask, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
-		_dtapeTask = newTask;
 
 		// now replace the main thread's duct-taped thread with a new one
 		auto oldThread = mainThread->_dtapeThread;
-		auto newThread = dtape_thread_create(_dtapeTask, mainThread->_nstid, mainThread.get());
-		mainThread->_dtapeThread = newThread;
+		auto newThread = dtape_thread_create(newTask, mainThread->_nstid, mainThread.get());
 
-		// destroy the main thread's old S2C semaphores
+		// create a new fork-wait semaphore and new S2C semaphores for the new task
+		auto newForkWaitSemaphore = dtape_semaphore_create(newTask, 0);
+		auto newPerform = dtape_semaphore_create(newTask, 1);
+		auto newReply = dtape_semaphore_create(newTask, 0);
+		auto newInterruptEnter = dtape_semaphore_create(newTask, 0);
+		auto newInterruptExit = dtape_semaphore_create(newTask, 0);
+
+		// destroy the old semaphores (created against the old task)
 		dtape_semaphore_destroy(mainThread->_s2cPerformSempahore);
-		mainThread->_s2cPerformSempahore = nullptr;
 		dtape_semaphore_destroy(mainThread->_s2cReplySempahore);
-		mainThread->_s2cReplySempahore = nullptr;
 		dtape_semaphore_destroy(mainThread->_s2cInterruptEnterSemaphore);
-		mainThread->_s2cInterruptEnterSemaphore = nullptr;
 		dtape_semaphore_destroy(mainThread->_s2cInterruptExitSemaphore);
-		mainThread->_s2cInterruptExitSemaphore = nullptr;
-
-		// destroy the fork-wait semaphore
 		dtape_semaphore_destroy(_dtapeForkWaitSemaphore);
-		_dtapeForkWaitSemaphore = nullptr;
 
-		// release the main thread's old duct-taped thread
+		// publish the new state FIRST, then release the old task/thread.
+		//
+		// dar-l8k: the order matters. dtape_task_release(oldTask) tears down the old task's
+		// IPC space -> ipc_space_terminate -> ipc_right_terminate -> ipc_port_destroy, which
+		// (with IMPORTANCE_INHERITANCE) reads `current_thread()->ith_assertions`.
+		// `current_thread()` resolves through dtape_hook_current_thread to
+		// `Thread::currentThread()->_dtapeThread` -- i.e. mainThread->_dtapeThread. If we
+		// release+free oldThread and run the task teardown while mainThread->_dtapeThread is
+		// STILL oldThread, the teardown dereferences the freed dtape_thread (heap UAF, pinned
+		// by ASan: free at dtape_thread_release here, use at ipc_port_destroy:936). So we must
+		// repoint mainThread->_dtapeThread at the live newThread BEFORE the releases.
+		//
+		// The publish needs _rwlock; the releases must NOT hold it (dtape_task_release can
+		// suspend the microthread, and a suspended microthread resumes on a different OS
+		// thread -- holding the std::shared_mutex write lock across a suspend strands it, the
+		// exact wedge documented above for the dtape_*_create calls). So: publish under the
+		// lock, drop the lock, then release the old handles.
+		lock.lock();
+		_dtapeTask = newTask;
+		mainThread->_dtapeThread = newThread;
+		_dtapeForkWaitSemaphore = newForkWaitSemaphore;
+		_forkChildCheckin.reset();
+		mainThread->_s2cPerformSempahore = newPerform;
+		mainThread->_s2cReplySempahore = newReply;
+		mainThread->_s2cInterruptEnterSemaphore = newInterruptEnter;
+		mainThread->_s2cInterruptExitSemaphore = newInterruptExit;
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_publish pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_publish_before_release pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
+		lock.unlock();
+
+		// release the main thread's old duct-taped thread and the old task now that
+		// current_thread() resolves to the live newThread (see dar-l8k note above).
 		dtape_thread_release(oldThread);
-
-		// release the old task
 		dtape_task_release(oldTask);
+		TestDiagnostics::traceLine(
+			"process.checkin.exec_release_old pid=" + std::to_string(id()) +
+			" nsid=" + std::to_string(nsid())
+		);
 
-		// create a new fork-wait semaphore for the new task
-		_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
-
-		// create new S2C semaphores for the main thread
-		mainThread->_s2cPerformSempahore = dtape_semaphore_create(_dtapeTask, 1);
-		mainThread->_s2cReplySempahore = dtape_semaphore_create(_dtapeTask, 0);
-		mainThread->_s2cInterruptEnterSemaphore = dtape_semaphore_create(_dtapeTask, 0);
-		mainThread->_s2cInterruptExitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
+		// re-acquire so the rest of the function runs under the lock as before.
+		lock.lock();
 	} else {
 		// fork case
 
@@ -359,28 +430,75 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		}
 	}
 
-	_pendingReplacement = false;
-
 	lock.unlock();
 
 	if (didExec) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
-	} else {
+	} else if (isFork) {
+		// perf#25a A0 (Part 4): only a FORK checkin announces a child's arrival. Previously
+		// every checkin from the process (including pthread_create THREAD checkins) took this
+		// branch and raised the parent's fork-wait semaphore -- each spurious up is a stored
+		// wakeup that satisfies the parent's NEXT fork_wait_for_child immediately, detaching
+		// the semaphore count from real child arrivals under churn.
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			processLog.info() << *this << ": notifying fork parent " << *parent << " after checkin" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.checkin.fork_notify_parent child=" + std::to_string(nsid()) +
+				" parent=" + std::to_string(parent->nsid())
+			);
+			if (TestDiagnostics::consumeFault("fork.drop_checkin")) {
+				TestDiagnostics::traceLine(
+					"process.checkin.fork_drop child=" + std::to_string(nsid()) +
+					" parent=" + std::to_string(parent->nsid())
+				);
+				return;
+			}
+			parent->_forkChildCheckin.markChildCheckedIn();
+			std::string targetedFault = "fork.skip_checkin_semaphore parent=" + std::to_string(parent->nsid());
+			if (TestDiagnostics::consumeFault(targetedFault.c_str())) {
+				TestDiagnostics::traceLine(
+					"process.checkin.fork_skip_semaphore child=" + std::to_string(nsid()) +
+					" parent=" + std::to_string(parent->nsid())
+				);
+			} else {
+				dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			}
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
+		} else {
+			processLog.info() << *this << ": checkin without registered fork parent" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.checkin.fork_no_parent child=" + std::to_string(nsid())
+			);
 		}
 	}
 };
 
-void DarlingServer::Process::setPendingReplacement() {
+void DarlingServer::Process::beginExec(std::shared_ptr<FD> listener, bool executingMachO) {
 	std::unique_lock lock(_rwlock);
+	_execCompletion.begin(std::move(listener), executingMachO);
+};
 
-	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
+void DarlingServer::Process::notifyExecCompletion(const std::shared_ptr<FD>& listener) {
+	std::unique_lock lock(_rwlock);
+	auto completion = _execCompletion.poll(listener);
+	if (completion == ExecCompletion::Result::Darling) {
+		_traceExecCompletion();
+	}
+	lock.unlock();
 
-	_pendingReplacement = true;
+	if (completion == ExecCompletion::Result::Native) {
+		notifyDead();
+	}
+};
+
+void DarlingServer::Process::_traceExecCompletion() {
+	processLog.info() << "Process " << id() << " (" << nsid() << ") completed Darling exec" << processLog.endLog;
+	TestDiagnostics::traceLine(
+		"process.exec_completion pid=" + std::to_string(id()) +
+		" nsid=" + std::to_string(nsid())
+	);
 };
 
 void DarlingServer::Process::registerKqchan(std::shared_ptr<Kqchan> kqchan) {
@@ -395,9 +513,61 @@ void DarlingServer::Process::unregisterKqchan(std::shared_ptr<Kqchan> kqchan) {
 	_kqchannels.erase(kqchan->_idForProcess());
 };
 
-void DarlingServer::Process::waitForChildAfterFork() {
+bool DarlingServer::Process::waitForChildAfterFork() {
 	// this function is always called within a microthread
-	dtape_semaphore_down_simple(_dtapeForkWaitSemaphore);
+	unsigned int timeoutSeconds = ForkCheckinWaitTimeoutSeconds;
+	if (const char* value = std::getenv("DSERVER_TEST_FORK_CHECKIN_TIMEOUT_SECONDS"); value && value[0] != '\0') {
+		char* end = nullptr;
+		unsigned long parsed = std::strtoul(value, &end, 10);
+		if (end != value && *end == '\0' && parsed > 0 && parsed <= 60) {
+			timeoutSeconds = static_cast<unsigned int>(parsed);
+		}
+	}
+
+	processLog.info() << *this << ": waiting up to " << timeoutSeconds
+			<< " seconds for fork child checkin" << processLog.endLog;
+
+	std::string interruptFault = "fork.interrupt_wait parent=" + std::to_string(nsid());
+	if (TestDiagnostics::consumeFault(interruptFault.c_str())) {
+		TestDiagnostics::traceLine(
+			"process.fork_wait.force_interrupted parent=" + std::to_string(nsid())
+		);
+		return false;
+	}
+	switch (_forkChildCheckin.wait(_dtapeForkWaitSemaphore, timeoutSeconds)) {
+		case ForkCheckinWaitResult::Observed:
+			processLog.info() << *this << ": fork child checkin observed" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=observed pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
+			return true;
+		case ForkCheckinWaitResult::Interrupted:
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=interrupted pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
+			return false;
+		case ForkCheckinWaitResult::TimedOut:
+			processLog.error() << *this << ": timed out waiting " << timeoutSeconds
+					<< " seconds for fork child checkin" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=timed_out pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
+			return false;
+		default:
+			processLog.error() << *this << ": failed while waiting for fork child checkin" << processLog.endLog;
+			TestDiagnostics::traceLine(
+				"process.fork_wait result=error pid=" + std::to_string(id()) +
+				" nsid=" + std::to_string(nsid()) +
+				" timeout=" + std::to_string(timeoutSeconds)
+			);
+			return false;
+	}
 };
 
 void DarlingServer::Process::registerListeningKqchan(std::shared_ptr<Kqchan::Process> kqchan) {
@@ -739,6 +909,11 @@ void DarlingServer::Process::notifyDead() {
 };
 
 void DarlingServer::Process::_dispose() {
+	// perf#30 FD-COURIER: this incarnation is going away, so any descriptor half it delivered but never
+	// paired, and any semantic half still waiting for one, die with it. Both are counted so a mutation
+	// that leaves a half behind is visible as a counter, not as a silent descriptor leak. Keyed by the
+	// Linux pid, which is exactly what SO_PEERCRED reports for the courier connection.
+	Server::sharedInstance()._closeFdCourierForPid(id());
 	_selfReference = nullptr;
 };
 

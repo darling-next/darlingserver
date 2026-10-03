@@ -158,6 +158,25 @@ namespace DarlingServer {
 		WorkQueue(WorkQueue&&) = delete;
 		WorkQueue& operator=(WorkQueue&&) = delete;
 
+		// perf #0 metrics gauges (dar-dar6x4-perf-5dq.6). Cheap snapshot of queue state
+		// under the queue lock; called off the hot path (only when a stat snapshot is built).
+		struct Stats {
+			size_t depth;            // work items waiting
+			size_t threadsTotal;     // worker threads alive
+			size_t threadsAvailable; // worker threads idle-waiting for work
+			size_t threadsBusy;      // threadsTotal - threadsAvailable
+		};
+
+		Stats stats() {
+			std::unique_lock lock(_queueMutex);
+			Stats s;
+			s.depth = _workItems.size();
+			s.threadsTotal = _workerThreads.size();
+			s.threadsAvailable = _threadsAvailable;
+			s.threadsBusy = (_threadsAvailable > _workerThreads.size()) ? 0 : (_workerThreads.size() - _threadsAvailable);
+			return s;
+		};
+
 		void push(WorkItem workItem) {
 			std::unique_lock lock(_queueMutex);
 			_workItems.push(std::move(workItem));

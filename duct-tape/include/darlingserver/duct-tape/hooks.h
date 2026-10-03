@@ -32,6 +32,11 @@ typedef void (*dtape_hook_get_load_info_f)(dtape_load_info_t* load_info);
 
 typedef void (*dtape_hook_thread_suspend_f)(void* thread_context, dtape_thread_continuation_callback_f continuation_callback, void* continuation_contex, libsimple_lock_t* unlock_me);
 typedef void (*dtape_hook_thread_resume_f)(void* thread_context);
+// perf#25a A0 (Part 3d): consume a wake permit minted by thread_resume for a wait that was
+// finalized (thread_unblock) BEFORE the microthread physically suspended. thread_block skips the
+// suspension in that case, so the permit would otherwise go stale and spuriously satisfy the
+// thread's NEXT suspend() with wait_result still THREAD_WAITING.
+typedef void (*dtape_hook_thread_clear_resume_permit_f)(void* thread_context);
 typedef void (*dtape_hook_thread_terminate_f)(void* thread_context);
 typedef dtape_thread_t* (*dtape_hook_thread_create_kernel_f)(void);
 typedef void (*dtape_hook_thread_setup_f)(void* thread_context, dtape_thread_continuation_callback_f continuation_callback, void* continuation_context);
@@ -83,6 +88,7 @@ typedef struct dtape_hooks {
 
 	dtape_hook_thread_suspend_f thread_suspend;
 	dtape_hook_thread_resume_f thread_resume;
+	dtape_hook_thread_clear_resume_permit_f thread_clear_resume_permit;
 	dtape_hook_thread_terminate_f thread_terminate;
 	dtape_hook_thread_create_kernel_f thread_create_kernel;
 	dtape_hook_thread_setup_f thread_setup;

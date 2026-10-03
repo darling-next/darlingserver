@@ -21,7 +21,8 @@
 #include <darlingserver/server.hpp>
 #include <darlingserver/thread.hpp>
 #include <darlingserver/process.hpp>
-#include <filesystem>
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -31,6 +32,45 @@
 static const char* alwaysLoggedCategories[] = {
 	//"kprintf",
 };
+
+static int openLogDirectoryAt(int rootFD) {
+	int current = dup(rootFD);
+	if (current == -1) {
+		return -1;
+	}
+	static const char* components[] = { "private", "var", "log" };
+	for (const char* component : components) {
+		struct stat status;
+		if (fstatat(current, component, &status, AT_SYMLINK_NOFOLLOW) == -1) {
+			close(current);
+			return -1;
+		}
+		if (!S_ISDIR(status.st_mode)) {
+			close(current);
+			errno = ENOTDIR;
+			return -1;
+		}
+		const int next = openat(
+			current, component,
+			O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (next == -1) {
+			close(current);
+			return -1;
+		}
+		struct stat opened;
+		if (fstat(next, &opened) == -1 ||
+			opened.st_dev != status.st_dev ||
+			opened.st_ino != status.st_ino) {
+			close(next);
+			close(current);
+			errno = EAGAIN;
+			return -1;
+		}
+		close(current);
+		current = next;
+	}
+	return current;
+}
 
 DarlingServer::Log::Log(std::string category):
 	_category(category)
@@ -102,9 +142,17 @@ void DarlingServer::Log::_log(Type type, std::string message) const {
 	// NOTE: we use POSIX file APIs because we want to append each message to the log file atomically,
 	//       and as far as i can tell, C++ fstreams provide no such guarantee (that they won't write in chunks).
 	static int logFile = []() {
-		std::filesystem::path path(Server::sharedInstance().prefix() + "/private/var/log/dserver.log");
-		std::filesystem::create_directories(path.parent_path());
-		return open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+		const int directory =
+			openLogDirectoryAt(Server::sharedInstance().prefixFD());
+		if (directory == -1) {
+			return -1;
+		}
+		const int file = openat(
+			directory, "dserver.log",
+			O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+			S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+		close(directory);
+		return file;
 	}();
 
 	static bool logToStderr = []() {

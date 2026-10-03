@@ -24,6 +24,9 @@ void dtape_deinit(void);
 uint32_t dtape_task_self_trap(void);
 uint32_t dtape_host_self_trap(void);
 uint32_t dtape_thread_self_trap(void);
+/* The same semantics, addressed at a NAMED thread instead of the current one: the management plane needs this so it
+ * can return a guest thread's self port while running on a server microthread. NULL returns 0. */
+uint32_t dtape_thread_self_trap_for(dtape_thread_t* thread);
 uint32_t dtape_mach_reply_port(void);
 uint32_t dtape_thread_get_special_reply_port(void);
 uint32_t dtape_mk_timer_create(void);
@@ -60,8 +63,29 @@ void dtape_kqchan_mach_port_destroy(dtape_kqchan_mach_port_t* kqchan);
 void dtape_semaphore_destroy(dtape_semaphore_t* semaphore);
 
 void dtape_thread_entering(dtape_thread_t* thread);
-void dtape_thread_exiting(dtape_thread_t* thread);
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr);
+
+typedef struct dtape_thread_cancel_state_snapshot {
+	bool disabled;
+	bool pending;
+	bool canceled;
+} dtape_thread_cancel_state_snapshot_t;
+
+// Captures the cancellation state for diagnostics without changing it.
+void dtape_thread_cancel_state_snapshot(
+	const dtape_thread_t* thread,
+	dtape_thread_cancel_state_snapshot_t* snapshot
+);
+/**
+ * Implements __pthread_canceled(action) for the current thread. See dar-gwn.6.3.
+ * Returns the XNU-style code (0 or EINVAL); the caller negates it for the guest.
+ */
+int dtape_thread_canceled(dtape_thread_t* thread, int action);
+/**
+ * Implements __pthread_markcancel for the given target thread (requests its
+ * cancellation). See dar-gwn.6.3. Returns 0.
+ */
+int dtape_thread_markcancel(dtape_thread_t* thread);
 /**
  * Returns the thread corresponding to the given thread port.
  *
@@ -74,6 +98,7 @@ int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_s
 int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address);
 void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, int linux_signal_number, int code, uintptr_t signal_address);
 void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread);
+int dtape_thread_wait_timer_state(dtape_thread_t* thread, unsigned long long* active_out);
 void dtape_thread_retain(dtape_thread_t* thread);
 void dtape_thread_release(dtape_thread_t* thread);
 void dtape_thread_sigexc_enter(dtape_thread_t* thread);
@@ -103,7 +128,11 @@ bool dtape_kqchan_mach_port_has_events(dtape_kqchan_mach_port_t* kqchan);
 
 void dtape_semaphore_up(dtape_semaphore_t* semaphore);
 dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore);
+dtape_semaphore_wait_result_t dtape_semaphore_down_timeout(dtape_semaphore_t* semaphore, unsigned int seconds);
 bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore);
+// perf#30 (doc section 245): signal a semaphore by name in the TASK own namespace, with no calling thread,
+// returning the trap kern_return code instead of depending on a synthesized Call.
+int dtape_semaphore_signal_for_task(dtape_task_t* task, unsigned int name, int all);
 
 uint64_t dtape_debug_task_port_count(dtape_task_t* task);
 uint64_t dtape_debug_task_list_ports(dtape_task_t* task, dtape_debug_task_list_ports_iterator_f iterator, void* context);

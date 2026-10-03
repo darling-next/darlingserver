@@ -49,6 +49,8 @@ extern struct sockaddr_un __dserver_socket_address_data;
 
 #define dserver_rpc_hooks_memcpy memcpy
 
+static uint64_t dserver_rpc_hooks_fd_courier_send(int fd, uint32_t kind) { (void)fd; (void)kind; return 0; }
+
 static long int dserver_rpc_hooks_send_message(int socket, const dserver_rpc_hooks_msghdr_t* message) {
 	ssize_t ret = sendmsg(socket, message, 0);
 	if (ret < 0) {

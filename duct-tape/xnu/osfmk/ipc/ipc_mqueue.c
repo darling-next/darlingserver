@@ -84,6 +84,7 @@
 #include <kern/thread.h>
 #include <kern/waitq.h>
 
+#include <darlingserver/duct-tape/test-diagnostics.h>
 #include <ipc/port.h>
 #include <ipc/ipc_mqueue.h>
 #include <ipc/ipc_kmsg.h>
@@ -785,6 +786,14 @@ ipc_mqueue_post(
 		    WAITQ_ALL_PRIORITIES,
 		    WAITQ_KEEP_LOCKED);
 		/* waitq still locked, thread locked */
+
+		// perf#30 (doc section 237): THE decisive line for a lost wake. MEASURED (this run's send/receive join): of 47
+		// armed-but-never-completed receives, 24 armed on an mqueue that a send DID reach, so the message was posted to
+		// the very waitq the thread had armed on and the thread was never woken. The only two possibilities are "the
+		// post found no waiter although one was armed" and "the post found the waiter and it did not resume", and they
+		// are one boolean apart. `bits` carries the post's option; `port_name` carries the receiver thread pointer.
+		dtape_test_trace_msgq("post_wake", (unsigned long long)current_thread(), (unsigned long long)mqueue,
+			(unsigned long long)receiver, (unsigned int)option, (receiver != THREAD_NULL) ? 1 : 0);
 
 		if (receiver == THREAD_NULL) {
 			/*

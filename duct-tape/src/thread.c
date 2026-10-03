@@ -2,6 +2,8 @@
 #include <darlingserver/duct-tape.h>
 #include <darlingserver/duct-tape/task.h>
 #include <darlingserver/duct-tape/thread.h>
+#include <darlingserver/duct-tape/wait-timer.h>
+#include <darlingserver/duct-tape/test-diagnostics.h>
 #include <darlingserver/duct-tape/hooks.internal.h>
 #include <darlingserver/duct-tape/log.h>
 #include <darlingserver/duct-tape/psynch.h>
@@ -50,8 +52,14 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	}
 
 	thread->context = context;
+	// perf#25a A0: mutex_link (the shared mutex/condvar wait-queue link, incl. its _dbg_queued flag) is NOT
+	// covered by the memsets below; malloc leaves it garbage. The wait-queue double-insert guard reads
+	// _dbg_queued on the first dtape_mutex_lock -- if it starts nonzero it does a bogus TAILQ_REMOVE on an
+	// unqueued link and corrupts the queue at boot. Zero it explicitly. (This uninit was the boot wedge.)
+	memset(&thread->mutex_link, 0, sizeof(thread->mutex_link));
 	thread->processing_signal = false;
 	thread->name = NULL;
+	dtape_thread_cancel_state_init(&thread->cancel);
 	thread->waiting_suspended = false;
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
@@ -168,9 +176,6 @@ void dtape_thread_entering(dtape_thread_t* thread) {
 	thread->xnu_thread.block_hint = kThreadWaitNone;
 };
 
-void dtape_thread_exiting(dtape_thread_t* thread) {
-	thread->xnu_thread.state &= ~TH_RUN;
-};
 
 void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, uintptr_t dispatch_qaddr) {
 	thread_lock(&thread->xnu_thread);
@@ -179,7 +184,52 @@ void dtape_thread_set_handles(dtape_thread_t* thread, uintptr_t pthread_handle, 
 	thread_unlock(&thread->xnu_thread);
 };
 
+void dtape_thread_cancel_state_snapshot(
+	const dtape_thread_t* thread,
+	dtape_thread_cancel_state_snapshot_t* snapshot
+) {
+	snapshot->disabled = thread->cancel.disable;
+	snapshot->pending = thread->cancel.pending;
+	snapshot->canceled = thread->cancel.canceled;
+}
+
+// Implements XNU's __pthread_canceled(action) (bsd/kern/kern_sig.c) on the
+// duct-tape thread's cancellation bits. Operates on the *current* thread (the
+// caller of the syscall), exactly like the XNU version which uses
+// current_thread(). Returns the XNU return code (0 / EINVAL), which the call
+// layer negates to the BSD-errno convention the guest expects.
+//
+//   action 1 -> clear cancel-disable, return 0
+//   action 2 -> set   cancel-disable, return 0
+//   action 0 (or default) -> if a cancel is pending and not disabled/already
+//       acted upon, mark it canceled and return 0; otherwise return EINVAL.
+int dtape_thread_canceled(dtape_thread_t* thread, int action) {
+	return dtape_thread_cancel_state_canceled(&thread->cancel, action);
+};
+
+// Implements XNU's __pthread_markcancel(thread_port): requests cancellation of
+// the *target* thread by setting its pending-cancel bit. This is how one thread
+// asks another to cancel (the kernel side of pthread_cancel). The target later
+// observes the request via dtape_thread_canceled(action 0) at its next
+// cancellation point. Returns 0 on success.
+int dtape_thread_markcancel(dtape_thread_t* thread) {
+	return dtape_thread_cancel_state_markcancel(&thread->cancel);
+};
+
 dtape_thread_t* dtape_thread_for_port(uint32_t thread_port) {
+	/* A PORT NAME CAN ONLY BE TRANSLATED IN A THREAD THAT HAS A PORT SPACE (dar-b5pe). MEASURED: the management
+	 * plane's PTHREAD_KILL handler runs where a Call on a lane would run, which is NOT an XNU thread, so
+	 * port_name_to_thread called ipc_port_translate_send(current_space()) with a null space and the SERVER crashed
+	 * -- fault at si_addr=0x6c8 inside port_name_to_thread+0x2f, stack Registry<Thread>::scopedLock+0x27,
+	 * dtape_thread_for_port+0x15, over three runs in forty. THAT is also why the crash was intermittent rather
+	 * than constant: the plane only takes that handler when the request lands there. The honest answer in such a
+	 * context is "no such thread", which every caller already maps to -ESRCH (Thread::threadForPort returns
+	 * nullptr, and the plane reports the refusal rather than servicing the request against a guessed thread),
+	 * which is the same refusal the ordinary path produces for an unknown port. A silent null dereference is not
+	 * a refusal, so it must not be the behaviour here. */
+	if (current_thread() == NULL || current_space() == NULL) {
+		return NULL;
+	}
 	thread_t xnu_thread = port_name_to_thread(thread_port, PORT_TO_THREAD_NONE);
 	if (!xnu_thread) {
 		return NULL;
@@ -191,6 +241,17 @@ dtape_thread_t* dtape_thread_for_port(uint32_t thread_port) {
 	thread_deallocate(xnu_thread);
 	return dtape_thread_for_xnu_thread(xnu_thread);
 };
+
+/* perf#30 R1 COURIER PURITY: the thread-targeted instance of the thread_self_trap semantics, on the duct-tape handle.
+ * The management plane uses this so a guest thread's self port can be returned WITHOUT running on that thread -- which
+ * is what removes the last semantic AF_UNIX packet (the loader's pre-lane thread_self_trap). One implementation: this
+ * calls the same core the trap form does. */
+uint32_t dtape_thread_self_trap_for(dtape_thread_t* thread) {
+	if (thread == NULL) {
+		return 0;
+	}
+	return (uint32_t)thread_self_trap_for(&thread->xnu_thread);
+}
 
 void* dtape_thread_context(dtape_thread_t* thread) {
 	return thread->context;
@@ -344,7 +405,27 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 
 	dtape_log_debug("calling exception_triage_thread(%d, [%lld, %lld])", mach_exception, codes[0], codes[1]);
 
+	// For a fatal bad-memory-access fault, bound the synchronous reply wait on
+	// the user EXCEPTION_DEFAULT handler. If a handler consumes the exception
+	// but never resumes us (it just exit()s, like gnulib's printf-OOM
+	// nocrash_init handler), the reply never comes; on macOS task teardown would
+	// unwedge us, but here we would block forever holding any guest locks we
+	// faulted with. On timeout the user-level delivery fails and
+	// exception_triage falls through to the host ux_handler -> default SIGSEGV
+	// -> guest terminates, which is macOS's "unhandled fatal exception"
+	// behavior. See dar-gwn.1.10.
+	//
+	// Scoped to EXC_BAD_ACCESS only: that is the proven deadlock case, and other
+	// exception types (EXC_BAD_INSTRUCTION / EXC_ARITHMETIC / EXC_BREAKPOINT)
+	// have legitimate catch-and-resume handlers in real workloads (e.g. the
+	// brew/Ruby download path raises and recovers from SIGILL) that we must not
+	// time out and turn into a forced termination.
+	bool fatal = (mach_exception == EXC_BAD_ACCESS);
+	thread->fatal_exception_delivery = fatal;
+
 	exception_triage_thread(mach_exception, codes, EXCEPTION_CODE_MAX, &thread->xnu_thread);
+
+	thread->fatal_exception_delivery = false;
 
 	dtape_log_debug("exception_triage_thread returned");
 
@@ -406,6 +487,12 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 
 		thread->xnu_thread.wait_result = THREAD_WAITING;
 
+		if (dtape_test_consume_fault("microthread.resume_before_suspend")) {
+			dtape_test_trace_line("microthread.dtape.resume_before_suspend");
+			thread->xnu_thread.suspend_count = 0;
+			dtape_hooks->thread_resume(thread->context);
+		}
+
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, NULL);
 
 		dtape_log_debug("sigexc: woken up");
@@ -431,8 +518,39 @@ void dtape_thread_release(dtape_thread_t* thread) {
 
 void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
-	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
-	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
+	// Clear only TH_UNINT so this signal is allowed to abort even an
+	// uninterruptible wait. Do NOT pre-clear TH_WAIT here: clear_wait_internal()
+	// -> waitq_pull_thread_locked() must see the thread still marked TH_WAIT so
+	// it routes through thread_go() -> thread_unblock(), which is what actually
+	// FINALIZES the unblock -- pulls the thread off its waitq (clearing
+	// thread->waitq), cancels the wait_timer, and resumes the microthread. If we
+	// pre-clear TH_WAIT, clear_wait_internal takes its
+	//   (state & (TH_WAIT|TH_TERMINATE)) == TH_WAIT   // false
+	// branch, returns KERN_NOT_WAITING, and SKIPS thread_go(): the wait is left
+	// half-torn-down with thread->waitq still set. Under brew `make -j`'s SIGCHLD
+	// storm the guest re-issues the aborted psynch_cvwait (-EINTR retry), which
+	// re-enters waitq_assert_wait64_locked() with thread->waitq != NULL and trips
+	// its invariant -- panic("thread already waiting", waitq.c:2835) in a debug
+	// build, and a corrupted-waitq lost-wakeup condvar livelock otherwise (the
+	// intermittent `brew reinstall` hang; deterministic repro in
+	// tests/../tmp/cvstorm.c). Letting clear_wait_internal own the state
+	// transition matches XNU, where a signal-interrupted wait is torn down by
+	// thread_go(), not by the caller hand-clearing TH_WAIT. (perf#25a A0)
+	thread->xnu_thread.state &= ~TH_UNINT;
+	// perf#25a A0 (Part 2): do NOT pre-assign wait_result here. clear_wait_internal()
+	// -> thread_go() -> thread_unblock() writes wait_result = THREAD_INTERRUPTED itself,
+	// but ONLY when it actually finds the thread still waiting (TH_WAIT set). If a psynch
+	// grant already unblocked this thread (thread_wakeup_thread -> thread_unblock set
+	// wait_result = THREAD_AWAKENED and cleared TH_WAIT) but its microthread continuation
+	// has not yet physically run, an unconditional assignment here CLOBBERS that committed
+	// THREAD_AWAKENED grant to THREAD_INTERRUPTED. The continuation (psynch_mtxcontinue)
+	// then takes its error path and returns EINTR, discarding an already-dequeued mutex
+	// grant (kwe_psynchretval) -- the guest re-issues the wait against an empty queue and
+	// deadlocks (the intermittent brew SIGCHLD-storm hang; repro cvstorm2 -DNCONS=1 storm).
+	// Letting clear_wait_internal own the write matches XNU (clear_wait(THREAD_INTERRUPTED)
+	// only rouses a thread that is genuinely still waiting) and leaves an already-delivered
+	// wakeup intact. Paired with thread_unblock() finalizing TH_WAIT->TH_RUN so the
+	// second (racing) abort correctly sees the thread no longer waiting.
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 	thread_unlock(&thread->xnu_thread);
 };
@@ -498,6 +616,22 @@ static void thread_continuation_callback(void* context) {
 	wait_result_t wait_result;
 
 	thread_lock(&thread->xnu_thread);
+
+	// perf#25a A0 (Part 3e): XNU semantics -- a blocked thread's continuation only runs once
+	// thread_unblock finalized the wait (TH_WAIT cleared, wait_result written). A stray resume
+	// permit (raw dtape mutex/condvar handoff crosstalk, stale re-runs) can pop the suspension
+	// early; running the continuation then would deliver wait_result == THREAD_WAITING (psynch
+	// continuations reply -EINTR to the guest and leave the thread linked on its waitq -> the
+	// next assert panics "thread already waiting" / silently corrupts the queue on release
+	// builds). Re-park instead: the genuine wakeup will resume us again. If the re-suspend
+	// parks, the genuine resume re-enters this callback fresh; if it fast-returns on yet
+	// another stray permit, the loop re-checks.
+	while (thread->xnu_thread.state & TH_WAIT) {
+		thread_unlock(&thread->xnu_thread);
+		dtape_hooks->thread_suspend(thread->context, thread_continuation_callback, thread, NULL);
+		thread_lock(&thread->xnu_thread);
+	}
+
 	continuation = thread->xnu_thread.continuation;
 	thread->xnu_thread.continuation = NULL;
 
@@ -526,6 +660,34 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 
 	if (waiting) {
 		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
+		// perf#25a A0 (Part 3e): for the inline (no-continuation) variant, enforce XNU's
+		// contract that thread_block only returns once the wait was finalized by
+		// thread_unblock. A stray resume permit (raw dtape mutex/condvar handoff crosstalk)
+		// can fast-return the suspension while TH_WAIT is still set and wait_result is still
+		// THREAD_WAITING; returning that to the caller corrupts the wait protocol
+		// (semaphore_convert_wait_result panics; psynch waits strand their waitq links).
+		// Re-park until genuinely unblocked. (The continuation variant re-checks in
+		// thread_continuation_callback and never returns here.)
+		if (!continuation) {
+			while (true) {
+				thread_lock(&thread->xnu_thread);
+				bool still_waiting = (thread->xnu_thread.state & TH_WAIT) != 0;
+				thread_unlock(&thread->xnu_thread);
+				if (!still_waiting) {
+					break;
+				}
+				dtape_hooks->thread_suspend(thread->context, NULL, thread, NULL);
+			}
+		}
+	} else {
+		// perf#25a A0 (Part 3d): the wait was already finalized (thread_unblock cleared TH_WAIT,
+		// wrote wait_result, and had thread_resume mint a wake permit) before we could physically
+		// suspend -- the wake is delivered right here by NOT suspending. Consume the paired
+		// permit; otherwise it goes stale and spuriously satisfies this thread's NEXT suspend()
+		// while wait_result is still THREAD_WAITING (panic in semaphore_convert_wait_result;
+		// silent wait-protocol corruption elsewhere). Repro: nestwait.c SIGUSR1 storm, the
+		// kernelAsyncRunner's work-queue semaphore (captured backtrace 2026-07-03).
+		dtape_hooks->thread_clear_resume_permit(thread->context);
 	}
 
 	thread_lock(&thread->xnu_thread);
@@ -541,6 +703,20 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 	return wait_result;
 };
 
+// perf#30 (doc section 242): the WAIT TIMER's armed state, readable from outside. MEASURED need: a semaphore timed wait
+// with a 30 second timeout was issued and its reply never came, while the same wait in another run timed out and
+// re-armed every 30 seconds -- so the question is not "did the timer fire" but "was a timer ever ARMED for this wait",
+// and only the XNU thread knows. Non-perturbing: it is read at dump time, not on the wait path.
+int dtape_thread_wait_timer_state(dtape_thread_t* thread, unsigned long long* active_out) {
+	if (!thread) {
+		return 0;
+	}
+	if (active_out) {
+		*active_out = (unsigned long long)thread->xnu_thread.wait_timer_active;
+	}
+	return thread->xnu_thread.wait_timer_is_set ? 1 : 0;
+}
+
 wait_result_t thread_block(thread_continue_t continuation) {
 	return thread_block_parameter(continuation, NULL);
 };
@@ -548,7 +724,41 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	int had_timer = xthread->wait_timer_is_set;
+	int active = xthread->wait_timer_active;
+
+	// perf#25a A0 (Part 2): finalize the wait-state transition here, matching XNU's
+	// thread_unblock() which clears TH_WAIT|TH_UNINT and sets TH_RUN. Duct-tape
+	// previously left TH_WAIT set until the microthread physically resumed and ran
+	// dtape_thread_entering(). That left a window: after a psynch grant delivered its
+	// wakeup via thread_go()->thread_unblock() (wait_result = THREAD_AWAKENED) but
+	// before the queued microthread actually ran, a racing signal abort
+	// (dtape_thread_sigexc_enter -> clear_wait_internal(THREAD_INTERRUPTED)) still saw
+	// (state & (TH_WAIT|TH_TERMINATE)) == TH_WAIT and re-fired thread_go(), CLOBBERING
+	// wait_result to THREAD_INTERRUPTED. The continuation (psynch_mtxcontinue) then took
+	// its error path and returned EINTR, THROWING AWAY an already-committed mutex grant
+	// (kwe_psynchretval, dequeued from the kwq) -- the guest re-issues the wait against a
+	// now-empty queue and deadlocks (the intermittent brew SIGCHLD-storm hang; repro
+	// cvstorm2 -DNCONS=1 storm-on). Clearing TH_WAIT here makes the second
+	// clear_wait_internal correctly return KERN_NOT_WAITING and leave the grant intact.
+	// (Do not clear TH_TERMINATE: a terminating thread must stay terminating.)
+	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+	thread->xnu_thread.state |= TH_RUN;
+
 	thread->xnu_thread.wait_result = wresult;
+
+	// Cancel the wait timer if one was armed for a timed wait. XNU's
+	// thread_unblock() does this; duct-tape previously only cancelled it in
+	// dtape_thread_destroy(). Without it, a timed wait that is woken early
+	// (e.g. by a signal or a normal condvar/mutex wakeup before its deadline)
+	// leaves its wait_timer armed. The stale timer later fires
+	// thread_timer_expire() -> clear_wait_internal(THREAD_TIMED_OUT), which
+	// delivers a SPURIOUS timeout to whatever the thread is doing then --
+	// typically a subsequent deadline-less psynch wait -- aborting it with
+	// ETIMEDOUT and stranding a condvar/mutex handoff (intermittent hang).
+	dtape_thread_cancel_wait_timer(&thread->xnu_thread);
+	dtape_test_trace_wait_timer("thread_unblock", (unsigned long long)xthread, wresult, had_timer, active);
+
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
 };

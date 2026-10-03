@@ -84,6 +84,10 @@
 
 #include <libkern/OSAtomic.h>
 
+#include <darlingserver/duct-tape/fatal-exception-reply.h>
+#include <darlingserver/duct-tape/thread.h>
+#include <darlingserver/duct-tape/test-diagnostics.h>
+
 void
 mach_msg_receive_results_complete(ipc_object_t object);
 
@@ -443,6 +447,17 @@ kernel_mach_msg_rpc(
 		return mr;
 	}
 
+	// If this microthread is synchronously delivering a fatal Mach exception to
+	// a user EXCEPTION_DEFAULT handler, bound the reply wait so an unreplying
+	// handler (e.g. one that just exit()s) can't wedge us forever. See
+	// dtape_thread.fatal_exception_delivery / dar-gwn.1.10.
+	dtape_thread_t* dthread = dtape_thread_for_xnu_thread(self);
+	boolean_t bounded = (dthread && dtape_exception_reply_wait_is_bounded(
+	    dthread->fatal_exception_delivery));
+	mach_msg_option_t rcv_option = dtape_exception_reply_wait_option(bounded);
+	mach_msg_timeout_t rcv_timeout = dtape_exception_reply_wait_timeout(bounded);
+	dtape_test_trace_exception_reply_wait((unsigned long long)self, bounded, rcv_timeout);
+
 	for (;;) {
 		ipc_mqueue_t mqueue;
 
@@ -460,9 +475,9 @@ kernel_mach_msg_rpc(
 
 		mqueue = &reply->ip_messages;
 		ipc_mqueue_receive(mqueue,
-		    MACH_MSG_OPTION_NONE,
+		    rcv_option,
 		    MACH_MSG_SIZE_MAX,
-		    MACH_MSG_TIMEOUT_NONE,
+		    rcv_timeout,
 		    interruptible ? THREAD_INTERRUPTIBLE : THREAD_UNINT);
 
 		mr = self->ith_state;
@@ -473,6 +488,16 @@ kernel_mach_msg_rpc(
 
 		if (mr == MACH_MSG_SUCCESS) {
 			break;
+		}
+
+		// Bounded fatal-exception delivery timed out: the handler never replied.
+		// Give up so exception_triage can fall through to the default handler
+		// (ux_handler -> SIGSEGV -> guest terminates), matching macOS's
+		// "unhandled fatal exception" outcome instead of deadlocking.
+		if (mr == MACH_RCV_TIMED_OUT) {
+			ipc_port_dealloc_reply(reply);
+			self->ith_rpc_reply = IP_NULL;
+			return mr;
 		}
 
 		assert(mr == MACH_RCV_INTERRUPTED);

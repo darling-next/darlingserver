@@ -75,6 +75,8 @@
 #include <kern/zalloc.h>
 #include <kern/policy_internal.h>
 #include <kern/turnstile.h>
+#include <darlingserver/duct-tape/wait-timer.h>
+#include <darlingserver/duct-tape/test-diagnostics.h>
 
 #include <os/hash.h>
 #include <libkern/OSAtomic.h>
@@ -2832,7 +2834,9 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 	assert(!thread->started || thread == current_thread());
 
 	if (thread->waitq != NULL) {
-		panic("thread already waiting on %p", thread->waitq);
+		panic("thread already waiting on %p (tid=%llu state=0x%x wr=%d old_event=0x%llx new_wq=%p new_event=0x%llx)",
+		    thread->waitq, (unsigned long long)thread->thread_id, thread->state, thread->wait_result,
+		    (unsigned long long)thread->wait_event, waitq, (unsigned long long)wait_event);
 	}
 
 	if (waitq_is_set(waitq)) {
@@ -2914,6 +2918,53 @@ waitq_assert_wait64_locked(struct waitq *waitq,
 		/* mark the event and real waitq, even if enqueued on a global safeq */
 		thread->wait_event = wait_event;
 		thread->waitq = waitq;
+
+		// dar-gwn.1.8/.1.9: A thread can only be in one wait at a time, so any
+		// wait_timer still armed here is a leftover from a PRIOR wait that was
+		// woken through a path which did not cancel it (XNU relies on
+		// thread_unblock() cancelling it on every wakeup; in duct-tape some
+		// wakeup/continuation paths can complete a timed wait without routing
+		// through thread_unblock). If left armed, that stale timer fires
+		// thread_timer_expire() -> clear_wait_internal(THREAD_TIMED_OUT) on THIS
+		// new wait, delivering a spurious timeout. For an untimed wait
+		// (deadline == 0) that becomes a bogus ETIMEDOUT, which Ruby's
+		// rb_native_cond_wait treats as a fatal [BUG] (Homebrew download_queue
+		// abort). Cancel any such leftover before (re)arming for this wait so
+		// the wait_timer state starts clean. Matches XNU's invariant that a
+		// thread entering assert_wait has no live wait_timer.
+		int injected_stale_timer = dtape_test_consume_fault("waitq.assert_wait_stale_timer");
+		if (injected_stale_timer) {
+			thread->wait_timer_is_set = TRUE;
+			dtape_test_trace_wait_timer(
+			    "wait_prepare_fault",
+			    (unsigned long long)thread,
+			    thread->wait_result,
+			    thread->wait_timer_is_set,
+			    thread->wait_timer_active);
+		}
+		dtape_test_trace_wait_timer(
+		    "wait_prepare_before",
+		    (unsigned long long)thread,
+		    thread->wait_result,
+		    thread->wait_timer_is_set,
+		    thread->wait_timer_active);
+		dtape_thread_prepare_for_wait(thread);
+		dtape_test_trace_wait_timer(
+		    "wait_prepare_after",
+		    (unsigned long long)thread,
+		    thread->wait_result,
+		    thread->wait_timer_is_set,
+		    thread->wait_timer_active);
+		if (injected_stale_timer) {
+			dtape_test_trace_wait_timer(
+			    thread->wait_timer_is_set ?
+			        "wait_prepare_fault_uncleared" :
+			        "wait_prepare_fault_cleared",
+			    (unsigned long long)thread,
+			    thread->wait_result,
+			    thread->wait_timer_is_set,
+			    thread->wait_timer_active);
+		}
 
 		if (deadline != 0) {
 			boolean_t act;

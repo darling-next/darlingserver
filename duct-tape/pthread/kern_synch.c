@@ -1161,8 +1161,9 @@ _psynch_cvwait(__unused proc_t p, user_addr_t cv, uint64_t cvlsgen,
 	 * timeouts. However S word needs to be within bounds and validated at
 	 * user level as well.
 	 */
-	if (is_seqhigher_eq(csgen, lockseq) != 0) {
-		__FAILEDUSERTEST__("psync_cvwait; invalid sequence numbers\n");
+	if (is_seqhigher(csgen, lockseq) != 0) {
+		__FAILEDUSERTEST2__("psync_cvwait; invalid sequence numbers cv=0x%llx cvlsgen=0x%llx cvugen=0x%x mutex=0x%llx mugen=0x%llx flags=0x%x cgen=0x%x csgen=0x%x lockseq=0x%x",
+				cv, cvlsgen, cvugen, mutex, mugen, flags, cgen, csgen, lockseq);
 		return EINVAL;
 	}
 

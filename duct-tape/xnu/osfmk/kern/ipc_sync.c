@@ -43,6 +43,9 @@
 #include <mach/mach_port_server.h>
 #include <mach/port.h>
 
+#include <darlingserver/duct-tape/types.h>
+#include <darlingserver/duct-tape/task.h>
+
 
 /*
  *	Routine:	port_name_to_semaphore
@@ -82,6 +85,60 @@ port_name_to_semaphore(
 	}
 	ip_unlock(kern_port);
 
+	return kr;
+}
+
+// perf#30 (doc section 245): this file now performs the signal itself, so it needs the internal entry point, which
+// upstream declares only as a forward declaration inside sync_sema.c. Declared here explicitly rather than invented.
+extern kern_return_t semaphore_signal_internal(semaphore_t semaphore, thread_t thread, int options);
+
+/*
+ *	Routine:	semaphore_signal_name_in_space
+ *
+ *	Signal (or signal-all) the semaphore named `name` inside a GIVEN space, with no dependence on the calling thread.
+ *
+ *	perf#30 (doc section 245). MEASURED: serving `semaphore_signal` from the process plane as an ordinary Call ran
+ *	the trap on the PROCESS own thread, which in this workload is very often legitimately parked in a blocking
+ *	receive, and the thread state machine refused the call -- "Thread has both a pending call and a pending
+ *	continuation (pending_call=58 ... active_call=38)" -- so the server aborted and every RPC the guest still had
+ *	outstanding was never answered. From outside that reads as a hang, and it was chased as one. The semantics need
+ *	no thread at all: a name in a space resolves to a semaphore and signalling it is a state mutation.
+ */
+kern_return_t
+semaphore_signal_name_in_space(
+	ipc_space_t             space,
+	mach_port_name_t        name,
+	boolean_t               all)
+{
+	ipc_port_t kern_port;
+	semaphore_t semaphore;
+	kern_return_t kr;
+
+	if (space == IPC_SPACE_NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	if (!MACH_PORT_VALID(name)) {
+		return KERN_INVALID_NAME;
+	}
+
+	kr = ipc_port_translate_send(space, name, &kern_port);
+	if (kr != KERN_SUCCESS) {
+		return kr;
+	}
+	assert(IP_VALID(kern_port));
+
+	semaphore = convert_port_to_semaphore(kern_port);
+	ip_unlock(kern_port);
+	if (semaphore == SEMAPHORE_NULL) {
+		return KERN_INVALID_CAPABILITY;
+	}
+
+	kr = semaphore_signal_internal(semaphore, THREAD_NULL,
+	    all ? SEMAPHORE_SIGNAL_ALL : SEMAPHORE_SIGNAL_PREPOST);
+	semaphore_dereference(semaphore);
+	if (kr == KERN_NOT_WAITING) {
+		kr = KERN_SUCCESS;
+	}
 	return kr;
 }
 

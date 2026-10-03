@@ -18,6 +18,7 @@
  */
 
 #include <darlingserver/message.hpp>
+#include <darlingserver/metrics.hpp>
 #include <unistd.h>
 #include <cstdlib>
 #include <stdexcept>
@@ -538,14 +539,28 @@ bool DarlingServer::MessageQueue::sendMany(int socket) {
 				break;
 			} else if (errno == EINTR) {
 				ret = 0;
-			} else if (errno == EPIPE || errno == ECONNREFUSED) {
+			} else if (errno == EPIPE || errno == ECONNREFUSED || errno == ENOTCONN) {
 				// this means that peer of the first message we tried to send has died.
 				// we'll just drop that message and try the others.
+				// perf#30: ENOTCONN is in this list for the same reason and it was MEASURED: a reply to a
+				// peer that has already gone away (a teardown call such as checkout, whose caller is exiting)
+				// raised it, the send path threw `std::system_error`, and the SERVER ABORTED -- which is what
+				// several earlier readings mistook for a boot wedge. A vanished peer is a dropped message,
+				// never a reason to take the process down.
 				_messages.pop_front();
 				ret = 0;
 			} else {
 				throw std::system_error(errno, std::generic_category(), "Failed to send messages through socket");
 			}
+		}
+
+		if (ret > 0) {
+			// perf #0 (dar-dar6x4-perf-5dq.6): count reply datagrams sent and stamp the
+			// last-reply time so the watcher can compute last_reply_age_ms (a frozen age
+			// while clients are blocked is the wedged signal).
+			auto& metrics = Metrics::shared();
+			metrics.repliesSent.fetch_add(static_cast<uint64_t>(ret), std::memory_order_relaxed);
+			metrics.lastReplyMonoUs.store(Metrics::nowMonoUs(), std::memory_order_relaxed);
 		}
 
 		for (size_t i = 0; i < ret; ++i) {

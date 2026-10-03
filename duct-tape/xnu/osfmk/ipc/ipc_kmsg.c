@@ -71,6 +71,7 @@
  */
 
 
+#include <darlingserver/duct-tape/test-diagnostics.h>
 #include <mach/mach_types.h>
 #include <mach/boolean.h>
 #include <mach/kern_return.h>
@@ -2190,6 +2191,8 @@ ipc_kmsg_send(
 	mach_msg_return_t error = MACH_MSG_SUCCESS;
 	boolean_t kernel_reply = FALSE;
 
+	(void)0;
+
 	/* Check if honor qlimit flag is set on thread. */
 	if ((th->options & TH_OPT_HONOR_QLIMIT) == TH_OPT_HONOR_QLIMIT) {
 		/* Remove the MACH_SEND_ALWAYS flag to honor queue limit. */
@@ -2218,6 +2221,12 @@ ipc_kmsg_send(
 
 	port = kmsg->ikm_header->msgh_remote_port;
 	assert(IP_VALID(port));
+	// perf#30 (doc section 236): the SEND half AT THE RESOLVED DESTINATION, printing the MQUEUE the message is about to
+	// be posted to. The first attempt printed `msgh_remote_port`, which is the port OBJECT (hence a pointer), so the
+	// line could not be compared with the `trap_recv_wait` line's mqueue at all -- an instrument that looked right and
+	// answered nothing. The parked receive arms on one mqueue; this is the address that must match it.
+	dtape_test_trace_msgq("kmsg_send_dest", (unsigned long long)th, (unsigned long long)&port->ip_messages,
+		(unsigned long long)port, (unsigned int)kmsg->ikm_header->msgh_bits, (int)option);
 	ip_lock(port);
 
 	/*

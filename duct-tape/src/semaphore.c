@@ -48,6 +48,34 @@ dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore)
 	}
 };
 
+dtape_semaphore_wait_result_t dtape_semaphore_down_timeout(dtape_semaphore_t* semaphore, unsigned int seconds) {
+	mach_timespec_t timeout = {
+		.tv_sec = seconds,
+		.tv_nsec = 0,
+	};
+	kern_return_t kr = semaphore_timedwait(semaphore->xnu_semaphore, timeout);
+	switch (kr) {
+		case KERN_SUCCESS:
+			return dtape_semaphore_wait_result_ok;
+		case KERN_ABORTED:
+			return dtape_semaphore_wait_result_interrupted;
+		case KERN_OPERATION_TIMED_OUT:
+			return dtape_semaphore_wait_result_timed_out;
+		default:
+			return dtape_semaphore_wait_result_error;
+	}
+};
+
+// perf#30 (doc section 245): the plane needs the semantics WITHOUT a thread. The name resolves in the task own
+// namespace, which is the only thing this operation ever needed, so no Call and no fiber are involved.
+int dtape_semaphore_signal_for_task(dtape_task_t* task, unsigned int name, int all) {
+	extern kern_return_t semaphore_signal_name_in_space(ipc_space_t, mach_port_name_t, boolean_t);
+	if (task == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	return semaphore_signal_name_in_space(task->xnu_task.itk_space, (mach_port_name_t)name, all ? 1 : 0);
+}
+
 bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore) {
 	switch (dtape_semaphore_down(semaphore)) {
 		case dtape_semaphore_wait_result_ok:
