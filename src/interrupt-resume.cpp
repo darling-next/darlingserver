@@ -31,4 +31,48 @@ bool restoresCapturedContext(Action action)
 	return action == Action::ResumeCapturedContext;
 }
 
+Retirement retireInterruptedCall(const OwnershipState& state)
+{
+	if (!state.interruptedCall) {
+		return Retirement::Nothing;
+	}
+
+	// The interrupt resumed the call (through its captured context, or by running its
+	// continuation): its own path ends here, so the record is the completion.
+	if (state.resumed) {
+		return Retirement::Retire;
+	}
+
+	// Not resumed. A plane-serviced call already answered its caller from the management page, so no
+	// waiter exists and the record may be retired. A call that still has a reply to deliver may not
+	// be retired by this path, because nothing here can deliver it.
+	return state.replySuppressed ? Retirement::Retire : Retirement::Keep;
+}
+
+bool retirementIsAmbiguous(const OwnershipState& state)
+{
+	// Retiring and keeping are mutually exclusive outcomes; the rule above must never need both.
+	return (retireInterruptedCall(state) == Retirement::Keep) && state.resumed;
+}
+
+PendingSignalResult setPendingSignal(const PendingSignalState& state, int signal)
+{
+	PendingSignalResult result;
+
+	// No marker to update is a legal state (processSignal and pendingSignal already accept it); it is
+	// reported, never raised, and nothing is mutated.
+	if (!state.interruptMarker) {
+		result.raised = false;
+		result.applied = false;
+		result.previous = 0;
+		return result;
+	}
+
+	result.raised = false;
+	result.applied = true;
+	result.previous = state.currentPending;
+	(void)signal; // the marker's new value is the caller's; this models the bookkeeping only
+	return result;
+}
+
 }

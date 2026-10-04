@@ -131,7 +131,73 @@ int main()
 		}
 	}
 
-	// The normal suspended-call behavior is unchanged by the additional case.
+	// OWNERSHIP (case C). Cleanup retires the interrupted call's record; the rule must retire a call
+	// this path completed, retire a plane-serviced call that has no waiter left, and keep one that
+	// still has a reply to deliver (this path cannot complete it).
+	{
+		using DarlingServer::InterruptResume::OwnershipState;
+		using DarlingServer::InterruptResume::Retirement;
+
+		OwnershipState none;
+		require(DarlingServer::InterruptResume::retireInterruptedCall(none) == Retirement::Nothing,
+			"no interrupted call -> nothing to retire");
+
+		OwnershipState resumed;
+		resumed.resumed = true;
+		resumed.interruptedCall = true;
+		require(DarlingServer::InterruptResume::retireInterruptedCall(resumed) == Retirement::Retire,
+			"a resumed interrupted call is complete: retire its record");
+
+		OwnershipState planeCall;
+		planeCall.interruptedCall = true;
+		planeCall.replySuppressed = true;
+		require(DarlingServer::InterruptResume::retireInterruptedCall(planeCall) == Retirement::Retire,
+			"a plane-serviced interrupted call has no waiter: retire its record");
+
+		OwnershipState liveReply;
+		liveReply.interruptedCall = true;
+		require(DarlingServer::InterruptResume::retireInterruptedCall(liveReply) == Retirement::Keep,
+			"a never-resumed call with a live reply must not be completed by this path");
+
+		for (int mask = 0; mask < 8; ++mask) {
+			OwnershipState s;
+			s.resumed = (mask & 1) != 0;
+			s.interruptedCall = (mask & 2) != 0;
+			s.replySuppressed = (mask & 4) != 0;
+			require(!DarlingServer::InterruptResume::retirementIsAmbiguous(s),
+				"ownership must never need both outcomes at once");
+			auto r = DarlingServer::InterruptResume::retireInterruptedCall(s);
+			if (s.resumed || s.replySuppressed) {
+				require(r == (s.interruptedCall ? Retirement::Retire : Retirement::Nothing),
+					"resumed or suppressed -> retire when a record exists");
+			} else {
+				require(r == (s.interruptedCall ? Retirement::Keep : Retirement::Nothing),
+					"never resumed with a live reply -> keep when a record exists");
+			}
+		}
+	}
+
+	// PENDING SIGNAL with no interrupt marker (the measured -EINVAL). The rule must not raise, must
+	// report that it mutated nothing, and must not pretend the signal was consumed.
+	{
+		using DarlingServer::InterruptResume::PendingSignalState;
+
+		PendingSignalState none;
+		auto r0 = DarlingServer::InterruptResume::setPendingSignal(none, 4);
+		require(!r0.raised, "no interrupt marker must not raise (measured defect was a throw -> -EINVAL)");
+		require(!r0.applied, "no interrupt marker -> the marker was not updated");
+		require(r0.previous == 0, "no interrupt marker -> no previous pending signal");
+
+		PendingSignalState marker;
+		marker.interruptMarker = true;
+		marker.currentPending = 7;
+		auto r1 = DarlingServer::InterruptResume::setPendingSignal(marker, 4);
+		require(!r1.raised, "an existing marker is not an error either");
+		require(r1.applied, "an existing marker is updated exactly once");
+		require(r1.previous == 7, "the previous pending signal is reported to the caller");
+	}
+
+	// The normal suspended-call behavior is unchanged by the additional cases.
 	{
 		State before;
 		before.haveInterruptedCall = true;

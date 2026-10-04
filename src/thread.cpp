@@ -1,3 +1,4 @@
+
 /**
  * This file is part of Darling.
  *
@@ -1113,15 +1114,17 @@ int DarlingServer::Thread::pendingSignal() const {
 
 int DarlingServer::Thread::setPendingSignal(int signal) {
 	std::unique_lock lock(_rwlock);
-	if (_interrupts.empty()) {
-		// NO INTERRUPT MARKER TO SET IS NOT AN ERROR. MEASURED: an urgent-plane sigprocess on a
-		// thread with no interrupt context made this throw
-		// "Can't set pending signal with no active interrupts"; processCallBasicReplyCode mapped the
-		// plain exception to -EINVAL (it maps any std::exception to -EINVAL), the guest's sigexc
-		// handler saw the failure and aborted (SIGILL), the fork child never checked in and
-		// shellspawn never became ready. processSignal() already documents and tolerates exactly this
-		// state -- the empty stack means there is no marker of this thread's to clear, not that the
-		// signal is dropped -- and pendingSignal() already answers 0 for it, so this matches both.
+	// The rule is decided by the pure module the host contract drives (see
+	// InterruptResume::setPendingSignal), so the decision is not re-derived here: no interrupt marker
+	// is a legal state (processSignal documents it and pendingSignal answers 0 for it), it is reported
+	// once, and nothing is mutated -- a marker-less thread is not an error and the signal is not
+	// consumed by this function.
+	InterruptResume::PendingSignalState state;
+	state.interruptMarker = !_interrupts.empty();
+	state.currentPending = state.interruptMarker ? _interrupts.top().signal : 0;
+
+	auto result = InterruptResume::setPendingSignal(state, signal);
+	if (!result.applied) {
 		static bool reportedMissingInterrupt = false;
 		if (!reportedMissingInterrupt) {
 			reportedMissingInterrupt = true;
@@ -1129,11 +1132,11 @@ int DarlingServer::Thread::setPendingSignal(int signal) {
 			log.error() << "[set-pending-signal-no-interrupt] setting a pending signal without an "
 				"interrupt context tid=" << _tid << " nstid=" << _nstid << log.endLog;
 		}
-		return 0;
+		return result.previous;
 	}
-	int pendingSignal = _interrupts.top().signal;
+
 	_interrupts.top().signal = signal;
-	return pendingSignal;
+	return result.previous;
 };
 
 void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNumber, int code, uintptr_t signalAddress, uintptr_t threadStateAddress, uintptr_t floatStateAddress) {
@@ -2781,6 +2784,31 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 
 	{
 		std::unique_lock lock(self->_rwlock);
+
+		// OWNERSHIP OF THE INTERRUPTED CALL (see InterruptResume::retireInterruptedCall). The rule is
+		// decided by the same pure module the host contract drives, so the decision is not re-derived
+		// here: a call this path resumed is complete, and a call it did NOT resume may only be retired
+		// when it has no reply left to deliver (a plane-serviced call answered its caller from the
+		// management page). A call that still has a reply and was not resumed is a state this path
+		// cannot complete; it is named once instead of being dropped in silence, which is what the
+		// contract's Keep outcome exists to expose.
+		{
+			InterruptResume::OwnershipState ownership;
+			ownership.resumed = self->_handlingInterruptedCall;
+			ownership.interruptedCall = (self->_interrupts.top().interruptedCall != nullptr);
+			ownership.replySuppressed = ownership.interruptedCall &&
+				self->_interrupts.top().interruptedCall->replySuppressed();
+			if (InterruptResume::retireInterruptedCall(ownership) == InterruptResume::Retirement::Keep) {
+				static bool reportedUnretiredInterruptedCall = false;
+				if (!reportedUnretiredInterruptedCall) {
+					reportedUnretiredInterruptedCall = true;
+					static DarlingServer::Log log("thread");
+					log.error() << "[interrupted-call-not-resumed] an interrupted call with a live reply "
+						"was not resumed by this interrupt; it is retired here because this path has no "
+						"way to complete it tid=" << self->_tid << " nstid=" << self->_nstid << log.endLog;
+				}
+			}
+		}
 
 		if (self->_interrupts.top().savedStack.isValid()) {
 			stackPool.free(self->_interrupts.top().savedStack);
