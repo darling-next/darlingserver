@@ -1216,9 +1216,6 @@ int main(int argc, char** argv) {
 	int pipefd = -1;
 	bool fix_permissions = false;
 	pid_t launchdGlobalPID = -1;
-	struct rlimit default_limit;
-	struct rlimit increased_limit;
-	FILE* nr_open_file = NULL;
 	int childWaitFDs[2];
 	struct rlimit core_limit;
 
@@ -1300,40 +1297,12 @@ int main(int argc, char** argv) {
 	//setupCoredumpPattern();
 	regain_privileges(rootless);
 
-	// read the default rlimit so we can restore it for our children
-	if (getrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
-		fprintf(stderr, "Failed to read default FD rlimit: %s\n", strerror(errno));
-		//exit(1);
-	} else {
-		// ASAN uses a rather obtuse way of closing descriptors for child processes it spawns,
-		// and increasing the FD limit screws with it (it tries to close every single descriptor up to the FD limit).
-#if !DSERVER_ASAN
-		// read the system maximum
-		nr_open_file = fopen("/proc/sys/fs/nr_open", "r");
-		if (nr_open_file == NULL) {
-			fprintf(stderr, "Warning: failed to open /proc/sys/fs/nr_open: %s\n", strerror(errno));
-			increased_limit.rlim_cur = increased_limit.rlim_max = default_limit.rlim_max;
-			//exit(1);
-		} else {
-			if (fscanf(nr_open_file, "%lu", &increased_limit.rlim_max) != 1) {
-				fprintf(stderr, "Failed to read /proc/sys/fs/nr_open: %s\n", strerror(errno));
-				exit(1);
-			}
-			increased_limit.rlim_cur = increased_limit.rlim_max;
-			if (fclose(nr_open_file) != 0) {
-				fprintf(stderr, "Failed to close /proc/sys/fs/nr_open: %s\n", strerror(errno));
-				exit(1);
-			}
-		}
-
-		// now set our increased rlimit
-		if (setrlimit(RLIMIT_NOFILE, &increased_limit) != 0) {
-			fprintf(stderr, "Warning: failed to increase FD rlimit: %s\n", strerror(errno));
-			//exit(1);
-		}
-
-#endif
-	}
+	// TRUTHFUL NOFILE (dar-dar6x4-perf-5dq.34): the server keeps whatever limit it inherited. It used to
+	// read /proc/sys/fs/nr_open and raise itself to the system maximum, with the child pushed back to the
+	// saved default afterwards -- which made the guest observe the maximum as its own limit (measured
+	// 1048575) instead of the honest inherited value, and left the raise invisible whenever the inherited
+	// limit already was the maximum (measured: every process of the chain at 1048576). No raise, no
+	// compensating restore: the inherited limit is the one every process gets.
 
 	if (getrlimit(RLIMIT_CORE, &core_limit) != 0) {
 		fprintf(stderr, "Failed to read default core rlimit: %s\n", strerror(errno));
@@ -1491,11 +1460,8 @@ int main(int argc, char** argv) {
 		// detect it here -- across the PID-ns boundary it always reports 0.)
 		prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 
-		// decrease the FD limit back to the default
-		if (setrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
-			fprintf(stderr, "Warning: failed to decrease FD limit back down for launchd: %s\n", strerror(errno));
-			//exit(1);
-		}
+		// No FD-limit restore here: the parent no longer raises its own limit, so the child simply keeps
+		// the inherited one (dar-dar6x4-perf-5dq.34).
 
 		// wait for the parent to give us the green light
 		read(childWaitFDs[0], buf, 1);
