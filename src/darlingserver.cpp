@@ -1206,6 +1206,36 @@ static void dserver_terminate_handler(void) {
 	_exit(134);
 }
 
+/* RLIMIT_NOFILE budget for the bootstrap closure (dar-dar6x4-perf-5dq.34).
+ *
+ * The server no longer raises this limit, so the inherited value has to carry the whole closure and the
+ * requirement is stated once, here. It is DERIVED from the descriptor high-water mark each role reaches
+ * while it establishes its anchors, measured on the canonical build (docs/nofile-virtual-cap-plan.md):
+ *
+ *     darlingserver 50   (largest: ring control page, doorbell eventfd, launchd socket, accepted guest
+ *                         connections)   launchd 28   shellspawn 23   launchctl 21   launcher 10
+ *
+ * A role's budget is its measured peak plus a quarter for descriptor churn while anchors are established
+ * (the closure opens listeners, sockets and pipes in one burst), and the closure requirement is the
+ * largest role budget aligned up to a multiple of the alignment below:
+ *
+ *     align16(50 * 5 / 4) = align16(62) = 64
+ *
+ * Cross-check, and explicitly not the source of the value: the truthful-no-raise build boots at 59 and
+ * fails at 58 (bisected), so the measured wall sits under this requirement, which is what a budget with
+ * churn headroom should look like. If a role's peak moves, this comment and the numbers move with it; do
+ * not paste a fresh wall value in without redoing the derivation.
+ */
+static constexpr rlim_t kLargestRoleDescriptorPeak = 50;
+static constexpr rlim_t kDescriptorChurnNumerator = 5;
+static constexpr rlim_t kDescriptorChurnDenominator = 4;
+static constexpr rlim_t kClosureRequirementAlign = 16;
+static constexpr rlim_t kMinimumInheritedNofile =
+	((kLargestRoleDescriptorPeak * kDescriptorChurnNumerator / kDescriptorChurnDenominator
+	  + kClosureRequirementAlign - 1) / kClosureRequirementAlign) * kClosureRequirementAlign;
+static constexpr const char* kNofileRequirementReason =
+	"largest role peak (darlingserver anchors, 50 descriptors) plus a quarter for bootstrap churn, aligned to 16";
+
 int main(int argc, char** argv) {
 	dserver_install_crash_probe();
 	std::set_terminate(dserver_terminate_handler);
@@ -1216,9 +1246,6 @@ int main(int argc, char** argv) {
 	int pipefd = -1;
 	bool fix_permissions = false;
 	pid_t launchdGlobalPID = -1;
-	struct rlimit default_limit;
-	struct rlimit increased_limit;
-	FILE* nr_open_file = NULL;
 	int childWaitFDs[2];
 	struct rlimit core_limit;
 
@@ -1300,39 +1327,33 @@ int main(int argc, char** argv) {
 	//setupCoredumpPattern();
 	regain_privileges(rootless);
 
-	// read the default rlimit so we can restore it for our children
-	if (getrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
-		fprintf(stderr, "Failed to read default FD rlimit: %s\n", strerror(errno));
-		//exit(1);
-	} else {
-		// ASAN uses a rather obtuse way of closing descriptors for child processes it spawns,
-		// and increasing the FD limit screws with it (it tries to close every single descriptor up to the FD limit).
-#if !DSERVER_ASAN
-		// read the system maximum
-		nr_open_file = fopen("/proc/sys/fs/nr_open", "r");
-		if (nr_open_file == NULL) {
-			fprintf(stderr, "Warning: failed to open /proc/sys/fs/nr_open: %s\n", strerror(errno));
-			increased_limit.rlim_cur = increased_limit.rlim_max = default_limit.rlim_max;
-			//exit(1);
-		} else {
-			if (fscanf(nr_open_file, "%lu", &increased_limit.rlim_max) != 1) {
-				fprintf(stderr, "Failed to read /proc/sys/fs/nr_open: %s\n", strerror(errno));
-				exit(1);
-			}
-			increased_limit.rlim_cur = increased_limit.rlim_max;
-			if (fclose(nr_open_file) != 0) {
-				fprintf(stderr, "Failed to close /proc/sys/fs/nr_open: %s\n", strerror(errno));
-				exit(1);
-			}
+	// TRUTHFUL NOFILE (dar-dar6x4-perf-5dq.34). The server keeps the RLIMIT_NOFILE it inherited and passes
+	// it on unchanged. It used to read /proc/sys/fs/nr_open, raise itself to that maximum and push the
+	// launchd child back down to the saved default; the ASAN special case existed only because that raise
+	// confused ASAN's descriptor sweep. Both halves are gone: with no raise there is nothing for a future
+	// creation path to leak and no compensating restore to keep in step with it.
+	//
+	// What the closure needs is therefore CHECKED, not raised, and the check runs here -- before any guest
+	// process exists -- so a host whose inherited limit cannot carry the bootstrap closure gets one
+	// diagnostic and a normal non-zero exit instead of a guest that dies through a signal after a
+	// shellspawn timeout.
+	{
+		struct rlimit inherited_nofile;
+		if (getrlimit(RLIMIT_NOFILE, &inherited_nofile) != 0) {
+			fprintf(stderr, "Failed to read inherited FD rlimit: %s\n", strerror(errno));
+			exit(1);
 		}
-
-		// now set our increased rlimit
-		if (setrlimit(RLIMIT_NOFILE, &increased_limit) != 0) {
-			fprintf(stderr, "Warning: failed to increase FD rlimit: %s\n", strerror(errno));
-			//exit(1);
+		if (inherited_nofile.rlim_cur < kMinimumInheritedNofile) {
+			fprintf(stderr,
+				"Insufficient RLIMIT_NOFILE: the inherited soft limit is %lu, but the bootstrap closure needs %lu (%s). "
+				"Raise the limit for the process that starts the server (for example, ulimit -n %lu) and retry; "
+				"no guest process has been started.\n",
+				(unsigned long)inherited_nofile.rlim_cur,
+				(unsigned long)kMinimumInheritedNofile,
+				kNofileRequirementReason,
+				(unsigned long)kMinimumInheritedNofile);
+			exit(1);
 		}
-
-#endif
 	}
 
 	if (getrlimit(RLIMIT_CORE, &core_limit) != 0) {
@@ -1491,11 +1512,9 @@ int main(int argc, char** argv) {
 		// detect it here -- across the PID-ns boundary it always reports 0.)
 		prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 
-		// decrease the FD limit back to the default
-		if (setrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
-			fprintf(stderr, "Warning: failed to decrease FD limit back down for launchd: %s\n", strerror(errno));
-			//exit(1);
-		}
+		// No FD-limit restore here (dar-dar6x4-perf-5dq.34): the parent does not raise its own limit any
+		// more, so this child simply keeps the inherited one -- the same truthful value every other
+		// process of the closure gets.
 
 		// wait for the parent to give us the green light
 		read(childWaitFDs[0], buf, 1);
