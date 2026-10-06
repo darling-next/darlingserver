@@ -294,6 +294,21 @@ extern mach_msg_return_t ipc_kmsg_put(
 	mach_msg_size_t         trailer_size,
 	mach_msg_size_t         *size);
 
+/*
+ * dar-dtape-explicit-context-6to3.5: copy a received message out on behalf of the named
+ * thread. The kqchan read path receives on a kernelAsync microthread, so the legacy
+ * header decision (task != kernel_task) and the destination map must come from the
+ * requester, never from the ambient thread.
+ */
+extern mach_msg_return_t ipc_kmsg_put_on_thread(
+	ipc_kmsg_t              kmsg,
+	mach_msg_option_t       option,
+	mach_vm_address_t       rcv_addr,
+	mach_msg_size_t         rcv_size,
+	mach_msg_size_t         trailer_size,
+	mach_msg_size_t         *size,
+	thread_t                thread);
+
 /* Copy a kernel message buffer to a kernel message */
 extern void ipc_kmsg_put_to_kernel(
 	mach_msg_header_t       *msg,
@@ -338,13 +353,28 @@ extern mach_msg_return_t ipc_kmsg_copyout(
 	mach_msg_body_t         *slist,
 	mach_msg_option_t       option);
 
+/*
+ * dar-dtape-explicit-context-6to3.5: copy a received message out on behalf of the named
+ * thread. The kqchan read path runs on a kernelAsync microthread, so the descriptor
+ * layout (task == kernel_task) and the guarded-descriptor knote must come from the
+ * requester, not the ambient thread.
+ */
+extern mach_msg_return_t ipc_kmsg_copyout_on_thread(
+	ipc_kmsg_t              kmsg,
+	ipc_space_t             space,
+	vm_map_t                map,
+	mach_msg_body_t         *slist,
+	mach_msg_option_t       option,
+	thread_t                thread);
+
 /* Copyout port rights and out-of-line memory from the body of a message */
 extern mach_msg_return_t ipc_kmsg_copyout_body(
 	ipc_kmsg_t              kmsg,
 	ipc_space_t             space,
 	vm_map_t                map,
 	mach_msg_option_t       option,
-	mach_msg_body_t         *slist);
+	mach_msg_body_t         *slist,
+	thread_t                thread);
 
 /* Copyout port rights and out-of-line memory to a user message,
  *  not reversing the ports in the header */

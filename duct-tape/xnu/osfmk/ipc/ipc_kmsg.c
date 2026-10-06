@@ -72,6 +72,7 @@
 
 
 #include <darlingserver/duct-tape/test-diagnostics.h>
+#include <darlingserver/duct-tape/memory.h>
 #include <mach/mach_types.h>
 #include <mach/boolean.h>
 #include <mach/kern_return.h>
@@ -2436,13 +2437,14 @@ retry:
  */
 
 mach_msg_return_t
-ipc_kmsg_put(
+ipc_kmsg_put_on_thread(
 	ipc_kmsg_t              kmsg,
 	mach_msg_option_t       option,
 	mach_vm_address_t       rcv_addr,
 	mach_msg_size_t         rcv_size,
 	mach_msg_size_t         trailer_size,
-	mach_msg_size_t         *sizep)
+	mach_msg_size_t         *sizep,
+	thread_t                thread)
 {
 	mach_msg_size_t size = kmsg->ikm_header->msgh_size + trailer_size;
 	mach_msg_return_t mr;
@@ -2465,7 +2467,7 @@ ipc_kmsg_put(
 	    kmsg->ikm_header->msgh_id);
 
 #if defined(__LP64__)
-	if (current_task() != kernel_task) { /* don't if receiver expects fully-cooked in-kernel msg; */
+	if (thread->task != kernel_task) { /* don't if receiver expects fully-cooked in-kernel msg; */
 		mach_msg_legacy_header_t *legacy_header =
 		    (mach_msg_legacy_header_t *)((vm_offset_t)(kmsg->ikm_header) + LEGACY_HEADER_SIZE_DELTA);
 
@@ -2505,7 +2507,7 @@ ipc_kmsg_put(
 		rcv_addr += rcv_size - size;
 	}
 
-	if (copyoutmsg((const char *) kmsg->ikm_header, rcv_addr, size)) {
+	if (dtape_copyoutmsg_on_map(thread->map, (const char *) kmsg->ikm_header, rcv_addr, size)) {
 		mr = MACH_RCV_INVALID_DATA;
 		size = 0;
 	} else {
@@ -2525,6 +2527,23 @@ ipc_kmsg_put(
 		*sizep = size;
 	}
 	return mr;
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint. XNU's own callers run on the
+ * receiving thread, so the ambient thread IS the receiver; forward it and keep the
+ * historical signature.
+ */
+mach_msg_return_t
+ipc_kmsg_put(
+	ipc_kmsg_t              kmsg,
+	mach_msg_option_t       option,
+	mach_vm_address_t       rcv_addr,
+	mach_msg_size_t         rcv_size,
+	mach_msg_size_t         trailer_size,
+	mach_msg_size_t         *sizep)
+{
+	return ipc_kmsg_put_on_thread(kmsg, option, rcv_addr, rcv_size, trailer_size, sizep, current_thread());
 }
 
 /*
@@ -4992,7 +5011,8 @@ ipc_kmsg_copyout_port_descriptor(
 	mach_msg_descriptor_t   *dsc,
 	mach_msg_descriptor_t   *dest_dsc,
 	ipc_space_t             space,
-	kern_return_t           *mr)
+	kern_return_t           *mr,
+	thread_t                self)
 {
 	mach_port_t             port;
 	mach_port_name_t        name;
@@ -5004,7 +5024,7 @@ ipc_kmsg_copyout_port_descriptor(
 	*mr |= ipc_kmsg_copyout_object(space,
 	    ip_to_object(port), disp, NULL, NULL, &name);
 
-	if (current_task() == kernel_task) {
+	if (self->task == kernel_task) {
 		mach_msg_port_descriptor_t *user_dsc = (typeof(user_dsc))dest_dsc;
 		user_dsc--;         // point to the start of this port descriptor
 		bzero((void *)user_dsc, sizeof(*user_dsc));
@@ -5031,7 +5051,8 @@ ipc_kmsg_copyout_ool_descriptor(
 	mach_msg_descriptor_t       *user_dsc,
 	int                         is_64bit,
 	vm_map_t                    map,
-	mach_msg_return_t           *mr)
+	mach_msg_return_t           *mr,
+	thread_t                    self)
 {
 	vm_map_copy_t               copy;
 	vm_map_address_t            rcv_addr;
@@ -5130,7 +5151,7 @@ ipc_kmsg_copyout_ool_descriptor(
 	 * visible size.  There is already space allocated for
 	 * this in what naddr points to.
 	 */
-	if (current_task() == kernel_task) {
+	if (self->task == kernel_task) {
 		mach_msg_ool_descriptor_t *user_ool_dsc = (typeof(user_ool_dsc))user_dsc;
 		user_ool_dsc--;
 		bzero((void *)user_ool_dsc, sizeof(*user_ool_dsc));
@@ -5180,7 +5201,8 @@ ipc_kmsg_copyout_ool_ports_descriptor(mach_msg_ool_ports_descriptor_t *dsc,
     vm_map_t map,
     ipc_space_t space,
     ipc_kmsg_t kmsg,
-    mach_msg_return_t *mr);
+    mach_msg_return_t *mr,
+    thread_t self);
 mach_msg_descriptor_t *
 ipc_kmsg_copyout_ool_ports_descriptor(mach_msg_ool_ports_descriptor_t *dsc,
     mach_msg_descriptor_t *user_dsc,
@@ -5188,7 +5210,8 @@ ipc_kmsg_copyout_ool_ports_descriptor(mach_msg_ool_ports_descriptor_t *dsc,
     vm_map_t map,
     ipc_space_t space,
     ipc_kmsg_t kmsg,
-    mach_msg_return_t *mr)
+    mach_msg_return_t *mr,
+    thread_t self)
 {
 	mach_vm_offset_t            rcv_addr = 0;
 	mach_msg_type_name_t                disp;
@@ -5287,7 +5310,7 @@ ipc_kmsg_copyout_ool_ports_descriptor(mach_msg_ool_ports_descriptor_t *dsc,
 	 * Now update the descriptor based on the information
 	 * calculated above.
 	 */
-	if (current_task() == kernel_task) {
+	if (self->task == kernel_task) {
 		mach_msg_ool_ports_descriptor_t *user_ool_dsc = (typeof(user_ool_dsc))user_dsc;
 		user_ool_dsc--;
 		bzero((void *)user_ool_dsc, sizeof(*user_ool_dsc));
@@ -5341,7 +5364,8 @@ ipc_kmsg_copyout_guarded_port_descriptor(
 	__unused ipc_kmsg_t  kmsg,
 	ipc_space_t space,
 	mach_msg_option_t option,
-	kern_return_t *mr)
+	kern_return_t *mr,
+	thread_t self)
 {
 	mach_port_t                 port;
 	mach_port_name_t            name = MACH_PORT_NULL;
@@ -5356,19 +5380,19 @@ ipc_kmsg_copyout_guarded_port_descriptor(
 	context = 0;
 
 	/* Currently kernel_task doesnt support receiving guarded port descriptors */
-	struct knote *kn = current_thread()->ith_knote;
+	struct knote *kn = self->ith_knote;
 	if ((kn != ITH_KNOTE_PSEUDO) && (((option & MACH_RCV_GUARDED_DESC) == 0) ||
-	    (current_task() == kernel_task))) {
+	    (self->task == kernel_task))) {
 #if DEVELOPMENT || DEBUG
-		if (current_task() != kernel_task) {
+		if (self->task != kernel_task) {
 			/*
 			 * Simulated crash needed for debugging, notifies the receiver to opt into receiving
 			 * guarded descriptors.
 			 */
-			mach_port_guard_exception(current_thread()->ith_receiver_name, 0, 0, kGUARD_EXC_RCV_GUARDED_DESC);
+			mach_port_guard_exception(self->ith_receiver_name, 0, 0, kGUARD_EXC_RCV_GUARDED_DESC);
 		}
 #endif
-		KDBG(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_DESTROY_GUARDED_DESC), current_thread()->ith_receiver_name,
+		KDBG(MACHDBG_CODE(DBG_MACH_IPC, MACH_IPC_DESTROY_GUARDED_DESC), self->ith_receiver_name,
 		    VM_KERNEL_ADDRPERM(port), disp, guard_flags);
 		ipc_object_destroy(ip_to_object(port), disp);
 		mach_msg_legacy_port_descriptor_t *user_dsc = (typeof(user_dsc))dest_dsc;
@@ -5434,7 +5458,8 @@ ipc_kmsg_copyout_body(
 	ipc_space_t             space,
 	vm_map_t                map,
 	mach_msg_option_t       option,
-	mach_msg_body_t         *slist)
+	mach_msg_body_t         *slist,
+	thread_t                self)
 {
 	mach_msg_body_t             *body;
 	mach_msg_descriptor_t       *kern_dsc, *user_dsc;
@@ -5465,23 +5490,23 @@ ipc_kmsg_copyout_body(
 		switch (kern_dsc[i].type.type) {
 		case MACH_MSG_PORT_DESCRIPTOR:
 			user_dsc = ipc_kmsg_copyout_port_descriptor(&kern_dsc[i],
-			    user_dsc, space, &mr);
+			    user_dsc, space, &mr, self);
 			break;
 		case MACH_MSG_OOL_VOLATILE_DESCRIPTOR:
 		case MACH_MSG_OOL_DESCRIPTOR:
 			user_dsc = ipc_kmsg_copyout_ool_descriptor(
 				(mach_msg_ool_descriptor_t *)&kern_dsc[i],
-				user_dsc, is_task_64bit, map, &mr);
+				user_dsc, is_task_64bit, map, &mr, self);
 			break;
 		case MACH_MSG_OOL_PORTS_DESCRIPTOR:
 			user_dsc = ipc_kmsg_copyout_ool_ports_descriptor(
 				(mach_msg_ool_ports_descriptor_t *)&kern_dsc[i],
-				user_dsc, is_task_64bit, map, space, kmsg, &mr);
+				user_dsc, is_task_64bit, map, space, kmsg, &mr, self);
 			break;
 		case MACH_MSG_GUARDED_PORT_DESCRIPTOR:
 			user_dsc = ipc_kmsg_copyout_guarded_port_descriptor(
 				(mach_msg_guarded_port_descriptor_t *)&kern_dsc[i],
-				user_dsc, is_task_64bit, kmsg, space, option, &mr);
+				user_dsc, is_task_64bit, kmsg, space, option, &mr, self);
 			break;
 		default: {
 			panic("untyped IPC copyout body: invalid message descriptor");
@@ -5574,12 +5599,13 @@ ipc_kmsg_copyout_size(
  */
 
 mach_msg_return_t
-ipc_kmsg_copyout(
+ipc_kmsg_copyout_on_thread(
 	ipc_kmsg_t              kmsg,
 	ipc_space_t             space,
 	vm_map_t                map,
 	mach_msg_body_t         *slist,
-	mach_msg_option_t      option)
+	mach_msg_option_t      option,
+	thread_t                self)
 {
 	mach_msg_return_t mr;
 
@@ -5591,7 +5617,7 @@ ipc_kmsg_copyout(
 	}
 
 	if (kmsg->ikm_header->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
-		mr = ipc_kmsg_copyout_body(kmsg, space, map, option, slist);
+		mr = ipc_kmsg_copyout_body(kmsg, space, map, option, slist, self);
 
 		if (mr != MACH_MSG_SUCCESS) {
 			mr |= MACH_RCV_BODY_ERROR;
@@ -5599,6 +5625,22 @@ ipc_kmsg_copyout(
 	}
 
 	return mr;
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint. XNU's own receive paths run on
+ * the receiving thread, so the ambient thread IS the receiver; forward it and keep the
+ * historical signature.
+ */
+mach_msg_return_t
+ipc_kmsg_copyout(
+	ipc_kmsg_t              kmsg,
+	ipc_space_t             space,
+	vm_map_t                map,
+	mach_msg_body_t         *slist,
+	mach_msg_option_t      option)
+{
+	return ipc_kmsg_copyout_on_thread(kmsg, space, map, slist, option, current_thread());
 }
 
 /*
@@ -5674,7 +5716,7 @@ ipc_kmsg_copyout_pseudo(
 	}
 
 	if (mbits & MACH_MSGH_BITS_COMPLEX) {
-		mr |= ipc_kmsg_copyout_body(kmsg, space, map, 0, slist);
+		mr |= ipc_kmsg_copyout_body(kmsg, space, map, 0, slist, current_thread());
 	}
 
 	return mr;

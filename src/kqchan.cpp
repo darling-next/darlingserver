@@ -513,12 +513,15 @@ void DarlingServer::Kqchan::MachPort::_read(uint64_t defaultBuffer, uint64_t def
 		reply->header.code = 0;
 		reply->header.number = dserver_kqchan_msgnum_mach_port_read;
 
-		Thread::currentThread()->impersonate(thread);
-		if (!dtape_kqchan_mach_port_fill(self->_dtapeKqchan, reply, defaultBuffer, defaultBufferSize)) {
+		// dar-dtape-explicit-context-6to3.5: the requester resolved from the RPC's nstid is
+		// carried explicitly into the fill/read path. The kernelAsync microthread's ambient
+		// thread is a kernel worker and must not be impersonated into the guest thread; the
+		// requester's kevent context, task/space, map and ith_* state are all derived from the
+		// thread handle we pass here.
+		if (!dtape_kqchan_mach_port_fill(self->_dtapeKqchan, thread->dtapeThread(), reply, defaultBuffer, defaultBufferSize)) {
 			kqchanMachPortLog.debug() << *self << ": no events to read" << kqchanMachPortLog.endLog;
 			reply->header.code = 0xdead;
 		}
-		Thread::currentThread()->impersonate(nullptr);
 
 		self->_outbox.push(std::move(msg));
 

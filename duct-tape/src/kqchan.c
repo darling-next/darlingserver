@@ -14,6 +14,8 @@ extern void filt_machportdetach(struct knote *kn);
 extern int filt_machportevent(struct knote *kn, long hint);
 extern int filt_machporttouch(struct knote *kn, struct kevent_qos_s *kev);
 extern int filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev);
+/* dar-dtape-explicit-context-6to3.5: explicit-requester form used by the kqchan read path. */
+extern int filt_machportprocess_on_thread(struct knote *kn, struct kevent_qos_s *kev, thread_t requester);
 extern int filt_machportpeek(struct knote *kn);
 
 dtape_kqchan_mach_port_t* dtape_kqchan_mach_port_create(dtape_task_t* owning_task, uint32_t port, uint64_t receive_buffer, uint64_t receive_buffer_size, uint64_t saved_filter_flags, dtape_kqchan_mach_port_notification_callback_f notification_callback, void* context) {
@@ -75,11 +77,15 @@ void dtape_kqchan_mach_port_disable_notifications(dtape_kqchan_mach_port_t* kqch
 	kqchan->context = NULL;
 };
 
-bool dtape_kqchan_mach_port_fill(dtape_kqchan_mach_port_t* kqchan, dserver_kqchan_reply_mach_port_read_t* reply, uint64_t default_buffer, uint64_t default_buffer_size) {
+bool dtape_kqchan_mach_port_fill(dtape_kqchan_mach_port_t* kqchan, dtape_thread_t* requester, dserver_kqchan_reply_mach_port_read_t* reply, uint64_t default_buffer, uint64_t default_buffer_size) {
 	struct kevent_qos_s kev;
 	bool maybe_used_default_buffer = false;
-	thread_t xthread = current_thread();
-	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	/*
+	 * dar-dtape-explicit-context-6to3.5: the read is performed on behalf of the explicit
+	 * requester resolved from the RPC's tid, not the executing (kernelAsync) thread. The
+	 * kevent context and the thread handed to filt_machportprocess are the requester's.
+	 */
+	dtape_thread_t* thread = requester;
 
 	thread->kevent_ctx.kec_data_out = thread->kevent_ctx.kec_data_avail = default_buffer;
 	thread->kevent_ctx.kec_data_size = thread->kevent_ctx.kec_data_resid = default_buffer_size;
@@ -103,7 +109,7 @@ bool dtape_kqchan_mach_port_fill(dtape_kqchan_mach_port_t* kqchan, dserver_kqcha
 
 	dtape_log_debug("has events before process? %s", has_events ? "yes" : "no");
 
-	bool result = (filt_machportprocess(&kqchan->knote, (void*)&reply->kev) & FILTER_ACTIVE) ? true : false;
+	bool result = (filt_machportprocess_on_thread(&kqchan->knote, (void*)&reply->kev, &thread->xnu_thread) & FILTER_ACTIVE) ? true : false;
 
 	dtape_log_debug("had events that were processed? %s", result ? "yes" : "no");
 

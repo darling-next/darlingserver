@@ -229,10 +229,17 @@ extern boolean_t ipc_importance_send(
 	ipc_kmsg_t              kmsg,
 	mach_msg_option_t       option);
 
-/* receive importance attributes from message */
+/* receive importance attributes from message (ambient receiver) */
 extern void ipc_importance_receive(
 	ipc_kmsg_t              kmsg,
 	mach_msg_option_t       option);
+
+/* dar-dtape-explicit-context-6to3.5: receive importance attributes on behalf of the
+ * named receiver task (the kqchan read path runs on a kernelAsync microthread). */
+extern void ipc_importance_receive_for_task(
+	ipc_kmsg_t              kmsg,
+	mach_msg_option_t       option,
+	task_t                  task_self);
 
 /* undo receive of importance attributes from message */
 extern void ipc_importance_unreceive(

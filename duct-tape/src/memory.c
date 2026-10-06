@@ -358,17 +358,26 @@ int (copyin)(const user_addr_t user_addr, void* kernel_addr, vm_size_t nbytes) {
 	return (copyinmap(current_map(), user_addr, kernel_addr, nbytes) == KERN_SUCCESS) ? 0 : 1;
 };
 
-int (copyout)(const void* kernel_addr, user_addr_t user_addr, vm_size_t nbytes) {
+/* dar-dtape-explicit-context-6to3.5: explicit destination map (see memory.h). */
+int dtape_copyout_on_map(vm_map_t map, const void* kernel_addr, user_addr_t user_addr, vm_size_t nbytes) {
 	// it doesn't actually modify kernel_addr
-	return (copyoutmap(current_map(), (void*)kernel_addr, user_addr, nbytes) == KERN_SUCCESS) ? 0 : 1;
+	return (copyoutmap(map, (void*)kernel_addr, user_addr, nbytes) == KERN_SUCCESS) ? 0 : 1;
+};
+
+int (copyout)(const void* kernel_addr, user_addr_t user_addr, vm_size_t nbytes) {
+	return dtape_copyout_on_map(current_map(), kernel_addr, user_addr, nbytes);
 };
 
 int copyinmsg(const user_addr_t user_addr, char* kernel_addr, mach_msg_size_t nbytes) {
 	return (copyin)(user_addr, kernel_addr, nbytes);
 };
 
+int dtape_copyoutmsg_on_map(vm_map_t map, const char* kernel_addr, user_addr_t user_addr, mach_msg_size_t nbytes) {
+	return dtape_copyout_on_map(map, kernel_addr, user_addr, nbytes);
+};
+
 int copyoutmsg(const char* kernel_addr, user_addr_t user_addr, mach_msg_size_t nbytes) {
-	return (copyout)(kernel_addr, user_addr, nbytes);
+	return dtape_copyoutmsg_on_map(current_map(), kernel_addr, user_addr, nbytes);
 };
 
 kern_return_t kmem_suballoc(vm_map_t parent, vm_offset_t* addr, vm_size_t size, boolean_t pageable, int flags, vm_map_kernel_flags_t vmk_flags, vm_tag_t tag, vm_map_t* new_map) {

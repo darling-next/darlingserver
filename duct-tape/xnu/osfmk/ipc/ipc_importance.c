@@ -3148,14 +3148,18 @@ out_locked:
  *		Nothing locked.
  */
 void
-ipc_importance_receive(
+ipc_importance_receive_for_task(
 	ipc_kmsg_t              kmsg,
-	mach_msg_option_t       option)
+	mach_msg_option_t       option,
+	task_t                  task_self)
 {
 	int impresult = -1;
 
+	/* dar-dtape-explicit-context-6to3.5: the receiver is the explicit requester task,
+	 * never the executing kernelAsync thread's task. */
+	(void)task_self;
+
 #if IMPORTANCE_TRACE || LEGACY_IMPORTANCE_DELIVERY
-	task_t task_self = current_task();
 	unsigned int sender_pid = ((mach_msg_max_trailer_t *)
 	    ((vm_offset_t)kmsg->ikm_header +
 	    mach_round_msg(kmsg->ikm_header->msgh_size)))->msgh_audit.val[5];
@@ -3280,6 +3284,18 @@ ipc_importance_receive(
 		    int, sender_pid, int, 1, int, task_self->task_imp_base->iit_assertcnt);
 	}
 #endif /* IMPORTANCE_TRACE */
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint; the ambient thread's task is
+ * the receiver for XNU's own receive paths.
+ */
+void
+ipc_importance_receive(
+	ipc_kmsg_t              kmsg,
+	mach_msg_option_t       option)
+{
+	ipc_importance_receive_for_task(kmsg, option, current_task());
 }
 
 /*

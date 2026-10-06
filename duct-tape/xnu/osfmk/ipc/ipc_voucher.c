@@ -2702,9 +2702,10 @@ ipc_voucher_send_preprocessing(ipc_kmsg_t kmsg)
  *		in order to maintain symmetry with ipc_voucher_send_preprocessing.
  */
 void
-ipc_voucher_receive_postprocessing(
+ipc_voucher_receive_postprocessing_for_task(
 	ipc_kmsg_t              kmsg,
-	mach_msg_option_t       option)
+	mach_msg_option_t       option,
+	task_t                  task_self)
 {
 	uint8_t recipes[(MACH_VOUCHER_ATTR_KEY_NUM_WELL_KNOWN + 1) * sizeof(ipc_voucher_attr_recipe_data_t)];
 	ipc_voucher_attr_raw_recipe_array_size_t recipe_size = (MACH_VOUCHER_ATTR_KEY_NUM_WELL_KNOWN + 1) *
@@ -2715,7 +2716,7 @@ ipc_voucher_receive_postprocessing(
 	int need_postprocessing = FALSE;
 
 	if ((option & MACH_RCV_VOUCHER) == 0 || (!IP_VALID(kmsg->ikm_voucher)) ||
-	    current_task() == kernel_task) {
+	    task_self == kernel_task) {
 		return;
 	}
 
@@ -2742,6 +2743,18 @@ ipc_voucher_receive_postprocessing(
 		ipc_port_release_send(kmsg->ikm_voucher);
 		kmsg->ikm_voucher = convert_voucher_to_port(recv_voucher);
 	}
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint; the ambient thread's task is
+ * the receiver for XNU's own receive paths.
+ */
+void
+ipc_voucher_receive_postprocessing(
+	ipc_kmsg_t              kmsg,
+	mach_msg_option_t       option)
+{
+	ipc_voucher_receive_postprocessing_for_task(kmsg, option, current_task());
 }
 
 /*

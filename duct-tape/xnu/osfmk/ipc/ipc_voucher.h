@@ -155,6 +155,9 @@ typedef ipc_voucher_attr_control_t iv_attr_control_t;
 
 extern ipc_voucher_attr_control_t  ivac_alloc(iv_index_t);
 extern void ipc_voucher_receive_postprocessing(ipc_kmsg_t kmsg, mach_msg_option_t option);
+/* dar-dtape-explicit-context-6to3.5: postprocess a received voucher on behalf of the
+ * named receiver task (the kqchan read path runs on a kernelAsync microthread). */
+extern void ipc_voucher_receive_postprocessing_for_task(ipc_kmsg_t kmsg, mach_msg_option_t option, task_t task_self);
 extern void ipc_voucher_send_preprocessing(ipc_kmsg_t kmsg);
 extern void mach_init_activity_id(void);
 extern kern_return_t ipc_get_pthpriority_from_kmsg_voucher(ipc_kmsg_t kmsg, ipc_pthread_priority_value_t *qos);

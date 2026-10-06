@@ -1079,16 +1079,28 @@ filt_machporttouch(
 	return result;
 }
 
+/*
+ * dar-dtape-explicit-context-6to3.5: the explicit-requester form of the Mach-port
+ * process filter. The kqchan read/fill path runs in a kernelAsync microthread (the
+ * ambient thread is the kernel worker, K) while the semantic requester is the guest
+ * thread that asked for the read (R). Every per-thread field this filter reads and
+ * writes -- ith_*, kevent_ctx and the thread passed to ipc_mqueue_receive_on_thread --
+ * must be R, never K, so the requester is an explicit parameter here.
+ *
+ * The ordinary entrypoint below keeps its signature and forwards current_thread():
+ * other XNU callers (select()/kevent processing on the guest thread) rely on the
+ * ambient thread being the receiver.
+ */
 #ifdef __DARLING__
 int
 #else
 static int
 #endif // __DARLING__
-filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev)
+filt_machportprocess_on_thread(struct knote *kn, struct kevent_qos_s *kev, thread_t requester)
 {
 	ipc_mqueue_t mqueue = kn->kn_mqueue;
 	ipc_object_t object = imq_to_object(mqueue);
-	thread_t self = current_thread();
+	thread_t self = requester;
 	kevent_ctx_t kectx = NULL;
 
 	wait_result_t wresult;
@@ -1199,7 +1211,7 @@ filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev)
 	 * Attempt to receive the message directly, returning
 	 * the results in the fflags field.
 	 */
-	kev->fflags = mach_msg_receive_results(&size);
+	kev->fflags = mach_msg_receive_results_on_thread(&size, self);
 
 	/* kmsg and object reference consumed */
 
@@ -1250,6 +1262,21 @@ filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev)
 	}
 
 	return FILTER_ACTIVE;
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint. XNU's own kevent/select
+ * processing calls this on the receiving thread, so the ambient thread IS the
+ * requester; forward it and keep the historical signature.
+ */
+#ifdef __DARLING__
+int
+#else
+static int
+#endif // __DARLING__
+filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev)
+{
+	return filt_machportprocess_on_thread(kn, kev, current_thread());
 }
 
 /*

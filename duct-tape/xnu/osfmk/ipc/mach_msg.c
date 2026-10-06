@@ -71,6 +71,7 @@
  */
 
 #include <darlingserver/duct-tape/test-diagnostics.h>
+#include <darlingserver/duct-tape/memory.h>
 #include <mach/mach_types.h>
 #include <mach/kern_return.h>
 #include <mach/port.h>
@@ -145,7 +146,8 @@ mach_msg_return_t msg_receive_error(
 	mach_msg_size_t         rcv_size,
 	mach_port_seqno_t       seqno,
 	ipc_space_t             space,
-	mach_msg_size_t         *out_size);
+	mach_msg_size_t         *out_size,
+	thread_t                self);
 
 static mach_msg_return_t
 mach_msg_rcv_link_special_reply_port(
@@ -154,6 +156,9 @@ mach_msg_rcv_link_special_reply_port(
 
 void
 mach_msg_receive_results_complete(ipc_object_t object);
+
+void
+mach_msg_receive_results_complete_on_thread(ipc_object_t object, thread_t self);
 
 const security_token_t KERNEL_SECURITY_TOKEN = KERNEL_SECURITY_TOKEN_VALUE;
 const audit_token_t KERNEL_AUDIT_TOKEN = KERNEL_AUDIT_TOKEN_VALUE;
@@ -309,13 +314,31 @@ typedef struct{
  *		MACH_RCV_HEADER_ERROR
  */
 
+/*
+ * dar-dtape-explicit-context-6to3.5: explicit-requester form of mach_msg_receive_results.
+ *
+ * The kqchan Mach-port read/fill path runs the receive in a kernelAsync microthread whose
+ * ambient thread is a kernel worker, K, while the message is being received on behalf of the
+ * guest thread R. The message body must copy out into R's address space and the received
+ * state (ith_*) must land on R, so requester is an explicit parameter: K is never consulted.
+ *
+ * mach_msg_receive_results_complete() is NOT left ambient for this path: it reads and writes
+ * the receiver's turnstile and ith_state, so it must act on the same requester R. The ambient
+ * entrypoint still forwards current_thread() for the blocking callers in ipc_mig.c.
+ *
+ * The same requester is threaded through the copyout leaves that would otherwise read the
+ * ambient thread: ipc_kmsg_put_on_thread (legacy-header decision and destination map),
+ * dtape_copyout_on_map (the TOO_LARGE header fields), ipc_kmsg_copyout_on_thread (descriptor
+ * layout and guarded-descriptor knote), and the importance/voucher postprocessing.
+ */
 mach_msg_return_t
-mach_msg_receive_results(
-	mach_msg_size_t *sizep)
+mach_msg_receive_results_on_thread(
+	mach_msg_size_t *sizep,
+	thread_t          requester)
 {
-	thread_t          self = current_thread();
-	ipc_space_t       space = current_space();
-	vm_map_t          map = current_map();
+	thread_t          self = requester;
+	ipc_space_t       space = requester->task->itk_space;
+	vm_map_t          map = requester->map;
 
 	ipc_object_t      object = self->ith_object;
 	mach_msg_return_t mr = self->ith_state;
@@ -333,7 +356,7 @@ mach_msg_receive_results(
 	 * unlink the special_reply_port before releasing reference to object.
 	 * get the thread's turnstile, if the thread donated it's turnstile to the port
 	 */
-	mach_msg_receive_results_complete(object);
+	mach_msg_receive_results_complete_on_thread(object, self);
 	io_release(object);
 
 	if (mr != MACH_MSG_SUCCESS) {
@@ -355,13 +378,13 @@ mach_msg_receive_results(
 					 * the queue).
 					 */
 					if (option & MACH_RCV_LARGE_IDENTITY) {
-						if (copyout((char *) &self->ith_receiver_name,
+						if (dtape_copyout_on_map(map, (char *) &self->ith_receiver_name,
 						    rcv_addr + offsetof(mach_msg_user_header_t, msgh_local_port),
 						    sizeof(mach_port_name_t))) {
 							mr = MACH_RCV_INVALID_DATA;
 						}
 					}
-					if (copyout((char *) &self->ith_msize,
+					if (dtape_copyout_on_map(map, (char *) &self->ith_msize,
 					    rcv_addr + offsetof(mach_msg_user_header_t, msgh_size),
 					    sizeof(mach_msg_size_t))) {
 						mr = MACH_RCV_INVALID_DATA;
@@ -371,7 +394,7 @@ mach_msg_receive_results(
 				/* discard importance in message */
 				ipc_importance_clean(kmsg);
 
-				if (msg_receive_error(kmsg, option, rcv_addr, rcv_size, seqno, space, &size)
+				if (msg_receive_error(kmsg, option, rcv_addr, rcv_size, seqno, space, &size, self)
 				    == MACH_RCV_INVALID_DATA) {
 					mr = MACH_RCV_INVALID_DATA;
 				}
@@ -389,17 +412,17 @@ mach_msg_receive_results(
 #if IMPORTANCE_INHERITANCE
 
 	/* adopt/transform any importance attributes carried in the message */
-	ipc_importance_receive(kmsg, option);
+	ipc_importance_receive_for_task(kmsg, option, self->task);
 
 #endif  /* IMPORTANCE_INHERITANCE */
 
 	/* auto redeem the voucher in the message */
-	ipc_voucher_receive_postprocessing(kmsg, option);
+	ipc_voucher_receive_postprocessing_for_task(kmsg, option, self->task);
 
 	/* Save destination port context for the trailer before copyout */
 	context = kmsg->ikm_header->msgh_remote_port->ip_context;
 
-	mr = ipc_kmsg_copyout(kmsg, space, map, MACH_MSG_BODY_NULL, option);
+	mr = ipc_kmsg_copyout_on_thread(kmsg, space, map, MACH_MSG_BODY_NULL, option, self);
 
 	trailer_size = ipc_kmsg_trailer_size(option, self);
 
@@ -410,11 +433,11 @@ mach_msg_receive_results(
 		/* if we had a body error copyout what we have, otherwise a simple header/trailer */
 		if ((mr & ~MACH_MSG_MASK) == MACH_RCV_BODY_ERROR) {
 			ipc_kmsg_add_trailer(kmsg, space, option, self, seqno, FALSE, context);
-			if (ipc_kmsg_put(kmsg, option, rcv_addr, rcv_size, trailer_size, &size) == MACH_RCV_INVALID_DATA) {
+			if (ipc_kmsg_put_on_thread(kmsg, option, rcv_addr, rcv_size, trailer_size, &size, self) == MACH_RCV_INVALID_DATA) {
 				mr = MACH_RCV_INVALID_DATA;
 			}
 		} else {
-			if (msg_receive_error(kmsg, option, rcv_addr, rcv_size, seqno, space, &size)
+			if (msg_receive_error(kmsg, option, rcv_addr, rcv_size, seqno, space, &size, self)
 			    == MACH_RCV_INVALID_DATA) {
 				mr = MACH_RCV_INVALID_DATA;
 			}
@@ -424,13 +447,25 @@ mach_msg_receive_results(
 		self->ith_ppriority = kmsg->ikm_ppriority;
 		self->ith_qos_override = kmsg->ikm_qos_override;
 		ipc_kmsg_add_trailer(kmsg, space, option, self, seqno, FALSE, context);
-		mr = ipc_kmsg_put(kmsg, option, rcv_addr, rcv_size, trailer_size, &size);
+		mr = ipc_kmsg_put_on_thread(kmsg, option, rcv_addr, rcv_size, trailer_size, &size, self);
 	}
 
 	if (sizep) {
 		*sizep = size;
 	}
 	return mr;
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint. XNU's blocking receive
+ * paths (mach_msg_receive / the overwrite trap) call this with the ambient thread as
+ * the receiver; forward it and keep the historical signature.
+ */
+mach_msg_return_t
+mach_msg_receive_results(
+	mach_msg_size_t *sizep)
+{
+	return mach_msg_receive_results_on_thread(sizep, current_thread());
 }
 
 /*
@@ -702,9 +737,8 @@ mach_msg_rcv_link_special_reply_port(
  *		None.
  */
 void
-mach_msg_receive_results_complete(ipc_object_t object)
+mach_msg_receive_results_complete_on_thread(ipc_object_t object, thread_t self)
 {
-	thread_t self = current_thread();
 	ipc_port_t port = IPC_PORT_NULL;
 	boolean_t get_turnstile = (self->turnstile == TURNSTILE_NULL);
 
@@ -735,6 +769,17 @@ mach_msg_receive_results_complete(ipc_object_t object)
 	}
 	assert(self->turnstile != TURNSTILE_NULL);
 	/* thread now has a turnstile */
+}
+
+/*
+ * dar-dtape-explicit-context-6to3.5: ordinary entrypoint. The blocking receive callers in
+ * ipc_mig.c call this with the ambient thread as the receiver; forward it and keep the
+ * historical signature.
+ */
+void
+mach_msg_receive_results_complete(ipc_object_t object)
+{
+	mach_msg_receive_results_complete_on_thread(object, current_thread());
 }
 
 /*
@@ -782,12 +827,12 @@ msg_receive_error(
 	mach_msg_size_t         rcv_size,
 	mach_port_seqno_t       seqno,
 	ipc_space_t             space,
-	mach_msg_size_t         *sizep)
+	mach_msg_size_t         *sizep,
+	thread_t                self)
 {
 	mach_vm_address_t       context;
 	mach_msg_trailer_size_t trailer_size;
 	mach_msg_max_trailer_t  *trailer;
-	thread_t                self = current_thread();
 
 	context = kmsg->ikm_header->msgh_remote_port->ip_context;
 
@@ -817,7 +862,7 @@ msg_receive_error(
 	 * (note that ipc_kmsg_put may also adjust the actual
 	 * size copied out to user-space).
 	 */
-	if (ipc_kmsg_put(kmsg, option, rcv_addr, rcv_size, trailer_size, sizep) == MACH_RCV_INVALID_DATA) {
+	if (ipc_kmsg_put_on_thread(kmsg, option, rcv_addr, rcv_size, trailer_size, sizep, self) == MACH_RCV_INVALID_DATA) {
 		return MACH_RCV_INVALID_DATA;
 	} else {
 		return MACH_MSG_SUCCESS;

@@ -123,7 +123,9 @@ void dtape_timer_fired(void);
 
 void dtape_kqchan_mach_port_modify(dtape_kqchan_mach_port_t* kqchan, uint64_t receive_buffer, uint64_t receive_buffer_size, uint64_t saved_filter_flags);
 void dtape_kqchan_mach_port_disable_notifications(dtape_kqchan_mach_port_t* kqchan);
-bool dtape_kqchan_mach_port_fill(dtape_kqchan_mach_port_t* kqchan, dserver_kqchan_reply_mach_port_read_t* reply, uint64_t default_buffer, uint64_t default_buffer_size);
+// dar-dtape-explicit-context-6to3.5: the read/fill is performed on behalf of an explicit
+// requester thread (resolved from the RPC tid), not the executing kernelAsync thread.
+bool dtape_kqchan_mach_port_fill(dtape_kqchan_mach_port_t* kqchan, dtape_thread_t* requester, dserver_kqchan_reply_mach_port_read_t* reply, uint64_t default_buffer, uint64_t default_buffer_size);
 bool dtape_kqchan_mach_port_has_events(dtape_kqchan_mach_port_t* kqchan);
 
 void dtape_semaphore_up(dtape_semaphore_t* semaphore);

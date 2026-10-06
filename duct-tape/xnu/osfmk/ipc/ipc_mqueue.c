@@ -1354,7 +1354,13 @@ ipc_mqueue_select_on_thread(
 	thread->ith_kmsg = kmsg;
 	thread->ith_state = mr;
 
-	current_task()->messages_received++;
+	/*
+	 * dar-dtape-explicit-context-6to3.5: this function receives on behalf of the
+	 * named thread, so the received-message counter belongs to that thread's task.
+	 * current_task() is the executing thread, which is not necessarily the named one
+	 * (the kqchan fill runs in a kernelAsync microthread on behalf of a guest thread).
+	 */
+	thread->task->messages_received++;
 	return;
 }
 

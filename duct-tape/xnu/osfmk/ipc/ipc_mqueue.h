@@ -305,6 +305,18 @@ extern void ipc_mqueue_select_on_thread(
 	mach_msg_size_t         max_size,
 	thread_t                thread);
 
+/*
+ * dar-dtape-explicit-context-6to3.5: complete a receive on the named requester.
+ *
+ * The kqchan Mach-port read path receives in a kernelAsync microthread whose ambient
+ * thread is a kernel worker, so the historical mach_msg_receive_results() (which reads
+ * current_thread()/current_space()/current_map()) cannot serve it. This form takes the
+ * semantic requester explicitly; the ambient entrypoint forwards current_thread().
+ */
+extern mach_msg_return_t mach_msg_receive_results_on_thread(
+	mach_msg_size_t         *sizep,
+	thread_t                requester);
+
 /* Peek into a messaqe queue to see if there are messages */
 extern unsigned ipc_mqueue_peek(
 	ipc_mqueue_t            mqueue,

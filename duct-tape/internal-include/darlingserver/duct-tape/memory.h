@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <mach/vm_types.h>
+#include <mach/mach_types.h>
+#include <mach/message.h>
 #include <os/refcnt.h>
 #include <sys/tree.h>
 
@@ -67,5 +69,17 @@ struct vm_map_copy {
 void dtape_memory_init(void);
 vm_map_t dtape_vm_map_create(struct dtape_task* task);
 void dtape_vm_map_destroy(vm_map_t map);
+
+/*
+ * dar-dtape-explicit-context-6to3.5: map-explicit forms of the kernel copyout helpers.
+ *
+ * The historical copyout()/copyoutmsg() resolve the destination map from current_map(),
+ * which is only correct when the ambient thread is the receiver. The kqchan Mach-port
+ * read path runs on a kernelAsync microthread on behalf of a guest thread, so the
+ * receive copyout must name the requester's map explicitly. The ambient entrypoints
+ * forward current_map() and keep their signatures for all other callers.
+ */
+int dtape_copyout_on_map(vm_map_t map, const void* kernel_addr, user_addr_t user_addr, vm_size_t nbytes);
+int dtape_copyoutmsg_on_map(vm_map_t map, const char* kernel_addr, user_addr_t user_addr, mach_msg_size_t nbytes);
 
 #endif // _DARLINGSERVER_DUCT_TAPE_MEMORY_H_
