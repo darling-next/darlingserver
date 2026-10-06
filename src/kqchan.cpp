@@ -438,21 +438,20 @@ void DarlingServer::Kqchan::MachPort::_processMessages() {
 void DarlingServer::Kqchan::MachPort::_modify(uint64_t receiveBuffer, uint64_t receiveBufferSize, uint64_t savedFilterFlags, pid_t nstid) {
 	kqchanMachPortLog.debug() << *this << ": Received modification request with {receiveBuffer=" << receiveBuffer << ",receiveBufferSize=" << receiveBufferSize << ",savedFilterFlags=" << savedFilterFlags << "}" << kqchanMachPortLog.endLog;
 
-	auto maybeThread = threadRegistry().lookupEntryByNSID(nstid);
-
-	if (!maybeThread) {
+	// dar-dtape-explicit-context-6to3.4a: the modify path is context-free. dtape_kqchan_mach_port_modify
+	// reaches only filt_machporttouch, whose transitive code reads no current_thread()/current_task(), so
+	// the impersonate() pair that used to wrap the call was fake context with no semantic consumer.
+	// Thread::impersonate also defers and coordinates the named thread (_deferLocked + _execution.begin()),
+	// so removing it removes a needless cross-thread deferral as well. The requester is still validated.
+	if (!threadRegistry().lookupEntryByNSID(nstid)) {
 		throw std::runtime_error("No thread for Mach port kqchan modification?");
 	}
 
-	auto thread = *maybeThread;
-
 	auto self = shared_from_this();
-	Thread::kernelAsync([self, thread, receiveBuffer, receiveBufferSize, savedFilterFlags]() {
+	Thread::kernelAsync([self, receiveBuffer, receiveBufferSize, savedFilterFlags]() {
 		kqchanMachPortLog.debug() << *self << ": Handling modification request in microthread" << kqchanMachPortLog.endLog;
 
-		Thread::currentThread()->impersonate(thread);
 		dtape_kqchan_mach_port_modify(self->_dtapeKqchan, receiveBuffer, receiveBufferSize, savedFilterFlags);
-		Thread::currentThread()->impersonate(nullptr);
 
 		Message msg(sizeof(dserver_kqchan_reply_mach_port_modify_t), 0, self->_checkForEventsAsyncFactory());
 
