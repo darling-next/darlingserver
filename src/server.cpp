@@ -3607,17 +3607,26 @@ void DarlingServer::Server::start() {
 				if (ret != 0) {
 					break; // ready fds (ret>0) or error (ret<0, handled below)
 				}
-				if (serviced > 0) {
-					continue; // did real work -> keep the budget alive (reset by staying hot)
-				}
-
+				// THE WORK QUANTUM BOUNDS THE SPIN EVEN WHILE RING WORK KEEPS ARRIVING (dar-dles). MEASURED:
+				// `serviced > 0 -> continue` skipped this check entirely, and _drainRings() has NO internal
+				// bound -- it walks every attached ring thread and runs the full Call path per thread -- so
+				// with continuous ring load the outer loop body was never reached. The management plane was
+				// then scanned only in the gaps between ring bursts (5-26 scans per 2 s against a ~130/s
+				// run average), a published management request waited seconds, and pthread_create stalled
+				// behind it. Consulting the budget unconditionally keeps the hot path hot (the drain still
+				// runs first, still with zero doorbell syscalls) and guarantees the outer body -- management
+				// service AND the deferred plane calls -- is reached at least once per quantum. This is not
+				// periodic polling of an idle server: the spin only exists while rings are attached, and a
+				// genuinely idle loop still arms and blocks in epoll below.
 				struct timespec ts1;
 				clock_gettime(CLOCK_MONOTONIC, &ts1);
 				uint64_t nowNs = (uint64_t)ts1.tv_sec * 1000000000ull + ts1.tv_nsec;
 				if (nowNs - startNs >= _ringSpinNs) {
-					break; // budget exhausted with nothing to do -> fall through to arm + block
+					break; // quantum exhausted -> service the plane + deferred calls, then re-arm
 				}
-				__builtin_ia32_pause();
+				if (serviced == 0) {
+					__builtin_ia32_pause();
+				}
 			}
 		}
 
@@ -4077,6 +4086,12 @@ std::shared_ptr<DarlingServer::Server::RingProcessWake> DarlingServer::Server::_
 			eventfd_read(thisMonitor->fd()->fd(), &value);
 			if (static_cast<uint64_t>(events & Monitor::Event::Readable) != 0) {
 				_ringDrainAll();
+				// WAKES MUST REACH THE MANAGEMENT PLANE FROM EITHER DOORBELL (dar-dles). A guest rings the
+				// doorbell it actually holds, and that object is whichever of the two it adopted first: the
+				// server-wide one (whose wake handler already services the plane) or this per-incarnation one.
+				// Servicing only the rings here made the plane's progress depend on which object the guest
+				// happened to keep, which is not a property any caller can see or reason about.
+				_serviceProcessControl();
 			}
 		}
 	);
