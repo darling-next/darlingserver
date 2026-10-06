@@ -3,6 +3,7 @@
 #include <darlingserver/duct-tape/task.h>
 #include <darlingserver/duct-tape/thread.h>
 #include <darlingserver/duct-tape/wait-timer.h>
+#include <darlingserver/duct-tape/thread-state.h>
 #include <darlingserver/duct-tape/test-diagnostics.h>
 #include <darlingserver/duct-tape/hooks.internal.h>
 #include <darlingserver/duct-tape/log.h>
@@ -18,6 +19,15 @@
 #include <stdlib.h>
 
 #include <rtsig.h>
+
+// perf#30 DTAPE-CONTEXT (dar-dtape-explicit-context-6to3.3): the pure layout module
+// (`darlingserver/duct-tape/thread-state.h`) is kept free of the generated RPC headers, so tie its
+// architecture codes to the RPC enum here, at compile time, rather than trusting them to agree.
+_Static_assert(dserver_rpc_architecture_invalid == dtape_thread_state_architecture_invalid, "thread-state architecture code mismatch");
+_Static_assert(dserver_rpc_architecture_i386 == dtape_thread_state_architecture_i386, "thread-state architecture code mismatch");
+_Static_assert(dserver_rpc_architecture_x86_64 == dtape_thread_state_architecture_x86_64, "thread-state architecture code mismatch");
+_Static_assert(dserver_rpc_architecture_arm32 == dtape_thread_state_architecture_arm32, "thread-state architecture code mismatch");
+_Static_assert(dserver_rpc_architecture_arm64 == dtape_thread_state_architecture_arm64, "thread-state architecture code mismatch");
 
 #define LINUX_ENOSYS 38
 #define LINUX_EFAULT 14
@@ -257,74 +267,92 @@ void* dtape_thread_context(dtape_thread_t* thread) {
 	return thread->context;
 };
 
+// perf#30 DTAPE-CONTEXT (dar-dtape-explicit-context-6to3.3): the XNU half of the shared thread-state
+// decision. The decision itself (which layouts exist, and that the NAMED thread is the only target)
+// lives in duct-tape/src/thread-state.c with no ambient dependency; these shims only forward the
+// explicit target to the XNU traps.
+static int dtape_thread_state_shim_copyin(void* ctx, uintptr_t address, void* buffer, unsigned long length) {
+	(void)ctx;
+	return copyin(address, buffer, length);
+}
+
+static int dtape_thread_state_shim_copyout(void* ctx, const void* buffer, uintptr_t address, unsigned long length) {
+	(void)ctx;
+	return copyout(buffer, address, length);
+}
+
+static void dtape_thread_state_shim_set_state(void* ctx, void* xnu_thread, int flavor, const void* state, unsigned int count) {
+	(void)ctx;
+	thread_set_state((thread_t)xnu_thread, flavor, (thread_state_t)state, count);
+}
+
+static void dtape_thread_state_shim_get_state(void* ctx, void* xnu_thread, int flavor, void* state, unsigned int count) {
+	(void)ctx;
+	mach_msg_type_number_t actual = count;
+	thread_get_state((thread_t)xnu_thread, flavor, (thread_state_t)state, &actual);
+}
+
+static const dtape_thread_state_io_t dtape_thread_state_io = {
+	.ctx = NULL,
+	.copyin = dtape_thread_state_shim_copyin,
+	.copyout = dtape_thread_state_shim_copyout,
+	.set_state = dtape_thread_state_shim_set_state,
+	.get_state = dtape_thread_state_shim_get_state,
+};
+
+static bool dtape_thread_state_descriptor(int architecture, dtape_thread_state_layout_desc_t* desc) {
+	if (architecture == dserver_rpc_architecture_x86_64) {
+		desc->thread_flavor = x86_THREAD_STATE64;
+		desc->float_flavor = x86_FLOAT_STATE64;
+		desc->thread_count = x86_THREAD_STATE64_COUNT;
+		desc->float_count = x86_FLOAT_STATE64_COUNT;
+		desc->thread_size = sizeof(x86_thread_state64_t);
+		desc->float_size = sizeof(x86_float_state64_t);
+		return true;
+	} else if (architecture == dserver_rpc_architecture_i386) {
+		desc->thread_flavor = x86_THREAD_STATE32;
+		desc->float_flavor = x86_FLOAT_STATE32;
+		desc->thread_count = x86_THREAD_STATE32_COUNT;
+		desc->float_count = x86_FLOAT_STATE32_COUNT;
+		desc->thread_size = sizeof(x86_thread_state32_t);
+		desc->float_size = sizeof(x86_float_state32_t);
+		return true;
+	}
+	return false;
+}
+
 int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address) {
+	union { x86_thread_state64_t s64; x86_thread_state32_t s32; } thread_buffer;
+	union { x86_float_state64_t f64; x86_float_state32_t f32; } float_buffer;
 	dtape_task_t* task = dtape_task_for_thread(thread);
+	dtape_thread_state_layout_desc_t desc;
 
-	if (task->architecture == dserver_rpc_architecture_x86_64) {
-		x86_thread_state64_t tstate;
-		x86_float_state64_t fstate;
-
-		if (copyin(thread_state_address, &tstate, sizeof(tstate)) || copyin(float_state_address, &fstate, sizeof(fstate))) {
-			return -LINUX_EFAULT;
-		}
-
-		thread_set_state(current_thread(), x86_THREAD_STATE64, (thread_state_t) &tstate, x86_THREAD_STATE64_COUNT);
-		thread_set_state(current_thread(), x86_FLOAT_STATE64, (thread_state_t) &fstate, x86_FLOAT_STATE64_COUNT);
-	} else if (task->architecture == dserver_rpc_architecture_i386) {
-		x86_thread_state32_t tstate;
-		x86_float_state32_t fstate;
-
-		if (copyin(thread_state_address, &tstate, sizeof(tstate)) || copyin(float_state_address, &fstate, sizeof(fstate))) {
-			return -LINUX_EFAULT;
-		}
-
-		thread_set_state(current_thread(), x86_THREAD_STATE32, (thread_state_t) &tstate, x86_THREAD_STATE32_COUNT);
-		thread_set_state(current_thread(), x86_FLOAT_STATE32, (thread_state_t) &fstate, x86_FLOAT_STATE32_COUNT);
-	} else {
+	if (!dtape_thread_state_descriptor((int)task->architecture, &desc)) {
 		dtape_log_error("dtape_thread_load_state_from_user() unimplemented for architecture: %d", task->architecture);
 		return -LINUX_ENOSYS;
 	}
 
-	return 0;
+	// The NAMED thread is the only target: `&thread->xnu_thread`, never `current_thread()`.
+	int result = dtape_thread_state_load(&thread->xnu_thread, (int)task->architecture,
+		thread_state_address, float_state_address, &desc, &thread_buffer, &float_buffer, &dtape_thread_state_io);
+	return (result == dtape_thread_state_ok) ? 0 : -result;
 };
 
 int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address) {
+	union { x86_thread_state64_t s64; x86_thread_state32_t s32; } thread_buffer;
+	union { x86_float_state64_t f64; x86_float_state32_t f32; } float_buffer;
 	dtape_task_t* task = dtape_task_for_thread(thread);
+	dtape_thread_state_layout_desc_t desc;
 
-	if (task->architecture == dserver_rpc_architecture_x86_64) {
-		x86_thread_state64_t tstate;
-		x86_float_state64_t fstate;
-		mach_msg_type_number_t count;
-
-		count = x86_THREAD_STATE64_COUNT;
-		thread_get_state(current_thread(), x86_THREAD_STATE64, (thread_state_t) &tstate, &count);
-
-		count = x86_FLOAT_STATE64_COUNT;
-		thread_get_state(current_thread(), x86_FLOAT_STATE64, (thread_state_t) &fstate, &count);
-
-		if (copyout(&tstate, thread_state_address, sizeof(tstate)) || copyout(&fstate, float_state_address, sizeof(fstate))) {
-			return -LINUX_EFAULT;
-		}
-	} else if (task->architecture == dserver_rpc_architecture_i386) {
-		x86_thread_state32_t tstate;
-		x86_float_state32_t fstate;
-		mach_msg_type_number_t count;
-
-		count = x86_THREAD_STATE32_COUNT;
-		thread_get_state(current_thread(), x86_THREAD_STATE32, (thread_state_t) &tstate, &count);
-
-		count = x86_FLOAT_STATE32_COUNT;
-		thread_get_state(current_thread(), x86_FLOAT_STATE32, (thread_state_t) &fstate, &count);
-
-		if (copyout(&tstate, thread_state_address, sizeof(tstate)) || copyout(&fstate, float_state_address, sizeof(fstate))) {
-			return -LINUX_EFAULT;
-		}
-	} else {
+	if (!dtape_thread_state_descriptor((int)task->architecture, &desc)) {
 		dtape_log_error("dtape_thread_save_state_to_user() unimplemented for architecture: %d", task->architecture);
 		return -LINUX_ENOSYS;
 	}
 
-	return 0;
+	// Same boundary as load_state_from_user: the NAMED thread's state is the only state read back.
+	int result = dtape_thread_state_save(&thread->xnu_thread, (int)task->architecture,
+		thread_state_address, float_state_address, &desc, &thread_buffer, &float_buffer, &dtape_thread_state_io);
+	return (result == dtape_thread_state_ok) ? 0 : -result;
 };
 
 void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, int linux_signal_number, int code, uintptr_t signal_address) {

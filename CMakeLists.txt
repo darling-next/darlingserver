@@ -188,6 +188,20 @@ target_compile_options(dserver_interrupt_resume_tests PRIVATE
 )
 add_test(NAME dserver_interrupt_resume COMMAND dserver_interrupt_resume_tests)
 
+# dar-dtape-explicit-context-6to3.3: host contract for the explicit-context thread-state boundary.
+# It compiles the shared, XNU-free decision (duct-tape/src/thread-state.c) so it runs anywhere.
+add_executable(dserver_thread_state_tests
+	tests/thread_state_test.cpp
+	duct-tape/src/thread-state.c
+)
+target_compile_options(dserver_thread_state_tests PRIVATE
+	$<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
+)
+target_include_directories(dserver_thread_state_tests PRIVATE
+	duct-tape/internal-include
+)
+add_test(NAME dserver_thread_state COMMAND dserver_thread_state_tests)
+
 add_dependencies(darlingserver
 	generate_dserver_rpc_wrappers
 	rtsig_h
